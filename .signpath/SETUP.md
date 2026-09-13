@@ -55,8 +55,9 @@ Example policy file structure:
 ```yaml
 github-policies:
   runners:
-    allowed_groups:
-      - 'blacksmith-4vcpu-windows-2025'
+    # release.yml builds on GitHub's hosted windows-latest. Pinning a custom
+    # runner group here would reject every release signing request.
+    allow_github_hosted: true
   build:
     disallow_reruns: true
   branch_rulesets:

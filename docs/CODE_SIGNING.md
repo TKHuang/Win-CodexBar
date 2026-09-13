@@ -2,7 +2,7 @@
 
 Free code signing of Win-CodexBar releases via SignPath.io, certificate by SignPath Foundation.
 
-> **Status: SignPath Foundation approved — pipeline wiring in progress.** The release workflow (`.github/workflows/release.yml`) includes SignPath signing steps; signing activates once the secrets (`SIGNPATH_API_TOKEN`, `SIGNPATH_ORGANIZATION_ID`, `SIGNPATH_PROJECT_SLUG`, `SIGNPATH_SIGNING_POLICY_SLUG`) are added to the GitHub repo. Until then, artifacts are unsigned with SHA-256 `.sha256` sidecar files. See `.signpath/SETUP.md` for the onboarding checklist.
+> **Status: SignPath Foundation approved — awaiting repository secrets.** The release workflow (`.github/workflows/release.yml`) contains the SignPath signing steps. Signing activates once all four secrets (`SIGNPATH_API_TOKEN`, `SIGNPATH_ORGANIZATION_ID`, `SIGNPATH_PROJECT_SLUG`, `SIGNPATH_SIGNING_POLICY_SLUG`) are present on the repo; the signing step is skipped while `SIGNPATH_API_TOKEN` is empty, and the release publishes unsigned with SHA-256 `.sha256` sidecars. See `.signpath/SETUP.md` for the onboarding checklist.
 
 ## Project identity
 
@@ -22,10 +22,12 @@ Free code signing of Win-CodexBar releases via SignPath.io, certificate by SignP
 
 ## Build system
 
-- CI runs on GitHub Actions (`.github/workflows/pr-check.yml`).
-- The Windows release pipeline is driven by `scripts/windows-release-build.ps1`, which builds the Tauri release binary plus the console CLI and packages them with Inno Setup into the installer (`CodexBar-<version>-Setup.exe`) and portable build, writing SHA-256 sidecar files for every artifact.
-- Release artifacts are published to [GitHub Releases](https://github.com/nesszer/Win-CodexBar/releases).
-- **Not yet wired:** release signing will be submitted to SignPath from this pipeline once SignPath onboarding completes; each release-signing request is approved manually by the approver listed above before signed binaries are published.
+- Releases build on **GitHub Actions**, `.github/workflows/release.yml`, triggered by a canonical `vX.Y.Z` tag push. SignPath verifies build provenance through its GitHub Trusted Build System integration, so the signed artifacts must be produced by that workflow.
+- The workflow has two jobs. `build` runs the preflight, provisions pinned prerequisites, and runs `scripts/circleci-release-build.ps1` (which drives `scripts/windows-release-build.ps1`) to produce the installer (`CodexBar-<version>-Setup.exe`), the portable build, the console CLI zip, SHA-256 sidecars, and `release-manifest.json`. It holds **no** publish credential.
+- `build` then submits the two installers to SignPath, replaces the unsigned binaries with the signed ones, recomputes every SHA-256 sidecar and the manifest, and asserts `Get-AuthenticodeSignature` returns `Valid`.
+- `publish` is gated on the `release` GitHub Environment — configure required reviewers there for the manual approval hold. It is the only job with `contents: write`, and runs `scripts/publish-github-release.ps1` to create or update a **draft** release. That script never finalizes a release.
+- Each release-signing request is also approved manually in SignPath by the approver listed above.
+- Ordinary PR/`main` CI still runs on CircleCI (`.circleci/config.yml`). Its `release` workflow is dormant — the CircleCI project excludes tag triggers, and `release.yml` no longer calls the CircleCI API.
 
 ## Privacy
 

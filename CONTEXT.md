@@ -6,7 +6,8 @@ Detailed Win-CodexBar CI topology, trigger configuration, cache policy, release 
 
 ## Win-CodexBar compute roles
 
-- **CircleCI Windows** — primary hosted PR/`main` integration gate and release builder.
+- **CircleCI Windows** — primary hosted PR/`main` integration gate.
+- **GitHub-hosted Windows** — tag-triggered release builder. SignPath verifies build provenance through GitHub, so signed releases must build there.
 - **Blacksmith Windows** — manual reserve/second-opinion CI only.
 - **GitHub-hosted Ubuntu** — lightweight interaction guard for untrusted authors.
 
@@ -24,9 +25,9 @@ The historical cross-repo intent split was roughly **60% Win-CodexBar / 30% line
 
 | Mode | CircleCI PR check | Interaction guard | Blacksmith reserve | Release |
 | --- | --- | --- | --- | --- |
-| `normal` | runs when in scope | runs when needed | manual only | tag-triggered CircleCI |
-| `thin` | runs when in scope | runs when needed | manual only | tag-triggered CircleCI |
-| `off` | skip | skip | skip | tag-triggered CircleCI |
+| `normal` | runs when in scope | runs when needed | manual only | tag-triggered GitHub Actions |
+| `thin` | runs when in scope | runs when needed | manual only | tag-triggered GitHub Actions |
+| `off` | skip | skip | skip | tag-triggered GitHub Actions |
 
 `thin` currently has the same single hosted Windows integration job as `normal`; there is no matrix left to trim. Porting micro PRs save compute through their semantic integration-branch topology instead. See `.github/CI.md` and `docs/PORTING.md`.
 
