@@ -10,7 +10,7 @@ param(
     [Parameter(Mandatory)][string]$OutputDir,
     [Parameter(Mandatory)][string]$Tag,
     [Parameter(Mandatory)][string]$Sha,
-    [string]$Repository = 'nesszer/Win-CodexBar'
+    [string]$Repository = 'TKHuang/Win-CodexBar'
 )
 
 Set-StrictMode -Version Latest
@@ -23,8 +23,8 @@ if (-not (Test-CanonicalReleaseTag $Tag)) {
 if ($Sha -notmatch '^[0-9a-fA-F]{40}$') {
     throw "Manifest requires a full immutable commit SHA; received '$Sha'."
 }
-if ((Normalize-GitHubRepository $Repository) -ne 'nesszer/win-codexbar') {
-    throw "Manifest repository must be canonical nesszer/Win-CodexBar."
+if ((Normalize-GitHubRepository $Repository) -ne 'tkhuang/win-codexbar') {
+    throw "Manifest repository must be canonical TKHuang/Win-CodexBar."
 }
 $version = Get-ReleaseVersionFromTag $Tag
 if (-not (Test-Path -LiteralPath $AssetsDir -PathType Container)) {
@@ -59,7 +59,7 @@ $assetRecords = @(
     }
 )
 $manifest = [ordered]@{
-    repository = 'nesszer/Win-CodexBar'
+    repository = 'TKHuang/Win-CodexBar'
     tag = $Tag
     version = $version
     commit = $Sha.ToLowerInvariant()
