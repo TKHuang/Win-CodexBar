@@ -1,5 +1,24 @@
 # Changelog
 
+## [Windows] Unreleased
+
+### Added
+- Overview now lists every quota window a provider reports. Claude's scoped Fable lane and Codex's Spark and reset-credit lanes were previously reachable only by opening the provider tab.
+- Every quota window shows its own pace: `N% in reserve` when consumption is behind schedule, `N% over pace` when ahead. Previously only the weekly lane carried this, and on weekly windows the on-pace budget disclosure hid it entirely.
+- Usage bars carry an on-pace mark showing where consumption should stand right now.
+- **Compact layout** (Settings -> Menu) tightens padding, spacing, type and bar height for the menu surfaces. Density only - no row is hidden.
+
+### Changed
+- **Browser cookies are read only when you import them.** Background provider refreshes no longer open browser cookie stores. Reading Chromium's DPAPI-wrapped key and decrypting its cookie database on a timer is indistinguishable from credential theft to endpoint security products; Kaspersky reports `PDM:Trojan.Win32.Generic` and terminates the app. Providers keep working from cookies imported earlier — **a provider that relied on the implicit scan needs one manual import** (Settings -> the provider -> Cookies). Claude and Codex use OAuth and local CLI logins and are unaffected. See [docs/COOKIES.md](docs/COOKIES.md).
+- Releases build and are code-signed in GitHub Actions instead of CircleCI, so SignPath can verify build provenance. Unsigned releases with SHA-256 sidecars remain the behaviour until signing secrets are configured. See [ADR 0007](docs/adr/0007-release-builds-move-to-github-actions.md).
+- Repository identity now points at this fork across the release pipeline, the in-app updater, the GitHub write guard, and documentation links.
+
+### Fixed
+- The compact layout's first implementation overrode design tokens, which the tray stylesheet bypasses with hardcoded pixel values, so it changed almost nothing. Its rules are now scoped to win that specificity contest.
+- Removed a test that read the developer's real `claude.ai` cookies on every `cargo test` run and asserted nothing. It was enough on its own to get the test binary flagged and terminated mid-suite.
+
+---
+
 ## [Windows] 0.56.8 - 2026-09-08
 
 Windows release aligned to the reviewed upstream CodexBar **0.56.8** behavior baseline, plus Windows-specific reliability, account-switching, UI, browser-import, and release-pipeline improvements landed since 0.55.0.
