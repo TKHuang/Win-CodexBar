@@ -34,7 +34,7 @@ checks run), which is the same withholding the `CI_BUDGET_MODE` note in
 contributors get no direct hosted Windows validation of their own PRs.
 
 The `release` workflow remains filtered to the canonical
-`nesszer/Win-CodexBar` project and exact protected tags `vX.Y.Z`; branch and
+`TKHuang/Win-CodexBar` project and exact protected tags `vX.Y.Z`; branch and
 pull-request pipelines cannot enter it. The CircleCI Windows release build is
 credential-free. Only its explicit approval-gated publisher gets the
 restricted `GH_TOKEN` context.
@@ -100,7 +100,7 @@ cover all tray, WebView2, provider, or CUA/UI behavior.
 ## Setup that requires administrators
 
 The repository cannot create external settings. Configure the CircleCI project
-for `nesszer/Win-CodexBar`, enable `.circleci/config.yml`, and create a
+for `TKHuang/Win-CodexBar`, enable `.circleci/config.yml`, and create a
 project-restricted context named `github-release-publisher`. Store `GH_TOKEN`
 there only, using a fine-grained GitHub token scoped to this repository with
 Contents read/write for release APIs. Do not grant Workflows permission.

@@ -3,7 +3,7 @@
 This is the privacy policy for **Win-CodexBar**, a Windows tray/desktop app that
 displays AI provider usage quotas on your own machine. It applies to the
 installer and portable builds published on
-[GitHub Releases](https://github.com/nesszer/Win-CodexBar/releases).
+[GitHub Releases](https://github.com/TKHuang/Win-CodexBar/releases).
 
 Last updated: 2026-08-06.
 
@@ -127,4 +127,4 @@ material changes will also be noted in release notes.
 ## Contact
 
 Questions or data concerns: open an issue at
-<https://github.com/nesszer/Win-CodexBar/issues>.
+<https://github.com/TKHuang/Win-CodexBar/issues>.

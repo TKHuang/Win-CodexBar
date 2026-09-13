@@ -22,7 +22,7 @@ write credential; only the approval-gated release publisher receives a
 ### Workflow — `.circleci/config.yml`
 
 The hosted PR/push validation gate now runs on **CircleCI** as the
-`pr-check` job in the `pr-check` workflow (project `nesszer/Win-CodexBar`),
+`pr-check` job in the `pr-check` workflow (project `TKHuang/Win-CodexBar`),
 not on Blacksmith. The CircleCI job delegates the whole check to
 `scripts/local-check.ps1 -Slice ci`, so the exact commands it runs are:
 

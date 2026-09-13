@@ -42,7 +42,7 @@ is the supported path to publisher trust.
 ## Reporting a vulnerability
 
 Please use GitHub's private vulnerability reporting: open the
-[Security tab](https://github.com/nesszer/Win-CodexBar/security) and click
+[Security tab](https://github.com/TKHuang/Win-CodexBar/security) and click
 "Report a vulnerability".
 
 Do **not** open a public GitHub issue for a vulnerability. Public issues and

@@ -7,9 +7,9 @@ Free code signing of Win-CodexBar releases via SignPath.io, certificate by SignP
 ## Project identity
 
 - **Project name:** Win-CodexBar
-- **Homepage:** https://github.com/nesszer/Win-CodexBar
-- **Source code:** https://github.com/nesszer/Win-CodexBar
-- **Releases:** https://github.com/nesszer/Win-CodexBar/releases
+- **Homepage:** https://github.com/TKHuang/Win-CodexBar
+- **Source code:** https://github.com/TKHuang/Win-CodexBar
+- **Releases:** https://github.com/TKHuang/Win-CodexBar/releases
 - **License:** MIT
 
 ## Roles
