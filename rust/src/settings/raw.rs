@@ -46,6 +46,8 @@ pub(super) struct RawSettings {
     predictive_pace_warning_enabled: bool,
     #[serde(default = "default_true")]
     show_pace: bool,
+    #[serde(default)]
+    compact_menu_layout: bool,
     menu_bar_display_mode: String,
     show_all_token_accounts_in_menu: bool,
 
@@ -211,6 +213,7 @@ impl Default for RawSettings {
             show_reset_when_exhausted: s.show_reset_when_exhausted,
             predictive_pace_warning_enabled: s.predictive_pace_warning_enabled,
             show_pace: s.show_pace,
+            compact_menu_layout: s.compact_menu_layout,
             menu_bar_display_mode: s.menu_bar_display_mode,
             show_all_token_accounts_in_menu: s.show_all_token_accounts_in_menu,
             provider_configs: s.provider_configs,
@@ -536,6 +539,7 @@ impl From<RawSettings> for Settings {
             show_reset_when_exhausted: raw.show_reset_when_exhausted,
             predictive_pace_warning_enabled: raw.predictive_pace_warning_enabled,
             show_pace: raw.show_pace,
+            compact_menu_layout: raw.compact_menu_layout,
             menu_bar_display_mode: raw.menu_bar_display_mode,
             show_all_token_accounts_in_menu: raw.show_all_token_accounts_in_menu,
             provider_configs,

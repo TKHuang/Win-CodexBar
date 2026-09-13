@@ -16,6 +16,8 @@ export interface MenuFooterRow {
 
 interface MenuSurfaceProps {
   variant: "tray" | "popout";
+  /** Tighten padding, spacing and type across the whole surface. */
+  compact?: boolean;
   /** Optional window chrome (e.g. the PopOut title bar) rendered flush at the
    *  top. A slot keeps this shared content container free of window APIs. */
   titleBar?: ReactNode;
@@ -45,6 +47,7 @@ interface MenuSurfaceProps {
  */
 export default function MenuSurface({
   variant,
+  compact = false,
   titleBar,
   onRefresh,
   isRefreshing,
@@ -58,7 +61,10 @@ export default function MenuSurface({
 }: MenuSurfaceProps) {
   const { t } = useLocale();
   return (
-    <div className={`menu-surface menu-surface--${variant}`} style={style}>
+    <div
+      className={`menu-surface menu-surface--${variant}${compact ? " menu-surface--compact" : ""}`}
+      style={style}
+    >
       {titleBar}
       {banner}
       {summary}

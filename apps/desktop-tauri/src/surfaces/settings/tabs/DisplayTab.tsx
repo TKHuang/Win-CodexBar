@@ -165,6 +165,18 @@ export default function DisplayTab({
             />
           </Field>
           <Field
+            label={t("CompactMenuLayoutLabel")}
+            description={t("CompactMenuLayoutHelper")}
+            leading
+          >
+            <Toggle
+              checked={settings.compactMenuLayout ?? false}
+              ariaLabel={t("CompactMenuLayoutLabel")}
+              disabled={saving}
+              onChange={(v) => set({ compactMenuLayout: v })}
+            />
+          </Field>
+          <Field
             label={t("ShowAllTokenAccountsLabel")}
             description={t("ShowAllTokenAccountsHelper")}
             leading

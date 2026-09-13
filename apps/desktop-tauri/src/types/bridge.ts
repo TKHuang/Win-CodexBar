@@ -188,6 +188,7 @@ export interface SettingsSnapshot {
   providerUsageThresholds?: Record<string, UsageThresholdOverride>;
   predictivePaceWarningEnabled: boolean;
   showPace?: boolean;
+  compactMenuLayout?: boolean;
   trayIconMode: TrayIconMode;
   switcherShowsIcons: boolean;
   menuBarShowsHighestUsage: boolean;
@@ -289,6 +290,7 @@ export interface SettingsUpdate {
   providerUsageThresholds?: Record<string, UsageThresholdOverride>;
   predictivePaceWarningEnabled?: boolean;
   showPace?: boolean;
+  compactMenuLayout?: boolean;
   trayIconMode?: TrayIconMode;
   switcherShowsIcons?: boolean;
   menuBarShowsHighestUsage?: boolean;
@@ -533,6 +535,8 @@ export interface RateWindowSnapshot {
   isExhausted: boolean;
   isInformational?: boolean;
   reservePercent: number | null;
+  /** Percent consumed beyond the on-pace expectation. */
+  overPercent?: number | null;
   reserveDescription: string | null;
   reserveWillLastToReset?: boolean;
   reserveEtaSeconds?: number | null;

@@ -263,21 +263,6 @@ fn minimax_region_lookup_normalizes_legacy_china_value() {
 }
 
 #[test]
-fn minimax_cookie_domain_follows_selected_region() {
-    let mut s = Settings::default();
-    assert_eq!(
-        super::provider_cookie_domain(ProviderId::MiniMax, &s),
-        Some("platform.minimax.io")
-    );
-
-    s.set_api_region(ProviderId::MiniMax, "cn");
-    assert_eq!(
-        super::provider_cookie_domain(ProviderId::MiniMax, &s),
-        Some("platform.minimaxi.com")
-    );
-}
-
-#[test]
 fn provider_cookie_source_set_rejects_unknown_provider() {
     let mut s = Settings::default();
     let err = super::provider_cookie_source_set(&mut s, "nope", "x".into()).unwrap_err();
@@ -1460,6 +1445,47 @@ fn japanese_provider_snapshot_localizes_pace_reserve_description() {
     assert!(secondary.reserve_percent.is_some());
     assert!(secondary.reserve_will_last_to_reset);
     assert!(secondary.reserve_description.is_none());
+}
+
+#[test]
+fn every_quota_window_carries_pace_reserve_or_over() {
+    use chrono::{Duration, Utc};
+
+    let metadata = instantiate_provider(ProviderId::Claude).metadata().clone();
+    let now = Utc::now();
+    let half_week = || {
+        // 7-day window with half of it already elapsed.
+        Some(now + Duration::minutes(7 * 24 * 60 / 2))
+    };
+    // 70% used at the halfway mark → 20% ahead of pace (over).
+    let session =
+        codexbar::core::RateWindow::with_details(70.0, Some(7 * 24 * 60), half_week(), None);
+    // 30% used at the halfway mark → 20% behind pace (reserve).
+    let scoped =
+        codexbar::core::RateWindow::with_details(30.0, Some(7 * 24 * 60), half_week(), None);
+    let usage = codexbar::core::UsageSnapshot::new(session).with_extra_rate_window(
+        "claude-weekly-scoped-fable",
+        "Fable only",
+        scoped,
+    );
+    let result = ProviderFetchResult {
+        usage,
+        cost: None,
+        wayfinder_usage: None,
+        source_label: "OAuth".to_string(),
+        has_successful_claude_cli_quota: false,
+        pace_authoritative: true,
+    };
+
+    let snapshot =
+        ProviderUsageSnapshot::from_fetch_result(ProviderId::Claude, &metadata, &result, None);
+
+    assert_eq!(snapshot.primary.over_percent, Some(20.0));
+    assert_eq!(snapshot.primary.reserve_percent, None);
+
+    let scoped = &snapshot.extra_rate_windows[0].window;
+    assert_eq!(scoped.reserve_percent, Some(20.0));
+    assert_eq!(scoped.over_percent, None);
 }
 
 #[test]

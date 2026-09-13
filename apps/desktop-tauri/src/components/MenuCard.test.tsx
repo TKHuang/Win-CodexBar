@@ -31,6 +31,7 @@ function rateWindow(
     exhausted?: boolean;
     resetDescription?: string | null;
     reservePercent?: number | null;
+    overPercent?: number | null;
     reserveDescription?: string | null;
     reserveWillLastToReset?: boolean;
     reserveEtaSeconds?: number | null;
@@ -46,6 +47,7 @@ function rateWindow(
     resetDescription: opts.resetDescription ?? null,
     isExhausted: opts.exhausted ?? false,
     reservePercent: opts.reservePercent ?? null,
+    overPercent: opts.overPercent ?? null,
     reserveDescription: opts.reserveDescription ?? null,
     reserveWillLastToReset: opts.reserveWillLastToReset ?? false,
     reserveEtaSeconds: opts.reserveEtaSeconds ?? null,
@@ -125,6 +127,7 @@ describe("MenuCard", () => {
         PanelFiveHours: "5h",
         PanelOnPaceBudget: "On-pace budget",
         PanelReserveSuffix: "in reserve",
+        PanelReserveLastsUntilReset: "Lasts until reset",
         PanelThirtyDayCost: "30d cost",
         PanelThirtyDayTokens: "30d tokens",
         PanelTodayBudget: "today",
@@ -655,6 +658,69 @@ describe("MenuCard", () => {
 
     expect(await screen.findByText("12% in reserve")).toBeInTheDocument();
     expect(screen.queryByText("On-pace budget")).not.toBeInTheDocument();
+  });
+
+  it("keeps the reserve row beside the weekly on-pace budget toggle", async () => {
+    const resetAt = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000);
+    const snapshot = provider(null, 33);
+    snapshot.primary = rateWindow(33, {
+      reservePercent: 38,
+      reserveWillLastToReset: true,
+      windowMinutes: 7 * 24 * 60,
+      resetsAt: resetAt.toISOString(),
+    });
+
+    renderCard(snapshot);
+
+    expect(await screen.findByText("38% in reserve")).toBeInTheDocument();
+    expect(screen.getByText("Lasts until reset")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /On-pace budget/ }),
+    ).toBeInTheDocument();
+  });
+
+  it("marks the on-pace position on the bar, flipping with the remaining view", async () => {
+    const snapshot = provider(null, 33);
+    snapshot.primary = rateWindow(33, { reservePercent: 38, reserveWillLastToReset: true });
+
+    // showAsUsed: bar fills from the left with consumption, mark at used+reserve.
+    const used = renderCard(snapshot, { showAsUsed: true });
+    await screen.findByText("38% in reserve");
+    expect(
+      used.container.querySelector<HTMLElement>(".menu-metric__bar-pace")?.style.left,
+    ).toBe("71%");
+    used.unmount();
+
+    // Default view shows what is left, so the mark mirrors to the other side.
+    const left = renderCard(snapshot, { showAsUsed: false });
+    await screen.findByText("38% in reserve");
+    expect(
+      left.container.querySelector<HTMLElement>(".menu-metric__bar-pace")?.style.left,
+    ).toBe("29%");
+  });
+
+  it("omits the on-pace mark when there is no pace data", async () => {
+    const { container } = renderCard(provider(null, 20));
+
+    await screen.findByText("80% left");
+    expect(container.querySelector(".menu-metric__bar-pace")).toBeNull();
+  });
+
+  it("renders an over-pace row when usage runs ahead of schedule", async () => {
+    tauriMocks.getLocaleStrings.mockResolvedValue(
+      buildBundle({ PanelOverPaceSuffix: "over pace" }),
+    );
+    const snapshot = provider(null, 70);
+    snapshot.primary = rateWindow(70, {
+      overPercent: 20,
+      reserveEtaSeconds: 3 * 60 * 60,
+    });
+
+    renderCard(snapshot);
+
+    expect(await screen.findByText("20% over pace")).toBeInTheDocument();
+    expect(screen.getByText("PanelReserveRunsOutInHours")).toBeInTheDocument();
+    expect(screen.queryByText(/in reserve/)).not.toBeInTheDocument();
   });
 
 

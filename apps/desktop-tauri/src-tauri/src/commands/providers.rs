@@ -49,9 +49,6 @@ pub(crate) fn build_fetch_context(
     let active_token_cookie = token_override
         .as_ref()
         .and_then(|override_data| override_data.cookie_header.clone());
-    let defer_provider_browser_cookie_lookup = provider.owns_browser_cookie_resolution()
-        && active_token_cookie.is_none()
-        && stored_cookie.is_none();
     let active_token_env = token_override
         .as_ref()
         .and_then(|override_data| override_data.env_override.as_ref());
@@ -64,7 +61,7 @@ pub(crate) fn build_fetch_context(
     let has_opencodego_api_key = id == ProviderId::OpenCodeGo
         && api_key.as_deref().is_some_and(|key| !key.trim().is_empty());
 
-    let (mut source_mode, mut cookie_header) = if id.cookie_domain().is_none() {
+    let (mut source_mode, cookie_header) = if id.cookie_domain().is_none() {
         let source_mode = if active_token_env.is_some() {
             SourceMode::OAuth
         } else {
@@ -116,20 +113,12 @@ pub(crate) fn build_fetch_context(
             }
             // `browser` is accepted as a legacy alias from older settings.
             "auto" | "browser" | "web" => {
-                // Claude resolves its cached cookie and browser fallback inside
-                // the provider; other providers retain the shell fallback.
-                let cookie_header = active_token_cookie.or(stored_cookie).or_else(|| {
-                    if defer_provider_browser_cookie_lookup {
-                        None
-                    } else {
-                        provider_cookie_domain(id, settings).and_then(|domain| {
-                            codexbar::browser::cookies::get_cookie_header(domain)
-                                .ok()
-                                .filter(|h| !h.is_empty())
-                        })
-                    }
-                });
-                (usage_source, cookie_header)
+                // Only cookies the user imported are used. The shell used to fall
+                // back to scanning every installed browser here on each refresh;
+                // that read Chromium's DPAPI key and cookie database on a timer,
+                // which endpoint security products classify as credential theft.
+                // See `codexbar::browser::cookies::ScanTrigger`.
+                (usage_source, active_token_cookie.or(stored_cookie))
             }
             _ => (usage_source, stored_cookie),
         }
@@ -137,20 +126,11 @@ pub(crate) fn build_fetch_context(
 
     // Cookie-web providers (Cursor, OpenCode, …) reject SourceMode::Cli. The shell
     // historically mapped "manual + no cookie" to Cli, which surfaces as
-    // "Source mode 'Cli' not supported". Remap to Web and try browser cookies
-    // unless the user explicitly disabled cookies ("off").
+    // "Source mode 'Cli' not supported". Remap to Web so the provider can use an
+    // imported cookie; it reports "no cookies" when the user has not imported
+    // one. The shell no longer scans browsers here — see
+    // `codexbar::browser::cookies::ScanTrigger`.
     if source_mode == SourceMode::Cli && cookie_source != "off" && !provider.supports_cli() {
-        if cookie_header
-            .as_deref()
-            .map(str::trim)
-            .is_none_or(|s| s.is_empty())
-        {
-            cookie_header = provider_cookie_domain(id, settings).and_then(|domain| {
-                codexbar::browser::cookies::get_cookie_header(domain)
-                    .ok()
-                    .filter(|h| !h.is_empty())
-            });
-        }
         source_mode = SourceMode::Web;
     }
 
@@ -180,24 +160,6 @@ fn provider_uses_oauth_without_cookies(id: ProviderId, usage_source: SourceMode)
         ProviderId::Grok => matches!(usage_source, SourceMode::Auto | SourceMode::OAuth),
         _ => false,
     }
-}
-
-pub(crate) fn provider_cookie_domain(id: ProviderId, settings: &Settings) -> Option<&'static str> {
-    if id == ProviderId::MiniMax {
-        return Some(
-            codexbar::providers::MiniMaxProvider::cookie_domain_for_region(Some(
-                settings.api_region(id),
-            )),
-        );
-    }
-    if id == ProviderId::Alibaba {
-        return Some(
-            codexbar::providers::AlibabaProvider::cookie_domain_for_region(Some(
-                settings.api_region(id),
-            )),
-        );
-    }
-    id.cookie_domain()
 }
 
 const DEFAULT_PROVIDER_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(35);
@@ -1169,6 +1131,7 @@ mod reset_backfill_tests {
             is_exhausted: false,
             is_informational: false,
             reserve_percent: None,
+            over_percent: None,
             reserve_description: None,
             reserve_will_last_to_reset: false,
             reserve_eta_seconds: None,

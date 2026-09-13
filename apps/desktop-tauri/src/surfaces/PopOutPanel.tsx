@@ -203,6 +203,7 @@ export default function PopOutPanel({
   const surface = sorted.length === 0 ? (
     <MenuSurface
       variant="popout"
+      compact={settings.compactMenuLayout ?? false}
       titleBar={<PopOutTitleBar />}
       onRefresh={refresh}
       isRefreshing={isRefreshing}
@@ -218,6 +219,7 @@ export default function PopOutPanel({
   ) : (
     <MenuSurface
       variant="popout"
+      compact={settings.compactMenuLayout ?? false}
       titleBar={<PopOutTitleBar />}
       onRefresh={refresh}
       isRefreshing={isRefreshing}
@@ -259,7 +261,6 @@ export default function PopOutPanel({
                   showResetWhenExhausted: settings.showResetWhenExhausted,
             showPace: settings.showPace ?? true,
                   showAsUsed: settings.showAsUsed,
-                  compactMetrics: selectedProviderId === null,
                   costSummaryDisplayStyle: settings.costSummaryDisplayStyle,
                 }}
                 accentColor={settings.providerAccentColors[p.providerId]}

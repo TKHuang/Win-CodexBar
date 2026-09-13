@@ -295,6 +295,23 @@ describe("TrayPanel provider grid", () => {
     });
   });
 
+  it("applies the compact surface class only when the setting is on", async () => {
+    const roomy = renderTrayPanel([provider("claude", "Claude", 35)]);
+    await waitFor(() => {
+      expect(roomy.container.querySelector(".tray-panel-reveal--ready")).not.toBeNull();
+    });
+    expect(roomy.container.querySelector(".menu-surface--compact")).toBeNull();
+    roomy.unmount();
+
+    const compact = renderTrayPanel([provider("claude", "Claude", 35)], {
+      compactMenuLayout: true,
+    });
+    await waitFor(() => {
+      expect(compact.container.querySelector(".tray-panel-reveal--ready")).not.toBeNull();
+    });
+    expect(compact.container.querySelector(".menu-surface--compact")).not.toBeNull();
+  });
+
   it("dismisses the tray panel on unmodified Escape", async () => {
     const { container } = renderTrayPanel([provider("claude", "Claude", 35)]);
 

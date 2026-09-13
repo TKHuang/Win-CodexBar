@@ -161,6 +161,11 @@ pub struct Settings {
     #[serde(default = "default_true")]
     pub show_pace: bool,
 
+    /// Tighten menu card padding, spacing and type so the flyout fits more
+    /// on screen. Purely visual density — no rows are hidden.
+    #[serde(default)]
+    pub compact_menu_layout: bool,
+
     /// Menu bar display mode: "minimal", "compact", or "detailed"
     pub menu_bar_display_mode: String,
 
@@ -516,6 +521,7 @@ impl Default for Settings {
             show_reset_when_exhausted: false,
             predictive_pace_warning_enabled: false,
             show_pace: true,
+            compact_menu_layout: false,
             menu_bar_display_mode: "detailed".to_string(), // Detailed mode by default
             show_all_token_accounts_in_menu: false,
             provider_configs: HashMap::new(),
