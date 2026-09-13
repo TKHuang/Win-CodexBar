@@ -134,7 +134,6 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
             showResetWhenExhausted: settings.showResetWhenExhausted,
             showPace: settings.showPace ?? true,
             showAsUsed: settings.showAsUsed,
-            compactMetrics: selectedProviderId === null,
             costSummaryDisplayStyle: settings.costSummaryDisplayStyle,
           }}
           accentColor={settings.providerAccentColors[p.providerId]}
@@ -155,6 +154,7 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
       <div className={revealClassName}>
         <MenuSurface
           variant="tray"
+          compact={settings.compactMenuLayout ?? false}
           onRefresh={refresh}
           isRefreshing={isRefreshing}
           actions={headerActions}
@@ -178,6 +178,7 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
     <div className={revealClassName}>
       <MenuSurface
         variant="tray"
+        compact={settings.compactMenuLayout ?? false}
         onRefresh={refresh}
         isRefreshing={isRefreshing}
         actions={headerActions}

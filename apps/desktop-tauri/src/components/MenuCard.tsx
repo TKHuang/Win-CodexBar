@@ -49,7 +49,6 @@ export interface MenuCardDisplayOptions {
   showResetWhenExhausted?: boolean;
   showPace?: boolean;
   showAsUsed?: boolean;
-  compactMetrics?: boolean;
   costSummaryDisplayStyle?: CostSummaryDisplayStyle;
 }
 
@@ -141,7 +140,6 @@ export default function MenuCard({
     showResetWhenExhausted = false,
     showPace = true,
     showAsUsed = false,
-    compactMetrics = false,
     costSummaryDisplayStyle,
   } = display;
   const { t, language } = useLocale();
@@ -232,12 +230,11 @@ export default function MenuCard({
       resetFormatMode: extra.id === "reset-credits" ? "expires" : "reset",
     });
   }
-  const visibleMetrics = compactMetrics ? metrics.slice(0, 2) : metrics;
 
   const presence = describeCard(
     provider,
     chartData,
-    visibleMetrics,
+    metrics,
     costSummaryDisplayStyle,
     showPace,
   );
@@ -306,7 +303,7 @@ export default function MenuCard({
             showAsUsed,
             costSummaryDisplayStyle,
           }}
-          metrics={visibleMetrics}
+          metrics={metrics}
           chartData={chartData}
           presence={presence}
           onLayoutChange={onLayoutChange}

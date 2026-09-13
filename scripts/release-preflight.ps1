@@ -15,7 +15,7 @@ param(
     [string]$Tag = $env:CIRCLE_TAG,
     [string]$Sha = $env:CIRCLE_SHA1,
     [string]$RepoRoot = '',
-    [string]$Repository = "nesszer/Win-CodexBar",
+    [string]$Repository = "TKHuang/Win-CodexBar",
     [string]$MainBranch = "main"
 )
 

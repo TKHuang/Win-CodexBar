@@ -15,7 +15,7 @@
 param(
     [Parameter(Mandatory)][string]$AssetsDir,
     [Parameter(Mandatory)][string]$Tag,
-    [string]$Repository = 'nesszer/Win-CodexBar'
+    [string]$Repository = 'TKHuang/Win-CodexBar'
 )
 
 Set-StrictMode -Version Latest
@@ -149,8 +149,8 @@ function Assert-ManifestAndAssets {
         throw "Missing release manifest: $ManifestPath"
     }
     $manifest = Get-Content -Raw -LiteralPath $ManifestPath | ConvertFrom-Json
-    if (-not $manifest.PSObject.Properties['repository'] -or [string]$manifest.repository -ne 'nesszer/Win-CodexBar') {
-        throw 'Manifest repository is not canonical nesszer/Win-CodexBar.'
+    if (-not $manifest.PSObject.Properties['repository'] -or [string]$manifest.repository -ne 'TKHuang/Win-CodexBar') {
+        throw 'Manifest repository is not canonical TKHuang/Win-CodexBar.'
     }
     if (-not $manifest.PSObject.Properties['tag'] -or [string]$manifest.tag -ne $ExpectedTag) {
         throw "Manifest tag does not match $ExpectedTag."
@@ -216,8 +216,8 @@ if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
 if (-not (Test-CanonicalReleaseTag $Tag)) {
     throw "Publisher accepts only canonical vX.Y.Z tags; received '$Tag'."
 }
-if ((Normalize-GitHubRepository $Repository) -ne 'nesszer/win-codexbar') {
-    throw "Publisher repository must be canonical nesszer/Win-CodexBar."
+if ((Normalize-GitHubRepository $Repository) -ne 'tkhuang/win-codexbar') {
+    throw "Publisher repository must be canonical TKHuang/Win-CodexBar."
 }
 if (-not (Test-Path -LiteralPath $AssetsDir -PathType Container)) {
     throw "Missing persisted release assets directory: $AssetsDir"

@@ -14,15 +14,15 @@ Win-CodexBar separates primary validation, reserve validation, and interaction p
 
 The primary and reserve Windows jobs deliberately execute the same
 `scripts/local-check.ps1 -Slice ci` contract. Neither build job receives a GitHub
-write credential; only the approval-gated CircleCI release publisher receives its
-restricted `GH_TOKEN` context.
+write credential; only the approval-gated release publisher receives a
+`GH_TOKEN`, and it is scoped by the `release` GitHub Environment.
 
 ## CircleCI hosted PR check (primary PR/push gate)
 
 ### Workflow — `.circleci/config.yml`
 
 The hosted PR/push validation gate now runs on **CircleCI** as the
-`pr-check` job in the `pr-check` workflow (project `nesszer/Win-CodexBar`),
+`pr-check` job in the `pr-check` workflow (project `TKHuang/Win-CodexBar`),
 not on Blacksmith. The CircleCI job delegates the whole check to
 `scripts/local-check.ps1 -Slice ci`, so the exact commands it runs are:
 
@@ -41,9 +41,9 @@ Auto-cancel of superseded non-default-branch work is a CircleCI **project settin
 CircleCI trigger configuration also lives outside this repository. The verified
 2026-09-05 setup has one enabled GitHub App trigger with explicit rules for PR
 opened/reopened/synchronize events and default-branch pushes only. Tag pushes are
-excluded because `.github/workflows/release.yml` deliberately triggers the release
-pipeline through the CircleCI API. Do not add overlapping subset triggers or tag
-rules; those create duplicate validation/release pipelines.
+excluded. That exclusion is now load-bearing for a second reason: releases build
+in GitHub Actions, so a CircleCI tag trigger would produce a duplicate — and
+unsigned — release pipeline. Do not add overlapping subset triggers or tag rules.
 
 Porting micro-review CI is enforced semantically in `.circleci/config.yml`: a PR
 whose **base/target** branch is `port/upstream-*` does not create the `pr-check`
@@ -62,13 +62,13 @@ Blacksmith pool for manual Windows fallback.
 
 Both the interaction guard and manual Blacksmith reserve job honor
 `vars.CI_BUDGET_MODE != 'off'`. `off` is the emergency stop for GitHub Actions
-CI helpers; it does not disable CircleCI releases.
+CI helpers; it does not disable the release workflow.
 
 Set `CI_BUDGET_MODE` in **Settings -> Secrets and variables -> Actions ->
 Variables**. Do not hard-code it in a workflow.
 
-| Mode | Interaction guard | Blacksmith reserve | Circle release |
-|------|-------------------|-------------------|----------------|
+| Mode | Interaction guard | Blacksmith reserve | Release |
+|------|-------------------|-------------------|---------|
 | normal | runs when needed | manual only | tag-triggered |
 | thin | runs when needed | manual only | tag-triggered |
 | off | skip | skip | tag-triggered |
@@ -78,9 +78,38 @@ interaction guard uses free standard GitHub-hosted public-repo compute; the
 Blacksmith Windows workflow runs only when a maintainer deliberately dispatches
 it. CircleCI credits/OSS allowance are budgeted independently.
 
-## CircleCI release pipeline
+## Release pipeline (GitHub Actions)
 
-Configuration: `.circleci/config.yml`, project **`nesszer/Win-CodexBar`**.
+Configuration: `.github/workflows/release.yml`, triggered by a canonical
+`vX.Y.Z` tag push, on GitHub's hosted `windows-latest` runner.
+
+Releases moved here from CircleCI because SignPath's Trusted Build System
+integration verifies build provenance through GitHub (`github-artifact-id`);
+artifacts built elsewhere cannot be signed under that policy. See
+[docs/CODE_SIGNING.md](../docs/CODE_SIGNING.md).
+
+1. **`build`** (no publish credential; asserts `GH_TOKEN` is absent) checks out
+   the tag with full history, runs `scripts/release-preflight.ps1`,
+   `scripts/install-release-prerequisites.ps1`, then
+   `scripts/circleci-release-build.ps1` — the same scripts CircleCI ran, so the
+   six assets and `release-manifest.json` are produced identically.
+2. It uploads the two installers, submits them to SignPath, replaces the
+   unsigned binaries with the signed ones, recomputes every `.sha256` sidecar
+   and the manifest hashes, and asserts `Get-AuthenticodeSignature` is `Valid`.
+   With `SIGNPATH_API_TOKEN` unset the signing steps skip and the release
+   publishes unsigned, exactly as before.
+3. **`publish`** is gated on the `release` GitHub Environment. Configure
+   required reviewers there — that is the manual hold the CircleCI
+   `release-approval` job used to provide. It is the only job with
+   `contents: write` and runs `scripts/publish-github-release.ps1`.
+
+## CircleCI release pipeline (dormant)
+
+Retained in `.circleci/config.yml` as a fallback. Nothing triggers it: the
+CircleCI project excludes tag pushes and `release.yml` no longer calls the
+CircleCI API. To use it, trigger the pipeline manually via the CircleCI API with
+the tag — note that it produces **unsigned** artifacts.
+
 Both jobs use CircleCI's hosted Windows executor (`circleci/windows@5.0`).
 
 1. `release-build` runs only when the workflow tag filter matches exactly

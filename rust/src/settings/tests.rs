@@ -1022,6 +1022,24 @@ fn test_per_provider_defaults_applied() {
 }
 
 #[test]
+fn compact_menu_layout_defaults_off_and_round_trips_through_raw() {
+    let settings = Settings::default();
+    assert!(!settings.compact_menu_layout);
+
+    let s = Settings {
+        compact_menu_layout: true,
+        ..Settings::default()
+    };
+    let json = serde_json::to_string(&s).expect("serialize");
+    let back: Settings = serde_json::from_str(&json).expect("deserialize");
+    assert!(back.compact_menu_layout);
+
+    // Settings files written before this option existed must still load.
+    let legacy: Settings = serde_json::from_str("{}").expect("deserialize legacy");
+    assert!(!legacy.compact_menu_layout);
+}
+
+#[test]
 fn codex_spark_usage_visibility_defaults_to_visible_and_roundtrips() {
     let mut settings = Settings::default();
     assert!(settings.codex_spark_usage_visible());

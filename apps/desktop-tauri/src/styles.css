@@ -6038,3 +6038,166 @@ button, input, select, textarea {
 .select {
   max-width: 240px;
 }
+
+/* ── On-pace mark ───────────────────────────────────────────────────
+   Where consumption should stand right now. Sitting left of the mark means
+   the reserve line below the bar is positive; past it means over pace. */
+.menu-metric__bar {
+  position: relative;
+}
+.menu-metric__bar-pace {
+  position: absolute;
+  top: -1px;
+  bottom: -1px;
+  width: 2px;
+  margin-left: -1px;
+  border-radius: 1px;
+  background: var(--provider-status-ok);
+  /* Readable over both the filled and unfilled halves of the track. */
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+}
+[data-theme="light"] .menu-metric__bar-pace {
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.7);
+}
+
+/* ── Compact menu layout (Settings → Menu → "Compact layout") ────────
+   Density only: every row still renders, nothing is hidden.
+
+   These are scoped `.menu-surface--tray.menu-surface--compact` (0,3,0) rather
+   than `.menu-surface--compact` (0,2,0) on purpose. The tray block above
+   hardcodes px for almost every type size and gap, which outranks the design
+   tokens; a single-class compact rule ties with it and loses to anything
+   declared later. Raising specificity makes the override independent of
+   source order. */
+.menu-surface--compact {
+  --font-body: 11px;
+  --font-headline: 11px;
+  --font-caption: 9px;
+  --font-caption2: 9px;
+  --bar-height: 4px;
+  --bar-radius: 2px;
+}
+
+/* Card shell */
+.menu-surface--tray.menu-surface--compact .menu-card,
+.menu-surface--compact .menu-card {
+  --menu-card-x: 12px;
+  --menu-card-header-only-y: 3px;
+  --menu-card-section-y: 3px;
+  --menu-card-header-line-gap: 1px;
+  gap: 3px;
+}
+.menu-surface--tray.menu-surface--compact .menu-stack,
+.menu-surface--compact .menu-stack {
+  gap: 1px;
+}
+.menu-surface--tray.menu-surface--compact .menu-stack__item {
+  padding: 1px 0;
+}
+.menu-surface--tray.menu-surface--compact .menu-card__content,
+.menu-surface--compact .menu-card__content {
+  gap: 6px;
+  padding-bottom: 1px;
+}
+.menu-surface--tray.menu-surface--compact .menu-card__divider,
+.menu-surface--compact .menu-card__divider {
+  margin: 1px 0;
+}
+
+/* Card header type */
+.menu-surface--tray.menu-surface--compact .menu-card__name,
+.menu-surface--compact .menu-card__name {
+  font-size: 11px;
+}
+.menu-surface--tray.menu-surface--compact .menu-card__email,
+.menu-surface--compact .menu-card__email {
+  font-size: 9px;
+}
+.menu-surface--tray.menu-surface--compact .menu-card__subtitle,
+.menu-surface--tray.menu-surface--compact .menu-card__error-text,
+.menu-surface--tray.menu-surface--compact .menu-card__plan-badge,
+.menu-surface--compact .menu-card__subtitle,
+.menu-surface--compact .menu-card__plan-badge {
+  font-size: 9px;
+}
+
+/* Metric rows — the bulk of the panel height */
+.menu-surface--tray.menu-surface--compact .menu-metric,
+.menu-surface--compact .menu-metric {
+  gap: 2px;
+}
+.menu-surface--tray.menu-surface--compact .menu-metric__title,
+.menu-surface--compact .menu-metric__title {
+  font-size: 11px;
+}
+.menu-surface--tray.menu-surface--compact .menu-metric__bar,
+.menu-surface--compact .menu-metric__bar {
+  height: var(--bar-height);
+  border-radius: var(--bar-radius);
+}
+.menu-surface--tray.menu-surface--compact .menu-metric__pct,
+.menu-surface--tray.menu-surface--compact .menu-metric__reset,
+.menu-surface--tray.menu-surface--compact .menu-metric__reserve,
+.menu-surface--compact .menu-metric__pct,
+.menu-surface--compact .menu-metric__reset,
+.menu-surface--compact .menu-metric__reserve {
+  font-size: 9px;
+}
+.menu-surface--compact .menu-metric__budget {
+  gap: 3px;
+}
+.menu-surface--compact .menu-metric__budget-header,
+.menu-surface--compact .menu-metric__budget-pill,
+.menu-surface--compact .menu-metric__forecast .menu-metric__pct {
+  font-size: 9px;
+}
+
+/* Provider grid */
+.menu-surface--tray.menu-surface--compact .provider-grid {
+  gap: 4px 4px;
+  padding: 4px 10px 3px;
+}
+.menu-surface--tray.menu-surface--compact .provider-grid__item {
+  min-height: 26px;
+  padding: 1px 0;
+}
+
+/* Local usage block */
+.menu-surface--tray.menu-surface--compact .menu-card__local-grid,
+.menu-surface--compact .menu-card__local-grid {
+  gap: 5px 14px;
+}
+.menu-surface--tray.menu-surface--compact .menu-card__local-note,
+.menu-surface--compact .menu-card__local-note {
+  font-size: 9px;
+  line-height: 1.2;
+}
+.menu-surface--tray.menu-surface--compact .menu-card__local-usage {
+  padding-top: 1px;
+}
+
+/* Footer — `min-height` floors the row, so padding alone does nothing here */
+.menu-surface--tray.menu-surface--compact .menu-surface__footer,
+.menu-surface--compact .menu-surface__footer {
+  padding: 2px 0 1px;
+  margin-top: 1px;
+}
+.menu-surface--tray.menu-surface--compact .menu-surface__footer-row,
+.menu-surface--compact .menu-surface__footer-row {
+  padding: 1px 16px;
+  min-height: 14px;
+  font-size: 10px;
+  line-height: 1.2;
+}
+.menu-surface--tray.menu-surface--compact .menu-surface__footer-zoom {
+  padding-top: 2px;
+  padding-bottom: 2px;
+}
+
+/* Multi-account lanes */
+.menu-surface--tray.menu-surface--compact .codex-menu-accounts,
+.menu-surface--compact .codex-menu-accounts {
+  margin-top: 1px;
+  padding-top: 1px;
+}

@@ -54,6 +54,46 @@ pub enum CookieError {
              Paste the Cookie header manually, or use Firefox if that browser has the same login."
     )]
     AppBoundEncryption,
+
+    /// A background refresh asked to read a browser cookie store. Only an
+    /// explicit user-initiated import may do that — see [`ScanTrigger`].
+    #[error(
+        "Browser cookies are only read when you import them. Import them in          Settings for the provider, or paste the Cookie header manually."
+    )]
+    ManualImportRequired,
+}
+
+/// Who asked for a browser cookie store to be opened.
+///
+/// Reading Chromium's DPAPI-wrapped `Local State` key and decrypting its
+/// `Cookies` database is byte-for-byte what an infostealer does. Doing it on a
+/// timer — the provider refresh runs every few minutes by default — makes
+/// endpoint security products classify CodexBar as credential theft; Kaspersky's
+/// behavioural engine reports `PDM:Trojan.Win32.Generic` and terminates the
+/// process. So a cookie store is opened only when the user explicitly asks for
+/// an import, never from a background refresh.
+///
+/// Providers still receive cookies imported earlier: the shell passes the
+/// stored manual cookie into the fetch context. Only the implicit
+/// scan-every-browser fallback is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanTrigger {
+    /// The user asked for this read right now (Settings → provider → Cookies).
+    UserImport,
+    /// A background provider refresh. Never permitted to read cookie stores.
+    AutomaticRefresh,
+}
+
+impl ScanTrigger {
+    /// `Err(ManualImportRequired)` for anything that is not a user-initiated
+    /// import. Checked before any browser detection or file access happens, so
+    /// an automatic refresh leaves no trace on the cookie stores at all.
+    fn permit(self) -> Result<(), CookieError> {
+        match self {
+            Self::UserImport => Ok(()),
+            Self::AutomaticRefresh => Err(CookieError::ManualImportRequired),
+        }
+    }
 }
 
 impl CookieError {
@@ -95,11 +135,16 @@ impl Cookie {
 pub struct CookieExtractor;
 
 impl CookieExtractor {
-    /// Extract cookies for a domain from a browser
+    /// Extract cookies for a domain from a browser.
+    ///
+    /// `trigger` must be [`ScanTrigger::UserImport`]; a background refresh is
+    /// refused before the cookie database is touched.
     pub fn extract_for_domain(
         browser: &DetectedBrowser,
         domain: &str,
+        trigger: ScanTrigger,
     ) -> Result<Vec<Cookie>, CookieError> {
+        trigger.permit()?;
         let mut all_cookies = Vec::new();
         // Preserve the first ABE error seen so it can be surfaced when no cookies
         // were recovered from any profile of this browser.
@@ -661,8 +706,15 @@ fn domain_matches(host_key: &str, domain: &str) -> bool {
 }
 
 /// Helper to get cookies for a specific domain from any available browser
-pub fn get_cookies_for_domain(domain: &str) -> Result<Vec<Cookie>, CookieError> {
+pub fn get_cookies_for_domain(
+    domain: &str,
+    trigger: ScanTrigger,
+) -> Result<Vec<Cookie>, CookieError> {
     use super::detection::BrowserDetector;
+
+    // Refused before detection so an automatic refresh never enumerates
+    // browser profiles, let alone opens a cookie database.
+    trigger.permit()?;
 
     let browsers = BrowserDetector::detect_all();
 
@@ -676,7 +728,7 @@ pub fn get_cookies_for_domain(domain: &str) -> Result<Vec<Cookie>, CookieError> 
 
     // Try each browser until we find cookies
     for browser in browsers {
-        match CookieExtractor::extract_for_domain(&browser, domain) {
+        match CookieExtractor::extract_for_domain(&browser, domain, trigger) {
             Ok(cookies) if !cookies.is_empty() => {
                 tracing::debug!(
                     "Found {} cookies for {} in {}",
@@ -718,18 +770,23 @@ pub fn get_cookies_for_domain(domain: &str) -> Result<Vec<Cookie>, CookieError> 
 }
 
 /// Get a cookie header string for a domain
-pub fn get_cookie_header(domain: &str) -> Result<String, CookieError> {
-    let cookies = get_cookies_for_domain(domain)?;
+pub fn get_cookie_header(domain: &str, trigger: ScanTrigger) -> Result<String, CookieError> {
+    let cookies = get_cookies_for_domain(domain, trigger)?;
     Ok(CookieExtractor::build_cookie_header(&cookies))
 }
 
 /// Get a cookie header string from the first domain that has readable cookies.
-pub fn get_cookie_header_for_domains(domains: &[&str]) -> Result<String, CookieError> {
+pub fn get_cookie_header_for_domains(
+    domains: &[&str],
+    trigger: ScanTrigger,
+) -> Result<String, CookieError> {
+    trigger.permit()?;
+
     let mut app_bound_encryption_seen = false;
     let mut last_error = None;
 
     for domain in domains {
-        match get_cookie_header(domain) {
+        match get_cookie_header(domain, trigger) {
             Ok(header) if !header.trim().is_empty() => return Ok(header),
             Ok(_) => {}
             Err(CookieError::AppBoundEncryption) => app_bound_encryption_seen = true,
@@ -742,18 +799,6 @@ pub fn get_cookie_header_for_domains(domains: &[&str]) -> Result<String, CookieE
     } else {
         Err(last_error.unwrap_or_else(|| CookieError::NotFound(domains.join(", "))))
     }
-}
-
-/// Get a cookie header string for a domain from a specific browser
-pub fn get_cookie_header_from_browser(
-    domain: &str,
-    browser: &super::detection::DetectedBrowser,
-) -> Result<String, CookieError> {
-    let cookies = CookieExtractor::extract_for_domain(browser, domain)?;
-    if cookies.is_empty() {
-        return Err(CookieError::NotFound(domain.to_string()));
-    }
-    Ok(CookieExtractor::build_cookie_header(&cookies))
 }
 
 #[cfg(test)]
@@ -770,24 +815,33 @@ mod tests {
         assert!(!domain_matches("chatgpt.com.evil.test", "chatgpt.com"));
     }
 
+    /// A background refresh must never reach a cookie store. This replaces an
+    /// older assertion-free test that read the developer's real `claude.ai`
+    /// cookies on every `cargo test` run — the behaviour this gate exists to
+    /// stop, and enough on its own to get the test binary flagged.
     #[test]
-    fn test_cookie_extraction() {
-        // This test will only work on a machine with Chrome installed
-        match get_cookies_for_domain("claude.ai") {
-            Ok(cookies) => {
-                println!("Found {} cookies for claude.ai", cookies.len());
-                for cookie in &cookies {
-                    println!(
-                        "  {}={}",
-                        cookie.name,
-                        &cookie.value[..20.min(cookie.value.len())]
-                    );
-                }
-            }
-            Err(e) => {
-                println!("Could not get cookies: {}", e);
-            }
+    fn automatic_refresh_never_reads_a_cookie_store() {
+        for result in [
+            get_cookies_for_domain("claude.ai", ScanTrigger::AutomaticRefresh).map(|_| ()),
+            get_cookie_header("claude.ai", ScanTrigger::AutomaticRefresh).map(|_| ()),
+            get_cookie_header_for_domains(&["claude.ai"], ScanTrigger::AutomaticRefresh)
+                .map(|_| ()),
+        ] {
+            assert!(
+                matches!(result, Err(CookieError::ManualImportRequired)),
+                "automatic refresh must be refused, got {result:?}"
+            );
         }
+    }
+
+    /// The refusal message has to tell the user what to do instead.
+    #[test]
+    fn manual_import_required_message_points_at_the_import_flow() {
+        let msg = CookieError::ManualImportRequired.to_string();
+        assert!(
+            msg.contains("import"),
+            "message should mention importing: {msg}"
+        );
     }
 
     /// Verify that the ABE error variant formats a readable, actionable message.

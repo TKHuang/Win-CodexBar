@@ -102,15 +102,21 @@ fn resolve_web_tokens(input: WebTokenInput) -> Vec<WebTokenCandidate> {
     candidates
 }
 
-/// Browser import only: the first usable `kimi-auth`-class token from any of
-/// the registered Kimi cookie domains.
+/// First usable `kimi-auth`-class token from any registered Kimi cookie domain.
+///
+/// Reached from the fetch path, so it runs as
+/// [`ScanTrigger::AutomaticRefresh`](crate::browser::cookies::ScanTrigger) and
+/// resolves to `None` unless the user imported cookies for Kimi.
 fn browser_auth_token() -> Option<String> {
     KIMI_COOKIE_DOMAINS
         .iter()
         .find_map(|domain| {
-            get_cookie_header(domain)
-                .ok()
-                .filter(|header| !header.is_empty())
+            get_cookie_header(
+                domain,
+                crate::browser::cookies::ScanTrigger::AutomaticRefresh,
+            )
+            .ok()
+            .filter(|header| !header.is_empty())
         })
         .and_then(|header| KimiProvider::auth_token_from_cookie_header(&header).ok())
 }

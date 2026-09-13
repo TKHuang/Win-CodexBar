@@ -1,7 +1,10 @@
 # ADR 0004: CircleCI release-only pipeline and dual-CI trust boundary
 
 Date: 2026-08-14
-Status: Accepted; supersedes the release-local portion of ADR 0001
+Status: Accepted; supersedes the release-local portion of ADR 0001.
+The release pipeline decision below is superseded by ADR 0007 — releases
+now build on GitHub Actions so SignPath can verify build provenance. The
+CircleCI pipeline described here is retained as a dormant fallback.
 
 ## Context
 

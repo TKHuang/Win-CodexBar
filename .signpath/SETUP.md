@@ -5,7 +5,7 @@ This guide covers the one-time setup to enable code signing for Win-CodexBar rel
 ## Prerequisites
 
 - SignPath Foundation program acceptance (confirmed)
-- Admin access to the `nesszer/Win-CodexBar` GitHub repo
+- Admin access to the `TKHuang/Win-CodexBar` GitHub repo
 - Admin access to the SignPath organization
 
 ## Step 1: Accept the SignPath organization invitation
@@ -14,7 +14,7 @@ Check your email for a SignPath invitation. Accept it and log in at https://app.
 
 ## Step 2: Add GitHub repo secrets
 
-In `nesszer/Win-CodexBar` → Settings → Secrets and variables → Actions → New repository secret, add:
+In `TKHuang/Win-CodexBar` → Settings → Secrets and variables → Actions → New repository secret, add:
 
 | Secret name | Value | Source |
 |---|---|---|
@@ -40,7 +40,7 @@ The configuration signs both `CodexBar-<version>-Setup.exe` and `CodexBar-<versi
 ## Step 4: Configure the Trusted Build System
 
 1. In SignPath → Organization → Trusted Build Systems → Add GitHub.com
-2. Install the [SignPath GitHub App](https://github.com/apps/signpath) on the `nesszer/Win-CodexBar` repo
+2. Install the [SignPath GitHub App](https://github.com/apps/signpath) on the `TKHuang/Win-CodexBar` repo
 3. Link the Trusted Build System to your SignPath project
 4. Set the signing policy to require manual approval (the approver is listed in `docs/CODE_SIGNING.md`)
 
@@ -55,8 +55,9 @@ Example policy file structure:
 ```yaml
 github-policies:
   runners:
-    allowed_groups:
-      - 'blacksmith-4vcpu-windows-2025'
+    # release.yml builds on GitHub's hosted windows-latest. Pinning a custom
+    # runner group here would reject every release signing request.
+    allow_github_hosted: true
   build:
     disallow_reruns: true
   branch_rulesets:
@@ -94,7 +95,7 @@ Get-AuthenticodeSignature .\CodexBar-0.54.0-Setup.exe
    ```powershell
    git tag -d v0.0.1
    git push origin :refs/tags/v0.0.1
-   gh release delete v0.0.1 --repo nesszer/Win-CodexBar --yes
+   gh release delete v0.0.1 --repo TKHuang/Win-CodexBar --yes
    git revert HEAD --no-edit
    git push origin main
    ```

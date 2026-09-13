@@ -25,6 +25,9 @@ pub struct RateWindowSnapshot {
     pub is_informational: bool,
     #[serde(default)]
     pub reserve_percent: Option<f64>,
+    /// Percent consumed beyond the on-pace expectation (positive pace delta).
+    #[serde(default)]
+    pub over_percent: Option<f64>,
     #[serde(default)]
     pub reserve_description: Option<String>,
     #[serde(default)]
@@ -50,24 +53,44 @@ impl RateWindowSnapshot {
             is_exhausted: rw.is_exhausted(),
             is_informational: rw.is_informational,
             reserve_percent: None,
+            over_percent: None,
             reserve_description: None,
             reserve_will_last_to_reset: false,
             reserve_eta_seconds: None,
         }
     }
 
-    /// Enrich with raw reserve info derived from pace analysis.
-    /// delta_percent = actual - expected; negative means ahead (in reserve).
-    /// Only meaningful for longer windows (weekly); skip if reserve rounds to 0.
+    /// Enrich with raw pace info. `delta_percent` = actual - expected, so a
+    /// negative delta is unspent budget (reserve) and a positive delta is spend
+    /// ahead of schedule (over). Skip when the delta rounds to 0.
     /// Localization happens at render time so cached snapshots stay language-neutral.
-    fn with_pace_reserve(mut self, pace: &codexbar::core::UsagePace) -> Self {
-        let reserve = pace.delta_percent.abs().round();
-        if pace.delta_percent < 0.0 && reserve > 0.0 {
-            self.reserve_percent = Some(reserve);
-            self.reserve_will_last_to_reset = pace.will_last_to_reset;
-            self.reserve_eta_seconds = pace.eta_seconds;
+    fn with_pace(mut self, pace: &codexbar::core::UsagePace) -> Self {
+        let delta = pace.delta_percent.round();
+        if delta == 0.0 {
+            return self;
         }
+        if delta < 0.0 {
+            self.reserve_percent = Some(-delta);
+        } else {
+            self.over_percent = Some(delta);
+        }
+        self.reserve_will_last_to_reset = pace.will_last_to_reset;
+        self.reserve_eta_seconds = pace.eta_seconds;
         self
+    }
+}
+
+/// Snapshot one rate window, attaching pace-derived reserve/over info when the
+/// provider's numbers are authoritative enough to pace against. Informational
+/// lanes carry no quota, so there is nothing to pace them against.
+fn window_snapshot_with_pace(window: &RateWindow, allows_pace: bool) -> RateWindowSnapshot {
+    let snap = RateWindowSnapshot::from_rate_window(window);
+    match (allows_pace && !window.is_informational)
+        .then(|| codexbar::core::UsagePace::weekly(window, None, 10080))
+        .flatten()
+    {
+        Some(pace) => snap.with_pace(&pace),
+        None => snap,
     }
 }
 
@@ -308,24 +331,14 @@ impl ProviderUsageSnapshot {
             actual_used_percent: p.actual_used_percent,
         });
 
-        // Compute pace for secondary window (weekly) to derive reserve info
-        let secondary_pace = allows_pace.then(|| {
-            usage
-                .secondary
-                .as_ref()
-                .and_then(|sw| codexbar::core::UsagePace::weekly(sw, None, 10080))
-        });
-        let secondary_pace = secondary_pace.flatten();
+        // Every real quota window carries its own reserve/over line (upstream
+        // parity): session, weekly, model-scoped and provider extras alike.
+        let primary_snap = window_snapshot_with_pace(&usage.primary, allows_pace);
 
-        let primary_snap = RateWindowSnapshot::from_rate_window(&usage.primary);
-
-        let secondary_snap = usage.secondary.as_ref().map(|sw| {
-            let mut s = RateWindowSnapshot::from_rate_window(sw);
-            if let Some(ref p) = secondary_pace {
-                s = s.with_pace_reserve(p);
-            }
-            s
-        });
+        let secondary_snap = usage
+            .secondary
+            .as_ref()
+            .map(|sw| window_snapshot_with_pace(sw, allows_pace));
 
         // Scope forecast history to the signed-in account so switching accounts on one
         // provider does not blend burn samples across plans. Codex publishes no email or
@@ -359,11 +372,11 @@ impl ProviderUsageSnapshot {
             model_specific: usage
                 .model_specific
                 .as_ref()
-                .map(RateWindowSnapshot::from_rate_window),
+                .map(|w| window_snapshot_with_pace(w, allows_pace)),
             tertiary: usage
                 .tertiary
                 .as_ref()
-                .map(RateWindowSnapshot::from_rate_window),
+                .map(|w| window_snapshot_with_pace(w, allows_pace)),
             // F5 (upstream 0.48.0): label the tertiary lane by its duration cadence
             // so surfaces (MenuCard, CLI, tray) can show "Monthly" instead of the
             // generic "DetailWindowTertiary" slot key.
@@ -381,7 +394,7 @@ impl ProviderUsageSnapshot {
                 .map(|extra| NamedRateWindowSnapshot {
                     id: extra.id.clone(),
                     title: extra.title.clone(),
-                    window: RateWindowSnapshot::from_rate_window(&extra.window),
+                    window: window_snapshot_with_pace(&extra.window, allows_pace),
                 })
                 .collect(),
             cost: result.cost.as_ref().map(|c| CostSnapshotBridge {
@@ -450,6 +463,7 @@ impl ProviderUsageSnapshot {
                 is_exhausted: false,
                 is_informational: false,
                 reserve_percent: None,
+                over_percent: None,
                 reserve_description: None,
                 reserve_will_last_to_reset: false,
                 reserve_eta_seconds: None,
@@ -593,6 +607,7 @@ pub struct SettingsSnapshot {
         std::collections::HashMap<String, codexbar::settings::UsageThresholdOverride>,
     predictive_pace_warning_enabled: bool,
     show_pace: bool,
+    compact_menu_layout: bool,
     tray_icon_mode: &'static str,
     switcher_shows_icons: bool,
     menu_bar_shows_highest_usage: bool,
@@ -710,6 +725,7 @@ impl From<Settings> for SettingsSnapshot {
             provider_usage_thresholds: settings.provider_usage_thresholds,
             predictive_pace_warning_enabled: settings.predictive_pace_warning_enabled,
             show_pace: settings.show_pace,
+            compact_menu_layout: settings.compact_menu_layout,
             tray_icon_mode: tray_icon_mode_label(settings.tray_icon_mode),
             switcher_shows_icons: settings.switcher_shows_icons,
             menu_bar_shows_highest_usage: settings.menu_bar_shows_highest_usage,
@@ -902,6 +918,7 @@ mod tests {
             is_exhausted: false,
             is_informational: false,
             reserve_percent: None,
+            over_percent: None,
             reserve_description: None,
             reserve_will_last_to_reset: false,
             reserve_eta_seconds: None,

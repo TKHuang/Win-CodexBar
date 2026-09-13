@@ -151,17 +151,29 @@ pub use zed::ZedProvider;
 pub use zenmux::ZenMuxProvider;
 pub use zoommate::ZoomMateProvider;
 
+/// Cookie header fallback for a provider fetch.
+///
+/// Always runs as [`ScanTrigger::AutomaticRefresh`], so it never reads a browser
+/// cookie store — it resolves to `NoCookies` unless the user imported cookies,
+/// in which case the shell passes them in and this fallback is not reached.
 pub(crate) fn browser_cookie_header(
     domains: &[&str],
 ) -> Result<String, crate::core::ProviderError> {
-    crate::browser::cookies::get_cookie_header_for_domains(domains)
-        .map_err(map_browser_cookie_error)
+    crate::browser::cookies::get_cookie_header_for_domains(
+        domains,
+        crate::browser::cookies::ScanTrigger::AutomaticRefresh,
+    )
+    .map_err(map_browser_cookie_error)
 }
 
 pub(crate) fn browser_cookies_for_domain(
     domain: &str,
 ) -> Result<Vec<crate::browser::cookies::Cookie>, crate::core::ProviderError> {
-    crate::browser::cookies::get_cookies_for_domain(domain).map_err(map_browser_cookie_error)
+    crate::browser::cookies::get_cookies_for_domain(
+        domain,
+        crate::browser::cookies::ScanTrigger::AutomaticRefresh,
+    )
+    .map_err(map_browser_cookie_error)
 }
 
 fn map_browser_cookie_error(
@@ -169,7 +181,8 @@ fn map_browser_cookie_error(
 ) -> crate::core::ProviderError {
     match error {
         crate::browser::cookies::CookieError::BrowserNotInstalled
-        | crate::browser::cookies::CookieError::NotFound(_) => {
+        | crate::browser::cookies::CookieError::NotFound(_)
+        | crate::browser::cookies::CookieError::ManualImportRequired => {
             crate::core::ProviderError::NoCookies
         }
         _ => crate::core::ProviderError::Other(format!("Failed to read browser cookies: {error}")),

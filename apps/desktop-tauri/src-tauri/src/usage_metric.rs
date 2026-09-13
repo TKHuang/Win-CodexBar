@@ -176,6 +176,7 @@ fn derived_window(used_percent: f64, resets_at: Option<String>) -> RateWindowSna
         is_exhausted: used_percent >= 100.0,
         is_informational: false,
         reserve_percent: None,
+        over_percent: None,
         reserve_description: None,
         reserve_will_last_to_reset: false,
         reserve_eta_seconds: None,

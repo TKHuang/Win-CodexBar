@@ -22,12 +22,12 @@ import { SimpleBarChart, StackedBarChart } from "./MiniBarChart";
 import { getPaceBudget, type PaceBudget } from "../lib/paceBudget";
 import PaceDetailsChart from "./PaceDetailsChart";
 
-/** Format a reserve description from raw pace data at render time. */
+/** Format a pace description (reserve or over) from raw pace data at render time. */
 function formatReserveDescription(
   snap: RateWindowSnapshot,
   t: (key: LocaleKey) => string,
 ): string | null {
-  if (snap.reservePercent == null) return null;
+  if (snap.reservePercent == null && snap.overPercent == null) return null;
   if (snap.reserveWillLastToReset) {
     return t("PanelReserveLastsUntilReset");
   }
@@ -255,24 +255,46 @@ export interface MetricEntry {
   sessionEquivalentForecast?: SessionEquivalentForecastSnapshot | null;
 }
 
-type MetricPaceView =
-  | { kind: "budget"; budget: PaceBudget }
-  | { kind: "reserve"; percent: number }
-  | { kind: "none" };
+type MetricPaceDelta = { kind: "reserve" | "over"; percent: number };
 
-function getMetricPaceView(snap: RateWindowSnapshot): MetricPaceView {
-  if (snap.isExhausted) return { kind: "none" };
-
-  const isWeeklyWindow =
-    snap.windowMinutes != null && snap.windowMinutes >= WEEKLY_WINDOW_MINUTES;
-  const budget = isWeeklyWindow ? getPaceBudget(snap) : null;
-  if (budget) return { kind: "budget", budget };
-
+/** Reserve/over line — shown for every quota window that has pace data. */
+function getMetricPaceDelta(snap: RateWindowSnapshot): MetricPaceDelta | null {
+  if (snap.isExhausted) return null;
   if (snap.reservePercent != null) {
     return { kind: "reserve", percent: snap.reservePercent };
   }
+  if (snap.overPercent != null) {
+    return { kind: "over", percent: snap.overPercent };
+  }
+  return null;
+}
 
-  return { kind: "none" };
+/**
+ * Position of the on-pace mark: where consumption *should* stand right now.
+ * `reserve` is how far behind that mark you are, `over` how far past it, so the
+ * mark sits at used+reserve or used-over. Returns null when there is no pace
+ * data, or when the mark would land on either end of the bar (nothing to show).
+ */
+function getPaceMarkPercent(snap: RateWindowSnapshot): number | null {
+  if (snap.isExhausted) return null;
+  const used = Number.isFinite(snap.usedPercent) ? Math.max(0, snap.usedPercent) : 0;
+  const expected =
+    snap.reservePercent != null
+      ? used + snap.reservePercent
+      : snap.overPercent != null
+        ? used - snap.overPercent
+        : null;
+  if (expected == null) return null;
+  const clamped = Math.min(100, Math.max(0, expected));
+  return clamped <= 0 || clamped >= 100 ? null : clamped;
+}
+
+/** Expandable on-pace budget breakdown — weekly windows only. */
+function getMetricPaceBudget(snap: RateWindowSnapshot): PaceBudget | null {
+  if (snap.isExhausted) return null;
+  const isWeeklyWindow =
+    snap.windowMinutes != null && snap.windowMinutes >= WEEKLY_WINDOW_MINUTES;
+  return isWeeklyWindow ? getPaceBudget(snap) : null;
 }
 type MetricRowDisplay = {
   resetTimeRelative: boolean;
@@ -336,7 +358,13 @@ function MetricRow({
     Number.isFinite(resetTarget) &&
     resetTarget > Date.now() &&
     resetText !== null;
-  const paceView = showPace ? getMetricPaceView(snap) : { kind: "none" as const };
+  const paceDelta = showPace ? getMetricPaceDelta(snap) : null;
+  const paceBudget = showPace ? getMetricPaceBudget(snap) : null;
+  const paceMark = showPace ? getPaceMarkPercent(snap) : null;
+  // The bar flips to "remaining" under showAsUsed=false, so the mark has to
+  // flip with it or it would point at the wrong end.
+  const paceMarkOffset =
+    paceMark == null ? null : showAsUsed ? paceMark : 100 - paceMark;
   const reserveDescription = formatReserveDescription(snap, t);
   const forecastText = formatSessionEquivalentEstimate(sessionEquivalentForecast);
   return (
@@ -345,6 +373,14 @@ function MetricRow({
       {!isInformational && (
         <div className="menu-metric__bar">
           <div className="menu-metric__bar-fill" data-level={level} style={{ width: `${barDisplayPct}%` }} />
+          {paceMarkOffset != null && (
+            <span
+              className="menu-metric__bar-pace"
+              style={{ left: `${paceMarkOffset}%` }}
+              title={`${t("PanelExpected")} ${Math.round(paceMark!)}%`}
+              aria-hidden
+            />
+          )}
         </div>
       )}
       <div className="menu-metric__row">
@@ -368,7 +404,21 @@ function MetricRow({
       {!isInformational && snap.isExhausted && (
         <div className="menu-metric__exhausted">{exhaustedLabel}</div>
       )}
-      {!isInformational && paceView.kind === "budget" && (
+      {!isInformational && paceDelta && (
+        <div
+          className="menu-metric__row menu-metric__reserve"
+          data-pace-delta={paceDelta.kind}
+        >
+          <span className="menu-metric__pct">
+            {Math.round(paceDelta.percent)}%{" "}
+            {t(paceDelta.kind === "over" ? "PanelOverPaceSuffix" : "PanelReserveSuffix")}
+          </span>
+          {reserveDescription && (
+            <span className="menu-metric__reset">{reserveDescription}</span>
+          )}
+        </div>
+      )}
+      {!isInformational && paceBudget && (
         <div className="menu-metric__budget">
           <button
             type="button"
@@ -377,14 +427,13 @@ function MetricRow({
             aria-expanded={expanded}
           >
             <span>{t("PanelOnPaceBudget")}</span>
-            {reserveDescription && <span>{reserveDescription}</span>}
           </button>
           {expanded && <div className="menu-metric__budget-pills">
             {[
-              [t("PanelNow"), paceView.budget.now],
-              [t("PanelOneHour"), paceView.budget.nextHour],
-              [t("PanelFiveHours"), paceView.budget.nextFiveHours],
-              [t("PanelTodayBudget"), paceView.budget.today],
+              [t("PanelNow"), paceBudget.now],
+              [t("PanelOneHour"), paceBudget.nextHour],
+              [t("PanelFiveHours"), paceBudget.nextFiveHours],
+              [t("PanelTodayBudget"), paceBudget.today],
             ].map(([label, value]) => (
               <span className="menu-metric__budget-pill" key={String(label)}>
                 {label} {formatBudget(Number(value))}%
@@ -392,14 +441,6 @@ function MetricRow({
             ))}
           </div>}
           {expanded && <PaceDetailsChart snap={snap} t={t} />}
-        </div>
-      )}
-      {!isInformational && paceView.kind === "reserve" && (
-        <div className="menu-metric__row menu-metric__reserve">
-          <span className="menu-metric__pct">{Math.round(paceView.percent)}% {t("PanelReserveSuffix")}</span>
-          {reserveDescription && (
-            <span className="menu-metric__reset">{reserveDescription}</span>
-          )}
         </div>
       )}
       {showPace && !isInformational && forecastText && (

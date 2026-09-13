@@ -705,11 +705,6 @@ pub trait Provider: Send + Sync {
         true
     }
 
-    /// Whether browser-cookie discovery/recovery is owned by the provider.
-    fn owns_browser_cookie_resolution(&self) -> bool {
-        false
-    }
-
     /// How the shell should treat a failed refresh when a prior good snapshot exists.
     fn last_good_failure_policy(&self, _error: &str) -> LastGoodFailurePolicy {
         LastGoodFailurePolicy::Replace

@@ -501,10 +501,6 @@ impl Provider for ClaudeProvider {
         true
     }
 
-    fn owns_browser_cookie_resolution(&self) -> bool {
-        true
-    }
-
     fn last_good_failure_policy(&self, error: &str) -> LastGoodFailurePolicy {
         last_good_failure_policy_for_error(error)
     }

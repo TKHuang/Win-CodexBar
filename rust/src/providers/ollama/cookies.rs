@@ -168,7 +168,11 @@ pub(super) fn resolve_browser_cookie_header(
 
     let mut first_error = None;
     for browser in BrowserDetector::detect_all() {
-        match CookieExtractor::extract_for_domain(&browser, OLLAMA_COOKIE_DOMAIN) {
+        match CookieExtractor::extract_for_domain(
+            &browser,
+            OLLAMA_COOKIE_DOMAIN,
+            crate::browser::cookies::ScanTrigger::AutomaticRefresh,
+        ) {
             Ok(cookies) => {
                 if let Some(header) = ollama_cookie_header_for_url(&cookies, &url) {
                     return Ok(Some(header));

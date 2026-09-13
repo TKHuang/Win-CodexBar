@@ -73,4 +73,15 @@ describe("DisplayTab window scale", () => {
 
     expect(set).toHaveBeenCalledWith({ showPace: true });
   });
+
+  it("updates the compact menu layout preference", () => {
+    const set = vi.fn();
+    renderTab(set);
+
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: "CompactMenuLayoutLabel" }),
+    );
+
+    expect(set).toHaveBeenCalledWith({ compactMenuLayout: true });
+  });
 });

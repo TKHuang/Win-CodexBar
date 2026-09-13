@@ -176,6 +176,7 @@ mod tests {
             is_exhausted: false,
             is_informational: false,
             reserve_percent: None,
+            over_percent: None,
             reserve_description: None,
             reserve_eta_seconds: None,
             reserve_will_last_to_reset: false,
