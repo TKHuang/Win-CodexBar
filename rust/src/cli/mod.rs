@@ -15,13 +15,17 @@ pub mod account;
 pub mod autostart;
 pub mod config;
 pub mod cost;
+mod cost_period;
 pub mod dashboard;
 pub mod diagnose;
+mod error_kind;
+mod fetch_context;
 pub mod guard;
 pub mod hooks;
 pub mod serve;
 pub mod sessions;
 pub mod toon;
+pub mod tty_responder;
 pub mod tty_runner;
 pub mod usage;
 pub mod workspaces;
@@ -85,7 +89,7 @@ pub enum Commands {
     /// List or focus local and configured remote agent sessions
     Sessions(sessions::SessionsArgs),
 
-    /// Serve usage and cost JSON on 127.0.0.1
+    /// Serve the local dashboard, JSON APIs, and optional Prometheus metrics
     Serve(serve::ServeArgs),
 
     /// Emit a one-shot dashboard snapshot (JSON to stdout or --output file)

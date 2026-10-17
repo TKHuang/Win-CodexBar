@@ -13,7 +13,7 @@ use crate::core::{
     instantiate_provider,
 };
 use crate::settings::{ApiKeys, Settings};
-use crate::status::{StatusLevel, fetch_provider_status};
+use crate::status::{StatusIndicator, fetch_provider_status};
 
 #[derive(Args, Debug, Clone)]
 pub struct HooksArgs {
@@ -57,7 +57,7 @@ pub struct HooksToggleArgs {
 
 #[derive(Args, Debug, Clone)]
 pub struct HooksTestArgs {
-    /// Event name (quota_low, quota_reached, quota_reset, provider_unavailable, provider_recovered, refresh_failed)
+    /// Event name (quota_low, quota_reached, quota_reset, usage_updated, provider_unavailable, provider_recovered, refresh_failed)
     pub event: String,
     /// Provider CLI name
     #[arg(long)]
@@ -215,7 +215,12 @@ async fn run_watch(args: HooksWatchArgs) -> anyhow::Result<()> {
                     },
                     None => hooks.clone(),
                 };
-                HookRunner::dispatch(&dispatch.event, &dispatch_config, &rate_limiter);
+                HookRunner::dispatch(
+                    &dispatch.event,
+                    &dispatch_config,
+                    &rate_limiter,
+                    dispatch.rate_limit_scope.as_deref(),
+                );
             }
         }
 
@@ -274,8 +279,8 @@ async fn hooks_watch_observation(
     web_timeout: u64,
     verbose: bool,
 ) -> HookProviderObservation {
-    let status = match fetch_provider_status(provider_id.cli_name()).await {
-        Some(s) => map_status_level(s.level),
+    let status = match fetch_provider_status(provider_id).await {
+        Some(s) => map_status_indicator(s.indicator),
         None => HookProviderStatus::Unknown,
     };
 
@@ -289,13 +294,20 @@ async fn hooks_watch_observation(
         web_timeout,
         verbose,
         manual_cookie_header: None,
+        manual_cookie_missing: false,
         api_key: None,
+        token_account_kind: None,
+        token_account_isolated: false,
         workspace_id: (!workspace.is_empty()).then(|| workspace.to_string()),
+        seat_credit_entitlement: settings.seat_credit_entitlement(provider_id),
         api_region: (!region.is_empty()).then(|| region.to_string()),
         gateway_url: (!gateway.is_empty()).then(|| gateway.to_string()),
         auto_prefer_web: false,
+        browser_cookie_import: false,
         // Hook watches keep the short optional-join grace.
         requires_optional_usage_completeness: false,
+        optional_details_enabled: settings.optional_details_enabled(provider_id),
+        live_usage_enabled: false,
     };
 
     if ctx.api_key.is_none() {
@@ -309,12 +321,19 @@ async fn hooks_watch_observation(
         Ok(result) => {
             let usage = &result.usage;
             let account = usage.account_email.clone();
+            let account_discriminator = result
+                .account_identity()
+                .map(str::trim)
+                .filter(|identity| !identity.is_empty())
+                .map(|identity| format!("provider-account:{}", identity.to_ascii_lowercase()));
             HookProviderObservation {
                 provider: provider_id.cli_name().to_string(),
                 lanes: hooks_watch_lanes(provider_id, usage, settings, account.as_deref()),
                 status,
                 refresh_failure_status: None,
                 account_display_name: account,
+                successful_usage: Some(usage.clone()),
+                account_discriminator,
             }
         }
         Err(err) => HookProviderObservation {
@@ -323,6 +342,8 @@ async fn hooks_watch_observation(
             status,
             refresh_failure_status: Some(hook_refresh_failure_status(&err)),
             account_display_name: None,
+            successful_usage: None,
+            account_discriminator: None,
         },
     }
 }
@@ -364,13 +385,14 @@ fn hooks_watch_lanes(
     lanes
 }
 
-fn map_status_level(level: StatusLevel) -> HookProviderStatus {
-    match level {
-        StatusLevel::Operational => HookProviderStatus::None,
-        StatusLevel::Degraded => HookProviderStatus::Minor,
-        StatusLevel::Partial => HookProviderStatus::Major,
-        StatusLevel::Major => HookProviderStatus::Critical,
-        StatusLevel::Unknown => HookProviderStatus::Unknown,
+fn map_status_indicator(indicator: StatusIndicator) -> HookProviderStatus {
+    match indicator {
+        StatusIndicator::Operational => HookProviderStatus::None,
+        StatusIndicator::Minor => HookProviderStatus::Minor,
+        StatusIndicator::Major => HookProviderStatus::Major,
+        StatusIndicator::Critical => HookProviderStatus::Critical,
+        StatusIndicator::Maintenance => HookProviderStatus::Maintenance,
+        StatusIndicator::Unknown => HookProviderStatus::Unknown,
     }
 }
 
@@ -381,7 +403,9 @@ fn hook_refresh_failure_status(error: &ProviderError) -> String {
         | ProviderError::NoCookies
         | ProviderError::OAuth(_)
         | ProviderError::OAuthExpired(_)
-        | ProviderError::OAuthRevoked(_) => "auth_required".into(),
+        | ProviderError::OAuthRevoked(_)
+        | ProviderError::BrowserSignInRequired { .. } => "auth_required".into(),
+        ProviderError::OAuthTransient(_) => "rate_limited".into(),
         ProviderError::Timeout => "timeout".into(),
         ProviderError::Network(err) => {
             if err.is_timeout() {
@@ -392,6 +416,7 @@ fn hook_refresh_failure_status(error: &ProviderError) -> String {
                 "network_error".into()
             }
         }
+        ProviderError::OwnedTransport { source, .. } => hook_refresh_failure_status(source),
         ProviderError::NotInstalled(_) => "error".into(),
         ProviderError::Parse(_) | ProviderError::UnsupportedSource(_) | ProviderError::Other(_) => {
             "error".into()
@@ -535,7 +560,7 @@ fn run_test(args: HooksTestArgs) -> anyhow::Result<()> {
     let settings = Settings::load();
     if !settings.hooks_enabled {
         anyhow::bail!(
-            "Hooks are disabled in Settings (hooks_enabled=false). Enable them in Advanced."
+            "Hooks are disabled in Settings (hooks_enabled=false). Enable them in Settings > Hooks."
         );
     }
 
@@ -598,6 +623,13 @@ fn sample_event(event: HookEventType, provider: &str) -> HookEvent {
         HookEventType::QuotaLow => e = e.with_used_percent(85.0),
         HookEventType::QuotaReached => e = e.with_used_percent(100.0),
         HookEventType::QuotaReset => e = e.with_used_percent(5.0),
+        HookEventType::UsageUpdated => {
+            e = e
+                .with_used_percent(25.0)
+                .with_window_minutes(Some(300))
+                .with_secondary_usage_fraction(0.1)
+                .with_secondary_window_minutes(Some(10080));
+        }
         HookEventType::ProviderUnavailable => e = e.with_status("unavailable"),
         HookEventType::ProviderRecovered => e = e.with_status("ok"),
         HookEventType::RefreshFailed => e = e.with_status("refresh_failed"),
@@ -610,11 +642,12 @@ fn parse_event(raw: &str) -> anyhow::Result<HookEventType> {
         "quota_low" => Ok(HookEventType::QuotaLow),
         "quota_reached" => Ok(HookEventType::QuotaReached),
         "quota_reset" => Ok(HookEventType::QuotaReset),
+        "usage_updated" => Ok(HookEventType::UsageUpdated),
         "provider_unavailable" => Ok(HookEventType::ProviderUnavailable),
         "provider_recovered" => Ok(HookEventType::ProviderRecovered),
         "refresh_failed" => Ok(HookEventType::RefreshFailed),
         other => anyhow::bail!(
-            "Unknown event '{other}'. Use one of: quota_low, quota_reached, quota_reset, provider_unavailable, provider_recovered, refresh_failed."
+            "Unknown event '{other}'. Use one of: quota_low, quota_reached, quota_reset, usage_updated, provider_unavailable, provider_recovered, refresh_failed."
         ),
     }
 }
@@ -631,6 +664,15 @@ fn print_json<T: Serialize>(value: &T, pretty: bool) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_sign_in_failures_report_auth_required() {
+        let error = ProviderError::BrowserSignInRequired {
+            message: "Sign in at the provider page in your browser.".to_string(),
+            sign_in_url: "https://example.test/login".to_string(),
+        };
+        assert_eq!(hook_refresh_failure_status(&error), "auth_required");
+    }
 
     #[test]
     fn parses_event_names() {

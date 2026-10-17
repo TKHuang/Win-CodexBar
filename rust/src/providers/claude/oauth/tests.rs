@@ -1,6 +1,56 @@
-use super::{ClaudeOAuthCredentials, ClaudeOAuthFetcher, OAuthUsageResponse, UsageWindow};
+use super::{
+    ClaudeOAuthCredentials, ClaudeOAuthFetcher, OAuthUsageResponse, UsageWindow,
+    credential_identity, is_rate_limited_error,
+};
+use crate::core::ProviderError;
+use base64::Engine;
 use reqwest::header::HeaderValue;
 use std::time::Duration;
+
+#[test]
+fn saved_account_refresh_errors_distinguish_reauthentication_from_retry() {
+    assert!(matches!(
+        super::account_refresh_error(ProviderError::OAuth("invalid grant".into())),
+        ProviderError::OAuthRevoked(_)
+    ));
+    assert!(matches!(
+        super::account_refresh_error(ProviderError::OAuthTransient("cooldown".into())),
+        ProviderError::OAuthTransient(_)
+    ));
+}
+
+fn test_credentials(access_token: &str) -> ClaudeOAuthCredentials {
+    ClaudeOAuthCredentials {
+        access_token: access_token.to_string(),
+        refresh_token: None,
+        expires_at: None,
+        scopes: vec!["user:profile".to_string()],
+        rate_limit_tier: None,
+    }
+}
+
+#[test]
+fn credential_identity_uses_jwt_subject_when_available() {
+    let payload =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"sub":"account-123"}"#);
+    let identity = credential_identity(&test_credentials(&format!("header.{payload}.signature")));
+
+    assert_eq!(identity.as_deref(), Some("claude-account:account-123"));
+}
+
+#[test]
+fn opaque_credential_identity_is_a_non_secret_fingerprint() {
+    let token = "opaque-claude-token";
+    let identity = credential_identity(&test_credentials(token)).expect("identity");
+
+    assert_eq!(
+        identity,
+        format!(
+            "claude-credential:{}",
+            crate::core::sha256_hex(token.as_bytes())
+        )
+    );
+}
 
 #[test]
 fn keeps_sub_one_utilization_in_percent_units() {
@@ -43,6 +93,58 @@ fn preserves_existing_percentage_utilization() {
 }
 
 #[test]
+fn missing_oauth_session_is_informational_and_keeps_weekly_lane() {
+    let response: OAuthUsageResponse = serde_json::from_str(
+        r#"{
+            "seven_day": {"utilization": 51.0, "resets_at": "2026-08-20T12:00:00Z"}
+        }"#,
+    )
+    .expect("OAuth response without a session lane should parse");
+
+    let usage =
+        ClaudeOAuthFetcher::new().build_usage_snapshot(&response, &test_credentials("token"));
+
+    assert!(usage.primary.is_informational);
+    assert_eq!(usage.primary.window_minutes, Some(300));
+    assert_eq!(
+        usage.primary.reset_description.as_deref(),
+        Some("No active 5h session")
+    );
+    assert_eq!(usage.secondary.expect("weekly lane").used_percent, 51.0);
+}
+
+#[test]
+fn oauth_cloud_credits_block_becomes_display_row_and_leaves_windows_alone() {
+    let response: OAuthUsageResponse = serde_json::from_str(
+        r#"{
+            "five_hour": {"utilization": 10.0, "resets_at": "2026-05-22T22:10:00Z"},
+            "iguana_necktie": {"limit_dollars": 20.0, "used_dollars": 8.0, "remaining_dollars": 12.0}
+        }"#,
+    )
+    .expect("OAuth response with cloud credits should parse");
+
+    let row = super::cloud_credits_row(&response, chrono::Utc::now()).expect("cloud credits row");
+    assert_eq!(row.title(), "Cloud credits");
+    assert_eq!(row.value(), "$12.00 of $20.00 remaining");
+
+    let usage =
+        ClaudeOAuthFetcher::new().build_usage_snapshot(&response, &test_credentials("token"));
+    assert!((usage.primary.used_percent - 10.0).abs() < f64::EPSILON);
+    assert!(usage.secondary.is_none());
+}
+
+#[test]
+fn oauth_response_without_valid_cloud_credits_yields_no_row() {
+    let absent: OAuthUsageResponse =
+        serde_json::from_str(r#"{"five_hour": {"utilization": 1.0}}"#).expect("parse");
+    assert!(super::cloud_credits_row(&absent, chrono::Utc::now()).is_none());
+
+    let malformed: OAuthUsageResponse =
+        serde_json::from_str(r#"{"iguana_necktie": {"limit_dollars": 0.0}}"#).expect("parse");
+    assert!(super::cloud_credits_row(&malformed, chrono::Utc::now()).is_none());
+}
+
+#[test]
 fn parses_current_snake_case_oauth_usage_response() {
     let response: OAuthUsageResponse = serde_json::from_str(
         r#"{
@@ -80,6 +182,78 @@ fn parses_current_snake_case_oauth_usage_response() {
         .expect("Fable scoped weekly limit");
     assert_eq!(scoped.title, "Fable only");
     assert_eq!(scoped.window.used_percent, 7.0);
+}
+
+#[test]
+fn spend_only_oauth_response_projects_the_monthly_cap_into_one_meter() {
+    use chrono::{Datelike, Timelike};
+
+    let response: OAuthUsageResponse = serde_json::from_str(
+        r#"{
+            "five_hour": null,
+            "seven_day": null,
+            "extra_usage": {"is_enabled": true, "used_credits": 1234, "monthly_limit": 5000, "currency": "USD"}
+        }"#,
+    )
+    .expect("spend-only OAuth response should parse");
+
+    let mut usage =
+        ClaudeOAuthFetcher::new().build_usage_snapshot(&response, &test_credentials("token"));
+    assert!(
+        usage.primary.is_informational,
+        "no session lane before projection"
+    );
+
+    let cost = super::apply_spend_only_extra_usage(&mut usage, &response)
+        .expect("spend-only cap should attach a cost");
+
+    assert!(!usage.primary.is_informational);
+    assert!((usage.primary.used_percent - 24.68).abs() < 0.001);
+    assert_eq!(usage.primary_label.as_deref(), Some("Monthly"));
+    assert!(usage.secondary.is_none());
+    assert!(cost.folded_into_primary);
+    assert_eq!(cost.limit, Some(50.0));
+    assert!((cost.used - 12.34).abs() < 0.001);
+
+    let resets_at = usage.primary.resets_at.expect("inferred monthly reset");
+    assert_eq!(
+        (resets_at.day(), resets_at.hour(), resets_at.minute()),
+        (1, 0, 0)
+    );
+    assert!(resets_at > chrono::Utc::now());
+}
+
+#[test]
+fn quota_oauth_response_keeps_its_session_and_attaches_no_cost() {
+    let response: OAuthUsageResponse = serde_json::from_str(
+        r#"{
+            "five_hour": {"utilization": 10.0, "resets_at": "2026-05-22T22:10:00Z"},
+            "extra_usage": {"is_enabled": true, "used_credits": 1234, "monthly_limit": 5000, "currency": "USD"}
+        }"#,
+    )
+    .expect("quota OAuth response should parse");
+
+    let mut usage =
+        ClaudeOAuthFetcher::new().build_usage_snapshot(&response, &test_credentials("token"));
+    assert!(super::apply_spend_only_extra_usage(&mut usage, &response).is_none());
+
+    assert!((usage.primary.used_percent - 10.0).abs() < f64::EPSILON);
+    assert!(usage.primary_label.is_none());
+}
+
+#[test]
+fn uncapped_spend_only_oauth_response_stays_without_a_meter() {
+    let response: OAuthUsageResponse = serde_json::from_str(
+        r#"{
+            "extra_usage": {"is_enabled": true, "used_credits": 1234, "currency": "USD"}
+        }"#,
+    )
+    .expect("uncapped OAuth response should parse");
+
+    let mut usage =
+        ClaudeOAuthFetcher::new().build_usage_snapshot(&response, &test_credentials("token"));
+    assert!(super::apply_spend_only_extra_usage(&mut usage, &response).is_none());
+    assert!(usage.primary.is_informational);
 }
 
 #[test]
@@ -286,23 +460,29 @@ fn invalid_retry_after_uses_default_backoff() {
 }
 
 #[test]
-fn rate_limit_gate_blocks_and_clears() {
-    ClaudeOAuthFetcher::clear_rate_limit();
-
-    ClaudeOAuthFetcher::record_rate_limit(Duration::from_secs(30));
-    assert!(ClaudeOAuthFetcher::rate_limit_backoff_remaining().is_some());
-
-    ClaudeOAuthFetcher::clear_rate_limit();
-    assert!(ClaudeOAuthFetcher::rate_limit_backoff_remaining().is_none());
-}
-
-#[test]
 fn rate_limited_error_preserves_credentials_language() {
     let error = ClaudeOAuthFetcher::rate_limited_error(Duration::from_secs(5));
     let message = error.to_string();
 
+    assert!(matches!(error, ProviderError::OAuthTransient(_)));
     assert!(message.contains("rate limited"));
     assert!(message.contains("credentials were preserved"));
+}
+
+#[test]
+fn only_the_rate_limit_refusal_counts_as_rate_limited() {
+    let refusal = ClaudeOAuthFetcher::rate_limited_error(Duration::from_secs(5));
+    assert!(is_rate_limited_error(&refusal));
+
+    let same_text_other_variant = ProviderError::OAuth(match refusal {
+        ProviderError::OAuthTransient(message) => message,
+        other => panic!("unexpected {other:?}"),
+    });
+    assert!(!is_rate_limited_error(&same_text_other_variant));
+    assert!(!is_rate_limited_error(&ProviderError::OAuthTransient(
+        "Claude OAuth token expired and token refresh is cooling down after a failed attempt."
+            .to_string()
+    )));
 }
 
 #[test]
@@ -340,7 +520,7 @@ fn oauth_extras_put_scoped_weekly_before_routines() {
 }
 
 #[test]
-fn oauth_extras_hide_routines_when_disabled() {
+fn oauth_extras_keep_routines_in_raw_snapshot() {
     let response: OAuthUsageResponse = serde_json::from_str(
         r#"{
             "five_hour": {"utilization": 10.0},
@@ -362,17 +542,11 @@ fn oauth_extras_hide_routines_when_disabled() {
         scopes: vec![],
         rate_limit_tier: None,
     };
-    let usage =
-        ClaudeOAuthFetcher::new().build_usage_snapshot_with_options(&response, &credentials, false);
+    let usage = ClaudeOAuthFetcher::new().build_usage_snapshot(&response, &credentials);
 
-    assert!(
-        usage
-            .extra_rate_windows
-            .iter()
-            .all(|w| w.id != "claude-routines")
-    );
-    assert_eq!(usage.extra_rate_windows.len(), 1);
+    assert_eq!(usage.extra_rate_windows.len(), 2);
     assert_eq!(usage.extra_rate_windows[0].id, "claude-weekly-scoped-fable");
+    assert_eq!(usage.extra_rate_windows[1].id, "claude-routines");
 }
 
 // ── Refresh-token backoff (upstream 0.48.0 #2650 mapping) ───
@@ -476,4 +650,76 @@ fn backoff_kinds_have_distinct_user_messages() {
     let cooldown = super::refresh_cooldown_message();
     assert!(cooldown.contains("retry shortly"), "{cooldown}");
     assert!(cooldown.contains("claude login"), "{cooldown}");
+}
+
+#[test]
+fn missing_user_profile_scope_recommends_a_usable_credential_source() {
+    let recovery = super::ClaudeOAuthFetcher::scope_recovery_message();
+    assert!(recovery.contains("Claude Code sign-in"), "{recovery}");
+    assert!(recovery.contains("OAuth token override"), "{recovery}");
+    assert!(recovery.contains("switch Claude Source"), "{recovery}");
+    assert!(!recovery.contains("setup-token"), "{recovery}");
+
+    // Local-scope error: prefixed with the current scopes.
+    let credentials = test_credentials("token");
+    let local = format!(
+        "OAuth token missing 'user:profile' scope (has: {}). {recovery}",
+        credentials.scopes.join(", ")
+    );
+    assert!(local.contains("missing 'user:profile' scope"), "{local}");
+    assert!(!local.contains("setup-token"), "{local}");
+
+    // 403 response error.
+    let forbidden =
+        format!("OAuth token does not meet scope requirement 'user:profile'. {recovery}");
+    assert!(forbidden.contains("scope requirement"), "{forbidden}");
+    assert!(!forbidden.contains("setup-token"), "{forbidden}");
+}
+
+#[test]
+fn gate_precheck_blocks_with_unchanged_error_and_serves_cache_without_request() {
+    use super::usage_gate::UsageGate;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("CodexBar").join("gate.json");
+    let now = 1_000_000_000_000_i64;
+    let gate = std::sync::Mutex::new(UsageGate::new(Some(path.clone())));
+
+    assert!(ClaudeOAuthFetcher::gate_precheck(&gate, now, "fp").is_none());
+
+    gate.lock().unwrap().record_success(
+        now,
+        "fp",
+        r#"{"fiveHour":{"utilization":42.0,"resetsAt":"2030-01-01T00:00:00Z"}}"#.into(),
+    );
+    let cached = ClaudeOAuthFetcher::gate_precheck(&gate, now + 1000, "fp")
+        .expect("cached")
+        .expect("ok");
+    assert_eq!(cached.five_hour.unwrap().utilization, Some(42.0));
+    assert!(ClaudeOAuthFetcher::gate_precheck(&gate, now + 1000, "other").is_none());
+
+    gate.lock()
+        .unwrap()
+        .record_rate_limit(now + 4 * 60_000, "fp", Duration::ZERO);
+    let err = ClaudeOAuthFetcher::gate_precheck(&gate, now + 5 * 60_000, "fp")
+        .expect("blocked")
+        .unwrap_err();
+    assert!(is_rate_limited_error(&err));
+    assert_eq!(
+        err.to_string(),
+        ClaudeOAuthFetcher::rate_limited_error(Duration::from_secs(240)).to_string()
+    );
+}
+
+#[test]
+fn gate_survives_a_poisoned_mutex() {
+    use super::usage_gate::UsageGate;
+    let gate = std::sync::Arc::new(std::sync::Mutex::new(UsageGate::new(None)));
+    let g2 = gate.clone();
+    let joined = std::thread::spawn(move || {
+        let _guard = g2.lock().unwrap();
+        panic!("poison");
+    })
+    .join();
+    assert!(joined.is_err());
+    assert!(ClaudeOAuthFetcher::gate_precheck(&gate, 1_000_000_000_000, "fp").is_none());
 }

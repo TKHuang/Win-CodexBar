@@ -1,9 +1,45 @@
+use super::credential_alerts::{self, FetchAttempt};
+use super::provider_refresh::{
+    ProviderRefreshCompletion, ProviderRefreshReservation, complete_provider_refresh,
+    reserve_provider_refresh,
+};
+use super::warning_identity::WarningIdentity;
 use super::*;
 use chrono::{Local, Utc};
+use codexbar::core::HookUsageWindow;
+use codexbar::notifications::{LimitResetObservation, LimitResetSample, WarningScope};
 use serde::Serialize;
 use std::sync::Arc;
 
+mod reset_backfill;
+
 const MAX_CONCURRENT_PROVIDER_FETCHES: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshScope {
+    AllEnabled,
+    AutoResume,
+}
+
+impl RefreshScope {
+    fn provider_ids(self, settings: &Settings, enabled_ids: &[ProviderId]) -> Vec<ProviderId> {
+        match self {
+            Self::AllEnabled => enabled_ids.to_vec(),
+            Self::AutoResume => crate::auto_resume::enabled_provider_ids(settings),
+        }
+    }
+
+    fn refresh_account_lanes(self) -> bool {
+        matches!(self, Self::AllEnabled)
+    }
+
+    /// Upstream polls status pages from its full and per-provider refreshes
+    /// (`UsageStore.swift:842`). The 60-second auto-resume probe is
+    /// Windows-only, so it must not add status rounds of its own.
+    fn polls_status(self) -> bool {
+        matches!(self, Self::AllEnabled)
+    }
+}
 
 /// Account changes supersede the old identity's cache and any in-flight batch.
 pub(crate) fn invalidate_account_usage(
@@ -14,6 +50,8 @@ pub(crate) fn invalidate_account_usage(
     state.is_refreshing = false;
     state.provider_refresh_started_at = None;
     state.transient_provider_failure_counts.remove(&id);
+    state.last_good_owners.remove(&id);
+    state.auto_resume.clear_provider(id);
     state
         .provider_cache
         .retain(|snapshot| snapshot.provider_id != id.cli_name());
@@ -49,25 +87,173 @@ pub(crate) fn build_fetch_context(
     let active_token_cookie = token_override
         .as_ref()
         .and_then(|override_data| override_data.cookie_header.clone());
+    let defer_provider_browser_cookie_lookup = provider.owns_browser_cookie_resolution()
+        && active_token_cookie.is_none()
+        && stored_cookie.is_none();
     let active_token_env = token_override
         .as_ref()
         .and_then(|override_data| override_data.env_override.as_ref());
     let active_token_api_key = active_token_env.and_then(|env| env.values().next().cloned());
     let usage_source = SourceMode::parse(settings.usage_source(id)).unwrap_or_default();
+    let token_account_kind = token_override.as_ref().map(|account| account.kind);
     // Selected token-account key overrides a stored provider apiKey (upstream #2271 / #1183).
-    let api_key = active_token_api_key.or(stored_api_key);
+    let api_key = active_token_api_key.clone().or(stored_api_key);
     let has_kimi_code_api_key =
         id == ProviderId::Kimi && api_key.as_deref().is_some_and(|key| !key.trim().is_empty());
     let has_opencodego_api_key = id == ProviderId::OpenCodeGo
         && api_key.as_deref().is_some_and(|key| !key.trim().is_empty());
 
-    let (mut source_mode, cookie_header) = if id.cookie_domain().is_none() {
-        let source_mode = if active_token_env.is_some() {
-            SourceMode::OAuth
+    // Providers whose cookies only enrich an API result keep the configured
+    // usage source. Off and the default manual-without-cookie state never read
+    // a browser; only Automatic imports one (`browser_cookie_import`).
+    let cookies_only_enrich_usage = provider.cookies_only_enrich_usage();
+    let browser_cookie_import =
+        cookies_only_enrich_usage && matches!(cookie_source, "auto" | "browser" | "web");
+    let (mut source_mode, mut cookie_header, fails_closed_without_cookie) = if id
+        .cookie_domain()
+        .is_none()
+    {
+        // The #725 wallet rule (#725 keeps Auto for wallet providers) folds into
+        // the account-source decision; other no-cookie providers still honor
+        // cookie_source below (the account-source pack's fix for the #619 merge).
+        let keeps_auto =
+            usage_source == SourceMode::Auto && provider.token_account_preserves_auto_source();
+        // A wallet provider keeps its saved usage source even with a selected
+        // token account: rewriting it to OAuth would skip the wallet read
+        // (#725 / upstream base-source resolver).
+        if keeps_auto || active_token_env.is_none() {
+            // A wallet provider keeps its saved usage source even with a
+            // selected token account: rewriting it to OAuth would skip the
+            // wallet read (#725 / upstream base-source resolver).
+            if active_token_env.is_some() {
+                (usage_source, None, false)
+            } else {
+                match cookie_source {
+                    // #433: an explicitly selected, non-empty Claude manual cookie is
+                    // authoritative. Do not let an active OAuth token account silently
+                    // replace it; this keeps tray refresh behavior aligned with diagnose,
+                    // whose Claude Auto path tries the supplied Web cookie before OAuth.
+                    "manual"
+                        if provider.manual_cookie_precedes_token_account()
+                            && stored_cookie
+                                .as_deref()
+                                .is_some_and(|cookie| !cookie.trim().is_empty()) =>
+                    {
+                        (SourceMode::Web, stored_cookie.clone(), false)
+                    }
+                    "auto" | "browser" | "web" => (usage_source, None, false),
+                    _ => (usage_source, None, false),
+                }
+            }
         } else {
-            usage_source
-        };
-        (source_mode, None)
+            match cookie_source {
+                // Opt-in web providers keep their default credential lane
+                // unless the usage source is explicitly Web; a stored or
+                // browser cookie must not turn Auto into Web.
+                _ if provider.web_is_opt_in() && usage_source != SourceMode::Web => {
+                    (usage_source, None, false)
+                }
+                // #433: an explicitly selected, non-empty Claude manual cookie is
+                // authoritative. Do not let an active OAuth token account silently
+                // replace it; this keeps tray refresh behavior aligned with diagnose,
+                // whose Claude Auto path tries the supplied Web cookie before OAuth.
+                "manual"
+                    if provider.manual_cookie_precedes_token_account()
+                        && stored_cookie
+                            .as_deref()
+                            .is_some_and(|cookie| !cookie.trim().is_empty()) =>
+                {
+                    (SourceMode::Web, stored_cookie.clone(), false)
+                }
+                _ if active_token_env.is_some() => (SourceMode::OAuth, None, false),
+                // Charm Hyper: the cookie source only picks the session, and
+                // the usage source keeps routing. Off and an empty Manual
+                // source never import a browser session, while Auto keeps its
+                // API-key fallback.
+                "off" | "manual" if provider.cookie_source_scopes_session_only() => {
+                    let cookie_header = if cookie_source == "manual" {
+                        active_token_cookie.clone().or(stored_cookie)
+                    } else {
+                        None
+                    };
+                    let source_mode = if provider.available_sources().contains(&usage_source) {
+                        usage_source
+                    } else {
+                        SourceMode::Auto
+                    };
+                    let cookie_missing = cookie_header.is_none();
+                    (source_mode, cookie_header, cookie_missing)
+                }
+                "off" if provider_uses_oauth_without_cookies(id, usage_source) => {
+                    (SourceMode::OAuth, None, false)
+                }
+                "off"
+                    if (has_kimi_code_api_key || has_opencodego_api_key)
+                        && usage_source == SourceMode::Auto =>
+                {
+                    (SourceMode::Auto, None, false)
+                }
+                // Droid/Factory: cookie-off must never scrape browser cookies. Map to
+                // Cli (API-only in the provider) so Auto does not fall through to web.
+                "off" if id == ProviderId::Factory => (SourceMode::Cli, None, false),
+                "off" => (SourceMode::Cli, None, false),
+                "manual" => {
+                    let cookie_header = active_token_cookie.clone().or(stored_cookie);
+                    let fails_closed_without_cookie = cookie_header
+                        .as_deref()
+                        .is_none_or(|header| header.trim().is_empty())
+                        && provider.manual_empty_cookie_policy()
+                            == ManualEmptyCookiePolicy::FailClosedWeb;
+                    let source_mode = if (has_kimi_code_api_key || has_opencodego_api_key)
+                        && usage_source == SourceMode::Auto
+                    {
+                        SourceMode::Auto
+                    } else if let Some(mode) = grok_source_mode_for_manual_cookie(id, usage_source)
+                    {
+                        // Grok Switch writes ~/.grok/auth.json. Leftover grok.com
+                        // cookies must not force Web, or Weekly/notifications keep
+                        // showing the previous browser account.
+                        mode
+                    } else if cookie_header.is_some() {
+                        SourceMode::Web
+                    } else if fails_closed_without_cookie {
+                        // The provider owns this policy; Web with no header means
+                        // it fails closed instead of importing a browser account
+                        // the user did not select.
+                        SourceMode::Web
+                    } else if provider_uses_oauth_without_cookies(id, usage_source) {
+                        SourceMode::OAuth
+                    } else {
+                        SourceMode::Cli
+                    };
+                    (source_mode, cookie_header, fails_closed_without_cookie)
+                }
+                // `browser` is accepted as a legacy alias from older settings.
+                "auto" | "browser" | "web" => {
+                    // Claude resolves its cached cookie and browser fallback inside
+                    // the provider; other providers retain the shell fallback.
+                    let cookie_header =
+                        active_token_cookie.clone().or(stored_cookie).or_else(|| {
+                            if defer_provider_browser_cookie_lookup {
+                                None
+                            } else {
+                                provider_cookie_domain(id, settings).and_then(|domain| {
+                                    codexbar::browser::cookies::get_cookie_header(domain)
+                                        .ok()
+                                        .filter(|h| !h.is_empty())
+                                })
+                            }
+                        });
+                    (usage_source, cookie_header, false)
+                }
+                _ => (usage_source, stored_cookie, false),
+            }
+        }
+    } else if cookies_only_enrich_usage {
+        let cookie_header = (cookie_source == "manual")
+            .then(|| active_token_cookie.clone().or(stored_cookie))
+            .flatten();
+        (usage_source, cookie_header, false)
     } else {
         match cookie_source {
             // #433: an explicitly selected, non-empty Claude manual cookie is
@@ -80,76 +266,225 @@ pub(crate) fn build_fetch_context(
                         .as_deref()
                         .is_some_and(|cookie| !cookie.trim().is_empty()) =>
             {
-                (SourceMode::Web, stored_cookie.clone())
+                (SourceMode::Web, stored_cookie.clone(), false)
             }
-            _ if active_token_env.is_some() => (SourceMode::OAuth, None),
-            "off" if provider_uses_oauth_without_cookies(id, usage_source) => {
-                (SourceMode::OAuth, None)
-            }
-            "off"
-                if (has_kimi_code_api_key || has_opencodego_api_key)
-                    && usage_source == SourceMode::Auto =>
+            _ if active_token_env.is_some() => (SourceMode::OAuth, None, false),
+            // Providers that pick their own API-key or cookie lane (Command
+            // Code) keep Auto and API for every cookie source, so a configured
+            // key is used without touching a browser. `off` marks the cookie
+            // lane unavailable; `manual`/`auto` pass a stored header through.
+            _ if provider.owns_credential_lane_routing()
+                && matches!(usage_source, SourceMode::Auto | SourceMode::OAuth) =>
             {
-                (SourceMode::Auto, None)
+                let cookie_off = cookie_source == "off";
+                let cookie_header = if cookie_off {
+                    None
+                } else {
+                    active_token_cookie.clone().or(stored_cookie)
+                };
+                (usage_source, cookie_header, cookie_off)
+            }
+            // Opt-in web providers keep their default credential lane
+            // unless the usage source is explicitly Web; a stored or
+            // browser cookie must not turn Auto into Web.
+            _ if provider.web_is_opt_in() && usage_source != SourceMode::Web => {
+                (usage_source, None, false)
+            }
+            // Charm Hyper: the cookie source only picks the session, and
+            // the usage source keeps routing. Off and an empty Manual
+            // source never import a browser session, while Auto keeps its
+            // API-key fallback.
+            "off" | "manual" if provider.cookie_source_scopes_session_only() => {
+                let cookie_header = if cookie_source == "manual" {
+                    active_token_cookie.clone().or(stored_cookie)
+                } else {
+                    None
+                };
+                let source_mode = if provider.available_sources().contains(&usage_source) {
+                    usage_source
+                } else {
+                    SourceMode::Auto
+                };
+                let cookie_missing = cookie_header.is_none();
+                (source_mode, cookie_header, cookie_missing)
+            }
+            "off" if provider_uses_oauth_without_cookies(id, usage_source) => {
+                (SourceMode::OAuth, None, false)
+            }
+            // OpenCode Go discovers browser sessions inside the provider; the
+            // missing-cookie flag tells it that Off forbids that discovery.
+            "off" if id == ProviderId::OpenCodeGo => {
+                let source_mode = if has_opencodego_api_key && usage_source == SourceMode::Auto {
+                    SourceMode::Auto
+                } else {
+                    SourceMode::Cli
+                };
+                (source_mode, None, true)
+            }
+            "off" if has_kimi_code_api_key && usage_source == SourceMode::Auto => {
+                (SourceMode::Auto, None, false)
             }
             // Droid/Factory: cookie-off must never scrape browser cookies. Map to
             // Cli (API-only in the provider) so Auto does not fall through to web.
-            "off" if id == ProviderId::Factory => (SourceMode::Cli, None),
-            "off" => (SourceMode::Cli, None),
+            "off" if id == ProviderId::Factory => (SourceMode::Cli, None, false),
+            "off" => (SourceMode::Cli, None, false),
             "manual" => {
-                let cookie_header = active_token_cookie.or(stored_cookie);
+                let cookie_header = active_token_cookie.clone().or(stored_cookie);
+                let fails_closed_without_cookie = cookie_header
+                    .as_deref()
+                    .is_none_or(|header| header.trim().is_empty())
+                    && provider.manual_empty_cookie_policy()
+                        == ManualEmptyCookiePolicy::FailClosedWeb;
                 let source_mode = if (has_kimi_code_api_key || has_opencodego_api_key)
                     && usage_source == SourceMode::Auto
                 {
                     SourceMode::Auto
+                } else if let Some(mode) = grok_source_mode_for_manual_cookie(id, usage_source) {
+                    // Grok Switch writes ~/.grok/auth.json. Leftover grok.com
+                    // cookies must not force Web, or Weekly/notifications keep
+                    // showing the previous browser account.
+                    mode
                 } else if cookie_header.is_some() {
+                    SourceMode::Web
+                } else if fails_closed_without_cookie {
+                    // The provider owns this policy; Web with no header means
+                    // it fails closed instead of importing a browser account
+                    // the user did not select.
                     SourceMode::Web
                 } else if provider_uses_oauth_without_cookies(id, usage_source) {
                     SourceMode::OAuth
                 } else {
                     SourceMode::Cli
                 };
-                (source_mode, cookie_header)
+                (source_mode, cookie_header, fails_closed_without_cookie)
             }
             // `browser` is accepted as a legacy alias from older settings.
             "auto" | "browser" | "web" => {
-                // Only cookies the user imported are used. The shell used to fall
-                // back to scanning every installed browser here on each refresh;
-                // that read Chromium's DPAPI key and cookie database on a timer,
-                // which endpoint security products classify as credential theft.
-                // See `codexbar::browser::cookies::ScanTrigger`.
-                (usage_source, active_token_cookie.or(stored_cookie))
+                // Claude resolves its cached cookie and browser fallback inside
+                // the provider; other providers retain the shell fallback.
+                let cookie_header = active_token_cookie.clone().or(stored_cookie).or_else(|| {
+                    if defer_provider_browser_cookie_lookup {
+                        None
+                    } else {
+                        provider_cookie_domain(id, settings).and_then(|domain| {
+                            codexbar::browser::cookies::get_cookie_header(domain)
+                                .ok()
+                                .filter(|h| !h.is_empty())
+                        })
+                    }
+                });
+                (usage_source, cookie_header, false)
             }
-            _ => (usage_source, stored_cookie),
+            _ => (usage_source, stored_cookie, false),
         }
     };
 
     // Cookie-web providers (Cursor, OpenCode, …) reject SourceMode::Cli. The shell
     // historically mapped "manual + no cookie" to Cli, which surfaces as
-    // "Source mode 'Cli' not supported". Remap to Web so the provider can use an
-    // imported cookie; it reports "no cookies" when the user has not imported
-    // one. The shell no longer scans browsers here — see
-    // `codexbar::browser::cookies::ScanTrigger`.
-    if source_mode == SourceMode::Cli && cookie_source != "off" && !provider.supports_cli() {
+    // "Source mode 'Cli' not supported". Remap to Web and try browser cookies
+    // unless the user explicitly disabled cookies ("off"). Providers whose
+    // cookie source only scopes the session (Charm Hyper) or only enriches an
+    // API result (Muse browser team quota) own this contract in the provider,
+    // so the shell must not remap their source mode.
+    if source_mode == SourceMode::Cli
+        && cookie_source != "off"
+        && !provider.supports_cli()
+        && !provider.cookie_source_scopes_session_only()
+        && !cookies_only_enrich_usage
+    {
+        // Providers that own browser cookie resolution try each browser's
+        // session themselves; a pre-resolved first-browser header would pin
+        // them to that browser.
+        if !defer_provider_browser_cookie_lookup
+            && cookie_header
+                .as_deref()
+                .map(str::trim)
+                .is_none_or(|s| s.is_empty())
+        {
+            cookie_header = provider_cookie_domain(id, settings).and_then(|domain| {
+                codexbar::browser::cookies::get_cookie_header(domain)
+                    .ok()
+                    .filter(|h| !h.is_empty())
+            });
+        }
         source_mode = SourceMode::Web;
+    }
+
+    // The inverse case: some providers never fetch over the web and reject
+    // SourceMode::Web outright (Codex since the 0.54 port only does OAuth/PAT/CLI).
+    // The default cookie source is "manual", so a pasted chatgpt.com cookie flipped
+    // Codex into Web and every refresh failed with
+    // "Source mode 'Web' not supported for this provider". Fall back to the
+    // configured usage source (or Auto) instead of handing the provider a mode it
+    // advertises as unsupported.
+    let available_sources = provider.available_sources();
+    if source_mode == SourceMode::Web && !available_sources.contains(&SourceMode::Web) {
+        source_mode = if available_sources.contains(&usage_source) {
+            usage_source
+        } else {
+            SourceMode::Auto
+        };
     }
 
     let workspace_id = settings.workspace_id(id).trim().to_string();
     let api_region = settings.api_region(id).trim().to_string();
-    let gateway_url = (id == ProviderId::Wayfinder && !settings.gateway_url(id).is_empty())
-        .then(|| settings.gateway_url(id).to_string());
+    // Every gateway-style provider (Wayfinder, Bifrost, Aixy) stores its base
+    // URL here; providers without one report an empty string.
+    let gateway_url = Some(settings.gateway_url(id))
+        .filter(|url| !url.is_empty())
+        .map(str::to_owned);
     // Local-first Auto providers (OpenCode Go) flip to web-first when a
     // token account or manual cookie source scopes the session to web creds.
     let auto_prefer_web = token_override.is_some() || cookie_source == "manual";
 
+    // These upstream account types are explicit identity selections. Keep the
+    // provider's saved region/source settings intact, but project the selected
+    // credential into the route required by that account.
+    let (cookie_header, api_key) = match (id, token_account_kind, usage_source) {
+        (ProviderId::Kimi, Some(_), _) => (active_token_cookie.clone(), None),
+        (ProviderId::Doubao, Some(_), _) => (None, active_token_api_key.clone()),
+        (
+            ProviderId::OpenCodeGo,
+            Some(codexbar::core::TokenAccountKind::ApiKey),
+            SourceMode::Auto,
+        ) => (None, active_token_api_key.clone()),
+        (ProviderId::OpenCodeGo, Some(codexbar::core::TokenAccountKind::ApiKey), _) => {
+            (cookie_header, api_key)
+        }
+        (
+            ProviderId::OpenCodeGo,
+            Some(codexbar::core::TokenAccountKind::Cookie),
+            SourceMode::Auto,
+        ) => (active_token_cookie.clone(), api_key),
+        _ => (cookie_header, api_key),
+    };
+    let source_mode = token_override
+        .as_ref()
+        .and_then(|account| account.effective_source_mode(usage_source))
+        .unwrap_or(source_mode);
+    let token_account_isolated = token_override.is_some()
+        && matches!(
+            id,
+            ProviderId::Kimi | ProviderId::Doubao | ProviderId::OpenCodeGo
+        );
+
     FetchContext {
         source_mode,
         manual_cookie_header: cookie_header,
+        manual_cookie_missing: fails_closed_without_cookie,
         api_key,
+        token_account_kind,
+        token_account_isolated,
         workspace_id: (!workspace_id.is_empty()).then_some(workspace_id),
+        seat_credit_entitlement: settings.seat_credit_entitlement(id),
         api_region: (!api_region.is_empty()).then_some(api_region),
         gateway_url,
-        auto_prefer_web,
+        auto_prefer_web: auto_prefer_web
+            && !(id == ProviderId::OpenCodeGo
+                && token_account_kind == Some(codexbar::core::TokenAccountKind::ApiKey)),
+        browser_cookie_import,
+        optional_details_enabled: settings.optional_details_enabled(id),
+        live_usage_enabled: settings.live_usage_enabled(id),
         ..FetchContext::default()
     }
 }
@@ -162,26 +497,55 @@ fn provider_uses_oauth_without_cookies(id: ProviderId, usage_source: SourceMode)
     }
 }
 
+/// Keep Grok Auto/OAuth/Cli on the switched login instead of rewriting a
+/// leftover manual cookie as Web. Auto remains Auto even when its manual
+/// cookie is empty; the provider uses that context to skip browser refresh.
+fn grok_source_mode_for_manual_cookie(
+    id: ProviderId,
+    usage_source: SourceMode,
+) -> Option<SourceMode> {
+    if id != ProviderId::Grok {
+        return None;
+    }
+    match usage_source {
+        SourceMode::Cli => Some(SourceMode::Cli),
+        SourceMode::Auto => Some(SourceMode::Auto),
+        SourceMode::OAuth => Some(SourceMode::OAuth),
+        _ => None,
+    }
+}
+
+pub(crate) fn provider_cookie_domain(id: ProviderId, settings: &Settings) -> Option<&'static str> {
+    if id == ProviderId::MiniMax {
+        return Some(
+            codexbar::providers::MiniMaxProvider::cookie_domain_for_region(Some(
+                settings.api_region(id),
+            )),
+        );
+    }
+    if id == ProviderId::Alibaba {
+        return Some(
+            codexbar::providers::AlibabaProvider::cookie_domain_for_region(Some(
+                settings.api_region(id),
+            )),
+        );
+    }
+    id.cookie_domain()
+}
+
 const DEFAULT_PROVIDER_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(35);
 const SLOW_PROVIDER_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(75);
+const OPTIONAL_LITELLM_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(40);
 const MAX_CONTEXT_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(65);
 
 pub(crate) fn provider_fetch_timeout(id: ProviderId, ctx: &FetchContext) -> std::time::Duration {
     let provider_timeout = match id {
         ProviderId::Claude | ProviderId::Codex | ProviderId::Copilot => SLOW_PROVIDER_FETCH_TIMEOUT,
+        ProviderId::LiteLLM if ctx.optional_details_enabled => OPTIONAL_LITELLM_FETCH_TIMEOUT,
         _ => DEFAULT_PROVIDER_FETCH_TIMEOUT,
     };
     let context_timeout = std::time::Duration::from_secs(ctx.web_timeout.saturating_add(5));
     provider_timeout.max(context_timeout.min(MAX_CONTEXT_FETCH_TIMEOUT))
-}
-
-pub(crate) fn is_provider_cache_fresh(
-    updated_at: Option<std::time::Instant>,
-    stale_after: std::time::Duration,
-) -> bool {
-    updated_at
-        .map(|updated| updated.elapsed() <= stale_after)
-        .unwrap_or(false)
 }
 
 pub(crate) fn upsert_provider_cache(
@@ -228,6 +592,13 @@ pub(crate) fn invalidate_provider_refresh_and_prune_disabled(
     guard
         .transient_provider_failure_counts
         .retain(|id, _| enabled_ids.contains(id));
+    guard
+        .last_good_owners
+        .retain(|id, _| enabled_ids.contains(id));
+    guard
+        .provider_cache_updated_at_by_provider
+        .retain(|id, _| enabled_ids.contains(id));
+    guard.auto_resume.clear_disabled(enabled_ids);
     Ok(())
 }
 
@@ -237,26 +608,73 @@ pub(crate) fn is_current_provider_refresh_generation(guard: &AppState, generatio
 
 /// Core refresh logic, usable from both the Tauri command and tray menu actions.
 pub(crate) async fn do_refresh_providers(app: &tauri::AppHandle) -> Result<(), String> {
-    do_refresh_providers_with_policy(app, true).await
+    do_refresh_providers_with_outcome(app).await.map(|_| ())
+}
+
+pub(crate) async fn do_refresh_providers_with_outcome(
+    app: &tauri::AppHandle,
+) -> Result<ProviderRefreshOutcome, String> {
+    do_refresh_providers_with_policy(app, true, RefreshScope::AllEnabled).await
 }
 
 pub(crate) async fn do_refresh_providers_if_stale(app: &tauri::AppHandle) -> Result<(), String> {
-    do_refresh_providers_with_policy(app, false).await
+    do_refresh_providers_with_policy(app, false, RefreshScope::AllEnabled)
+        .await
+        .map(|_| ())
+}
+
+/// Refresh only enabled providers with the opt-in exact-session watcher. This
+/// keeps a 60-second resume probe from shortening or repeating unrelated
+/// provider work.
+pub(crate) async fn do_refresh_auto_resume_providers_if_stale(
+    app: &tauri::AppHandle,
+) -> Result<(), String> {
+    do_refresh_providers_with_policy(app, false, RefreshScope::AutoResume)
+        .await
+        .map(|_| ())
 }
 
 async fn do_refresh_providers_with_policy(
     app: &tauri::AppHandle,
     force: bool,
-) -> Result<(), String> {
+    scope: RefreshScope,
+) -> Result<ProviderRefreshOutcome, String> {
     let state = app.state::<Mutex<AppState>>();
+    let expected_generation = state
+        .lock()
+        .map_err(|e| e.to_string())?
+        .provider_refresh_generation;
+    let settings = Settings::load();
+    let enabled_ids = settings.get_enabled_provider_ids();
+    let refresh_ids = scope.provider_ids(&settings, &enabled_ids);
+    if let Ok(mut guard) = state.lock() {
+        guard
+            .notification_manager
+            .retire_credential_episodes_except(&enabled_ids);
+    }
+    if refresh_ids.is_empty() {
+        return Ok(ProviderRefreshOutcome::Skipped {
+            reason: ProviderRefreshSkipReason::NoEnabledProviders,
+        });
+    }
 
-    let Some(generation) = begin_provider_refresh(&state, force)? else {
-        return Ok(());
+    let inputs = ProviderRefreshInputs::load(settings, enabled_ids);
+    let generation = match begin_provider_refresh(&state, force, &refresh_ids, expected_generation)?
+    {
+        ProviderRefreshReservation::Reserved { generation } => generation,
+        ProviderRefreshReservation::Skipped(reason) => {
+            // Settings or account identity changed while inputs were loading,
+            // another batch owns the refresh, or the cache is already fresh.
+            return Ok(ProviderRefreshOutcome::Skipped { reason });
+        }
     };
+    if scope.polls_status() {
+        crate::status_poller::spawn_poll(app, &inputs.settings, &refresh_ids, force);
+    }
 
-    let inputs = ProviderRefreshInputs::load();
     // Ensure cache only contains currently enabled providers for this generation.
-    if let Ok(mut guard) = state.lock()
+    if scope == RefreshScope::AllEnabled
+        && let Ok(mut guard) = state.lock()
         && is_current_provider_refresh_generation(&guard, generation)
     {
         prune_provider_cache_to_enabled(&mut guard.provider_cache, &inputs.enabled_ids);
@@ -264,59 +682,54 @@ async fn do_refresh_providers_with_policy(
 
     events::emit_refresh_started(
         app,
-        inputs
-            .enabled_ids
+        refresh_ids
             .iter()
             .map(|id| id.cli_name().to_string())
             .collect(),
     );
-    let enabled_count = inputs.enabled_ids.len();
+    let enabled_count = refresh_ids.len();
 
-    let handles = spawn_provider_refreshes(app, &inputs, generation);
+    let handles = spawn_provider_refreshes(
+        app,
+        &inputs,
+        &refresh_ids,
+        generation,
+        scope.refresh_account_lanes(),
+    );
     await_provider_refreshes(handles).await;
 
-    let Some(error_count) = finish_provider_refresh(&state, generation)? else {
-        // Superseded by a newer generation (or invalidate). Do not clear UI
-        // "refreshing" for a dead batch or stamp tray from incomplete work.
-        return Ok(());
+    let error_count = match finish_provider_refresh(&state, generation)? {
+        ProviderRefreshCompletion::Published { error_count } => error_count,
+        ProviderRefreshCompletion::Superseded { current_generation } => {
+            // Superseded by a newer generation (or invalidate). Do not clear UI
+            // "refreshing" for dead work or stamp tray from incomplete work.
+            return Ok(ProviderRefreshOutcome::Superseded {
+                generation,
+                current_generation,
+            });
+        }
     };
     update_tray_and_notifications(app, &state, &inputs.settings, &inputs.token_accounts)?;
 
     events::emit_refresh_complete(app, enabled_count, error_count);
     crate::auto_refresh::schedule_refresh_enrichment(&inputs.settings);
 
-    Ok(())
+    Ok(ProviderRefreshOutcome::Published { generation })
 }
 
 fn begin_provider_refresh(
     state: &tauri::State<'_, Mutex<AppState>>,
     force: bool,
-) -> Result<Option<u64>, String> {
+    provider_ids: &[ProviderId],
+    expected_generation: u64,
+) -> Result<ProviderRefreshReservation, String> {
     let mut guard = state.lock().map_err(|e| e.to_string())?;
-    if guard.is_refreshing {
-        return Ok(None);
-    }
-    if provider_cache_can_skip_refresh(&guard, force) {
-        return Ok(None);
-    }
-
-    guard.provider_refresh_generation = guard.provider_refresh_generation.wrapping_add(1);
-    let generation = guard.provider_refresh_generation;
-    guard.is_refreshing = true;
-    guard.provider_refresh_started_at = Some(std::time::Instant::now());
-    Ok(Some(generation))
-}
-
-fn provider_cache_can_skip_refresh(guard: &AppState, force: bool) -> bool {
-    // Proof-harness seed: pin the synthetic snapshot for the whole run so a
-    // periodic auto-refresh cannot overwrite seeded capture conditions.
-    if !force && crate::proof_harness::seed_usage_json_active() && !guard.provider_cache.is_empty()
-    {
-        return true;
-    }
-    !force
-        && !guard.provider_cache.is_empty()
-        && is_provider_cache_fresh(guard.provider_cache_updated_at, PROVIDER_CACHE_STALE_AFTER)
+    Ok(reserve_provider_refresh(
+        &mut guard,
+        force,
+        provider_ids,
+        expected_generation,
+    ))
 }
 
 struct ProviderRefreshInputs {
@@ -328,9 +741,7 @@ struct ProviderRefreshInputs {
 }
 
 impl ProviderRefreshInputs {
-    fn load() -> Self {
-        let settings = Settings::load();
-        let enabled_ids = settings.get_enabled_provider_ids();
+    fn load(settings: Settings, enabled_ids: Vec<ProviderId>) -> Self {
         let manual_cookies = ManualCookies::load();
         let api_keys = ApiKeys::load();
         let token_accounts = TokenAccountStore::new().load().unwrap_or_else(|e| {
@@ -351,12 +762,14 @@ impl ProviderRefreshInputs {
 fn spawn_provider_refreshes(
     app: &tauri::AppHandle,
     inputs: &ProviderRefreshInputs,
+    provider_ids: &[ProviderId],
     generation: u64,
+    refresh_account_lanes: bool,
 ) -> Vec<tokio::task::JoinHandle<()>> {
-    let mut handles = Vec::with_capacity(inputs.enabled_ids.len());
+    let mut handles = Vec::with_capacity(provider_ids.len());
     let fetch_permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PROVIDER_FETCHES));
 
-    for id in &inputs.enabled_ids {
+    for id in provider_ids {
         let id = *id;
         let app_handle = app.clone();
         let fetch_permits = Arc::clone(&fetch_permits);
@@ -369,17 +782,32 @@ fn spawn_provider_refreshes(
         );
         // Resolved here rather than inside the fetch: forecast history is keyed by
         // account, and the managed-account id is the only discriminator Codex exposes.
-        let token_account_id = inputs
+        let active_account = inputs
             .token_accounts
             .get(&id)
-            .and_then(ProviderAccountData::active_account)
-            .map(|account| account.id);
+            .and_then(ProviderAccountData::active_account);
+        let token_account_id = active_account.map(|account| account.id);
+        let token_account_label = active_account.and_then(|account| header_label(&account.label));
+        let hooks_enabled = inputs.settings.hooks_enabled;
+        let pace_work_days = inputs.settings.weekly_progress_work_days;
 
         handles.push(tokio::spawn(async move {
             let Ok(_permit) = fetch_permits.acquire_owned().await else {
                 return;
             };
-            refresh_provider(app_handle, id, ctx, generation, token_account_id).await;
+            refresh_provider(
+                app_handle,
+                id,
+                ctx,
+                generation,
+                ActiveTokenAccount {
+                    id: token_account_id,
+                    label: token_account_label,
+                },
+                hooks_enabled,
+                pace_work_days,
+            )
+            .await;
         }));
     }
 
@@ -388,7 +816,7 @@ fn spawn_provider_refreshes(
     // shared fetch semaphore. The ambient account still publishes the single
     // "codex" provider snapshot used by tray/menu; the lanes fill the account
     // snapshot store consumed by the Settings accounts panel.
-    if inputs.enabled_ids.contains(&ProviderId::Codex) {
+    if refresh_account_lanes && provider_ids.contains(&ProviderId::Codex) {
         let app_handle = app.clone();
         let fetch_permits = Arc::clone(&fetch_permits);
         handles.push(tokio::spawn(async move {
@@ -401,7 +829,28 @@ fn spawn_provider_refreshes(
         }));
     }
 
+    if refresh_account_lanes && provider_ids.contains(&ProviderId::Claude) {
+        let app_handle = app.clone();
+        let permits = Arc::clone(&fetch_permits);
+        handles.push(tokio::spawn(async move {
+            super::refresh_claude_account_lanes(app_handle, permits, generation).await;
+        }));
+    }
+
     handles
+}
+
+/// The active token account a refresh runs under: its id scopes forecast
+/// history; its label is header display only.
+struct ActiveTokenAccount {
+    id: Option<uuid::Uuid>,
+    label: Option<String>,
+}
+
+/// A token-account label fit for the card header, or `None` when blank.
+fn header_label(label: &str) -> Option<String> {
+    let label = label.trim();
+    (!label.is_empty()).then(|| label.to_string())
 }
 
 async fn refresh_provider(
@@ -409,9 +858,17 @@ async fn refresh_provider(
     id: ProviderId,
     ctx: FetchContext,
     generation: u64,
-    token_account_id: Option<uuid::Uuid>,
+    token_account: ActiveTokenAccount,
+    hooks_enabled: bool,
+    pace_work_days: Option<u8>,
 ) {
-    let snapshot = fetch_provider_snapshot(id, ctx, token_account_id).await;
+    let (mut snapshot, account_identity, retention) =
+        fetch_provider_snapshot(id, ctx, token_account.id, pace_work_days).await;
+    snapshot.account_label = token_account.label;
+    let token_account_id = token_account.id;
+    let fresh_snapshot = snapshot.error.is_none();
+    // Captured before last-good preservation can swap in a cached snapshot.
+    let fetch_attempt = FetchAttempt::of(&snapshot);
 
     let state = app.state::<Mutex<AppState>>();
     let published = if let Ok(mut guard) = state.lock() {
@@ -424,7 +881,16 @@ async fn refresh_provider(
             );
             None
         } else {
-            let snapshot = preserve_last_good_transient_failure(&mut guard, id, snapshot);
+            let snapshot = preserve_last_good_transient_failure_with_policy(
+                &mut guard,
+                id,
+                snapshot,
+                retention.policy,
+                &retention.failure_ownership,
+            );
+            if fresh_snapshot {
+                record_last_good_owner(&mut guard, id, retention.fresh_owner);
+            }
             // F6 (upstream 0.48.0): backfill missing reset timestamps from the
             // cached snapshot before persisting and publishing.
             let cached = guard
@@ -433,8 +899,30 @@ async fn refresh_provider(
                 .find(|c| c.provider_id == snapshot.provider_id && c.error.is_none())
                 .cloned();
             let mut snapshot = snapshot;
-            codex_reset_backfill(&mut snapshot, cached.as_ref());
+            reset_backfill::codex_reset_backfill(&mut snapshot, cached.as_ref());
             upsert_provider_cache(&mut guard.provider_cache, snapshot.clone());
+            if fresh_snapshot {
+                guard
+                    .provider_cache_updated_at_by_provider
+                    .insert(id, std::time::Instant::now());
+            }
+            // Read consent after the fetch completes, so a toggle change made
+            // while the request was in flight takes effect for this outcome.
+            let credential_alerts = match fetch_attempt {
+                FetchAttempt::Failed(kind) if kind.needs_sign_in() => Some(
+                    codexbar::notifications::CredentialAlertPolicy::from_settings(&Settings::load()),
+                ),
+                _ => None,
+            };
+            credential_alerts::observe_attempt(
+                &mut guard.notification_manager,
+                credential_alerts,
+                id,
+                token_account_id,
+                fetch_attempt,
+                &snapshot,
+                cached.as_ref(),
+            );
             Some(snapshot)
         }
     } else {
@@ -443,97 +931,129 @@ async fn refresh_provider(
 
     if let Some(snapshot) = published {
         events::emit_provider_updated(&app, &snapshot);
+        if fresh_snapshot {
+            dispatch_usage_updated_hook(
+                hooks_enabled,
+                id,
+                &snapshot,
+                account_identity.as_deref(),
+                token_account_id,
+            );
+            crate::auto_resume::observe_fresh_snapshot(
+                &app,
+                id,
+                &snapshot,
+                token_account_id,
+                account_identity.as_deref(),
+            )
+            .await;
+        }
     }
 }
 
-/// F6 (upstream 0.48.0 UsageStore+CodexResetBackfill): backfill missing
-/// `resets_at` / `reset_description` on fresh Codex windows from the cached
-/// lane data when the cached reset is still future. z.ai five-hour cached
-/// resets use the same plausibility bound as the provider parser, so an
-/// impossible rejected reset cannot be restored from the cache. Fresh
-/// `used_percent` is untouched; only reset metadata is backfilled.
-///
-/// This remains provider-scoped by design (upstream: "Provider-specific by
-/// design"): only Codex and z.ai carry the relevant bounded reset semantics.
-///
-/// Applies to the bridge snapshot before publishing so every surface (tray,
-/// CLI, frontend) sees the backfilled reset instead of a missing one.
-pub(super) fn codex_reset_backfill(
-    snapshot: &mut ProviderUsageSnapshot,
-    cached: Option<&ProviderUsageSnapshot>,
+/// Publish the current successful snapshot to opt-in external hooks. The event
+/// carries both quota windows in one payload and is rate-limited per provider
+/// account so periodic refreshes cannot create a hook storm.
+fn dispatch_usage_updated_hook(
+    hooks_enabled: bool,
+    provider: ProviderId,
+    snapshot: &ProviderUsageSnapshot,
+    account_identity: Option<&str>,
+    token_account_id: Option<uuid::Uuid>,
 ) {
-    let Some(cached) = cached else { return };
-    if !matches!(snapshot.provider_id.as_str(), "codex" | "zai") {
+    if !hooks_enabled {
         return;
     }
-
-    // Backfill each slot from the corresponding cached slot.
-    backfill_slot_window(
-        &snapshot.provider_id,
-        &mut snapshot.primary,
-        &cached.primary,
+    let settings = Settings::load();
+    let account = if settings.hide_personal_info {
+        None
+    } else {
+        account_identity
+            .map(str::trim)
+            .filter(|identity| !identity.is_empty())
+    };
+    let rate_limit_scope = quota_notification_account_identity(snapshot, token_account_id);
+    let rate_limit_scope = if rate_limit_scope.is_empty() {
+        None
+    } else {
+        Some(format!("provider-account:{rate_limit_scope}"))
+    };
+    let primary = HookUsageWindow {
+        used_percent: snapshot.primary.used_percent,
+        window_minutes: snapshot.primary.window_minutes,
+        resets_at: snapshot.primary.resets_at.clone(),
+        is_informational: snapshot.primary.is_informational,
+    };
+    let secondary = snapshot.secondary.as_ref().map(|window| HookUsageWindow {
+        used_percent: window.used_percent,
+        window_minutes: window.window_minutes,
+        resets_at: window.resets_at.clone(),
+        is_informational: window.is_informational,
+    });
+    codexbar::core::dispatch_usage_updated_hook(
+        hooks_enabled,
+        provider.cli_name(),
+        &primary,
+        secondary.as_ref(),
+        account,
+        rate_limit_scope,
     );
-    if let (Some(fresh), Some(cached_sec)) = (&mut snapshot.secondary, &cached.secondary) {
-        backfill_slot_window(&snapshot.provider_id, fresh, cached_sec);
-    }
-    // Tertiary (monthly/other): the Codex bridge doesn't normally populate this,
-    // but the slot exists for forward-compat. Backfill when available.
-    if let (Some(fresh), Some(cached_ter)) = (&mut snapshot.tertiary, &cached.tertiary) {
-        backfill_slot_window(&snapshot.provider_id, fresh, cached_ter);
-    }
 }
 
-/// Backfill `resets_at` and `reset_description` on a fresh window from the
-/// cached window whose reset is still in the future. `used_percent` is never
-/// overwritten (upstream: "fresh used_percent untouched").
-fn backfill_slot_window(
-    provider_id: &str,
-    fresh: &mut bridge::RateWindowSnapshot,
-    cached: &bridge::RateWindowSnapshot,
-) {
-    if fresh.resets_at.is_some() {
-        return;
-    }
-    let Some(cached_reset) = &cached.resets_at else {
-        return;
-    };
-    // Only backfill when the cached reset is still future — a stale reset is
-    // worse than a missing one.
-    let Ok(cached_dt) = chrono::DateTime::parse_from_rfc3339(cached_reset) else {
-        return;
-    };
-    let now = chrono::Utc::now();
-    if cached_dt <= now {
-        return;
-    }
-    // A missing z.ai five-hour reset can mean the provider rejected an
-    // impossible future timestamp. Do not let equally impossible cached
-    // evidence undo that rejection, but preserve a plausible cached reset.
-    if provider_id == "zai"
-        && fresh.window_minutes == Some(300)
-        && cached_dt > now + chrono::Duration::minutes(5 * 60 + 1)
-    {
-        return;
-    }
-    fresh.resets_at = Some(cached_reset.clone());
-    fresh.reset_description = fresh
-        .reset_description
-        .clone()
-        .or_else(|| cached.reset_description.clone());
-}
-
+#[cfg(test)]
 pub(super) fn preserve_last_good_transient_failure(
     guard: &mut AppState,
     id: ProviderId,
     snapshot: ProviderUsageSnapshot,
+    error: &codexbar::core::ProviderError,
+) -> ProviderUsageSnapshot {
+    let policy = instantiate_provider(id).last_good_failure_policy_for_error(error);
+    preserve_last_good_transient_failure_with_policy(
+        guard,
+        id,
+        snapshot,
+        Some(policy),
+        &error.failure_ownership(),
+    )
+}
+
+/// Remember which live session produced the fresh snapshot now cached for
+/// `id`, or forget any earlier owner when the fresh snapshot has none.
+pub(super) fn record_last_good_owner(
+    guard: &mut AppState,
+    id: ProviderId,
+    owner: Option<codexbar::core::LastGoodOwner>,
+) {
+    match owner {
+        Some(owner) => {
+            guard.last_good_owners.insert(id, owner);
+        }
+        None => {
+            guard.last_good_owners.remove(&id);
+        }
+    }
+}
+
+fn preserve_last_good_transient_failure_with_policy(
+    guard: &mut AppState,
+    id: ProviderId,
+    snapshot: ProviderUsageSnapshot,
+    policy: Option<codexbar::core::LastGoodFailurePolicy>,
+    ownership: &codexbar::core::FailureOwnership,
 ) -> ProviderUsageSnapshot {
     let Some(error) = snapshot.error.as_deref() else {
         guard.transient_provider_failure_counts.remove(&id);
         return snapshot;
     };
 
-    let policy = instantiate_provider(id).last_good_failure_policy(error);
+    let policy = policy.unwrap_or(codexbar::core::LastGoodFailurePolicy::Replace);
     if policy == codexbar::core::LastGoodFailurePolicy::Replace {
+        guard.transient_provider_failure_counts.remove(&id);
+        return snapshot;
+    }
+    // A failure tied to a live session may keep only a snapshot that the same
+    // session produced. Anything else shows the error.
+    if !ownership.allows_retention(guard.last_good_owners.get(&id)) {
         guard.transient_provider_failure_counts.remove(&id);
         return snapshot;
     }
@@ -597,38 +1117,88 @@ pub(super) fn preserve_last_good_transient_failure(
     }
 }
 
+/// What a refresh tells the shell about keeping or replacing the last good
+/// snapshot.
+#[derive(Default)]
+struct RefreshRetention {
+    /// Failure handling when a prior good snapshot exists.
+    policy: Option<codexbar::core::LastGoodFailurePolicy>,
+    /// Session the failed request belonged to, when the provider can tell.
+    failure_ownership: codexbar::core::FailureOwnership,
+    /// Session that produced a fresh snapshot.
+    fresh_owner: Option<codexbar::core::LastGoodOwner>,
+}
+
 async fn fetch_provider_snapshot(
     id: ProviderId,
     ctx: FetchContext,
     token_account_id: Option<uuid::Uuid>,
-) -> ProviderUsageSnapshot {
+    pace_work_days: Option<u8>,
+) -> (ProviderUsageSnapshot, Option<String>, RefreshRetention) {
     let provider = instantiate_provider(id);
     let metadata = provider.metadata().clone();
     let started = std::time::Instant::now();
 
-    let mut snapshot =
+    let (mut snapshot, account_identity, retention) =
         match tokio::time::timeout(provider_fetch_timeout(id, &ctx), provider.fetch_usage(&ctx))
             .await
         {
             Ok(Ok(result)) => {
-                ProviderUsageSnapshot::from_fetch_result(id, &metadata, &result, token_account_id)
+                let account_identity = result.account_identity().map(ToOwned::to_owned);
+                (
+                    ProviderUsageSnapshot::from_fetch_result(
+                        id,
+                        &metadata,
+                        &result,
+                        token_account_id,
+                        pace_work_days,
+                    ),
+                    account_identity,
+                    RefreshRetention {
+                        fresh_owner: result.last_good_owner.clone(),
+                        ..RefreshRetention::default()
+                    },
+                )
             }
-            Ok(Err(e)) => ProviderUsageSnapshot::from_error(
-                id,
-                &metadata,
-                codexbar::logging::safe_error_message(&e),
-                provider.error_state_kind(&e),
-            ),
-            Err(_) => ProviderUsageSnapshot::from_error(
-                id,
-                &metadata,
-                "Timeout".to_string(),
-                codexbar::core::ProviderStateKind::Unknown,
-            ),
+            Ok(Err(e)) => {
+                let policy = provider.last_good_failure_policy_for_error(&e);
+                (
+                    ProviderUsageSnapshot::from_error(
+                        id,
+                        &metadata,
+                        codexbar::logging::safe_error_message(&e),
+                        provider.error_state_kind(&e),
+                    ),
+                    None,
+                    RefreshRetention {
+                        policy: Some(policy),
+                        failure_ownership: e.failure_ownership(),
+                        fresh_owner: None,
+                    },
+                )
+            }
+            Err(_) => {
+                let error = codexbar::core::ProviderError::Timeout;
+                let policy = provider.last_good_failure_policy_for_error(&error);
+                (
+                    ProviderUsageSnapshot::from_error(
+                        id,
+                        &metadata,
+                        "Timeout".to_string(),
+                        provider.error_state_kind(&error),
+                    ),
+                    None,
+                    RefreshRetention {
+                        policy: Some(policy),
+                        failure_ownership: error.failure_ownership(),
+                        fresh_owner: None,
+                    },
+                )
+            }
         };
 
     record_provider_fetch_duration(id, &mut snapshot, started);
-    snapshot
+    (snapshot, account_identity, retention)
 }
 
 fn record_provider_fetch_duration(
@@ -659,23 +1229,9 @@ async fn await_provider_refreshes(handles: Vec<tokio::task::JoinHandle<()>>) {
 fn finish_provider_refresh(
     state: &tauri::State<'_, Mutex<AppState>>,
     generation: u64,
-) -> Result<Option<usize>, String> {
+) -> Result<ProviderRefreshCompletion, String> {
     let mut guard = state.lock().map_err(|e| e.to_string())?;
-    if !is_current_provider_refresh_generation(&guard, generation) {
-        // A newer begin or invalidate owns the lock/generation. Do not clear
-        // is_refreshing — that would race a live successor batch.
-        return Ok(None);
-    }
-    guard.is_refreshing = false;
-    guard.provider_refresh_started_at = None;
-    guard.provider_cache_updated_at = Some(std::time::Instant::now());
-    Ok(Some(
-        guard
-            .provider_cache
-            .iter()
-            .filter(|s| s.error.is_some())
-            .count(),
-    ))
+    Ok(complete_provider_refresh(&mut guard, generation))
 }
 
 fn update_tray_and_notifications(
@@ -701,7 +1257,7 @@ fn notify_usage_thresholds(
     cached: &[ProviderUsageSnapshot],
 ) {
     let cli_map = codexbar::core::cli_name_map();
-    if let Ok(mut guard) = state.lock() {
+    let persistence = if let Ok(mut guard) = state.lock() {
         for snapshot in cached {
             if snapshot.error.is_none()
                 && let Some(&provider) = cli_map.get(snapshot.provider_id.as_str())
@@ -710,23 +1266,35 @@ fn notify_usage_thresholds(
                     .get(&provider)
                     .and_then(ProviderAccountData::active_account)
                     .map(|account| account.id);
-                let account = quota_notification_account_identity(snapshot, token_account_id);
-                // Skip session notifications for synthetic/no-session placeholders
-                // (e.g. Claude web five_hour: null → informational 5h 0%).
-                if !snapshot.primary.is_informational {
-                    guard.notification_manager.check_and_notify(
-                        provider,
-                        &account,
-                        "session",
-                        snapshot.primary.used_percent,
-                        settings,
-                    );
-                    guard.notification_manager.check_session_transition(
-                        provider,
-                        &account,
-                        snapshot.primary.used_percent,
-                        settings,
-                    );
+                let warning_identity = WarningIdentity::new(
+                    provider,
+                    &snapshot.source_label,
+                    snapshot.account_email.as_deref(),
+                    snapshot.account_organization.as_deref(),
+                    token_account_id,
+                );
+                // Hooks keep their own per-source baselines (edge-triggered, first sample
+                // never fires), so they stay on the source key; only toast dedupe below
+                // bridges account-identity gaps.
+                let account = warning_identity.threshold_key();
+                let scope = warning_identity.gap_scope();
+                // Skip all session consumers for synthetic/no-session
+                // placeholders (e.g. Claude OAuth five_hour: null).
+                let session_account = resolve_toast_account(
+                    &mut guard.notification_manager,
+                    provider,
+                    &scope,
+                    "session",
+                    &snapshot.primary,
+                    settings,
+                );
+                if guard.notification_manager.check_session_lane(
+                    provider,
+                    &session_account,
+                    snapshot.primary.used_percent,
+                    snapshot.primary.is_informational,
+                    settings,
+                ) {
                     dispatch_quota_hooks(
                         settings,
                         provider,
@@ -738,9 +1306,17 @@ fn notify_usage_thresholds(
                 if let Some(weekly) = &snapshot.secondary
                     && !weekly.is_informational
                 {
+                    let weekly_account = resolve_toast_account(
+                        &mut guard.notification_manager,
+                        provider,
+                        &scope,
+                        "weekly",
+                        weekly,
+                        settings,
+                    );
                     guard.notification_manager.check_and_notify(
                         provider,
-                        &account,
+                        &weekly_account,
                         "weekly",
                         weekly.used_percent,
                         settings,
@@ -753,6 +1329,21 @@ fn notify_usage_thresholds(
                         weekly.used_percent,
                     );
                 }
+                let token_account_label = token_accounts
+                    .get(&provider)
+                    .and_then(ProviderAccountData::active_account)
+                    .map(|account| account.label.as_str());
+                guard.notification_manager.observe_limit_reset(
+                    limit_reset_sample(
+                        provider,
+                        snapshot,
+                        &warning_identity,
+                        token_account_label,
+                        &session_account,
+                        settings,
+                    ),
+                    settings,
+                );
                 notify_predictive_pace(
                     &mut guard.notification_manager,
                     provider,
@@ -762,7 +1353,92 @@ fn notify_usage_thresholds(
                 );
             }
         }
+        guard
+            .notification_manager
+            .finish_limit_reset_batch(settings, chrono::Utc::now())
+    } else {
+        None
+    };
+    if let Some(persistence) = persistence {
+        persistence.apply();
     }
+}
+
+/// Reset-detector input for one cached snapshot. Only real session lanes
+/// (1..=360 minutes) and the 7-day weekly lane are observed.
+pub(super) fn limit_reset_sample<'a>(
+    provider: ProviderId,
+    snapshot: &ProviderUsageSnapshot,
+    identity: &WarningIdentity,
+    token_account_label: Option<&str>,
+    session_transition_account: &'a str,
+    settings: &Settings,
+) -> LimitResetSample<'a> {
+    let label = token_account_label
+        .filter(|label| !label.trim().is_empty())
+        .or(snapshot.account_email.as_deref())
+        .filter(|label| !label.trim().is_empty())
+        .or(snapshot.account_organization.as_deref());
+    let account = identity.limit_reset_account(label, settings.hide_personal_info);
+    let observed_at = chrono::DateTime::parse_from_rfc3339(&snapshot.updated_at)
+        .ok()
+        .map(|date| date.with_timezone(&chrono::Utc));
+    let observe = |lane: &RateWindowSnapshot| {
+        Some(LimitResetObservation {
+            used_percent: lane.used_percent,
+            observed_at: observed_at?,
+            reset_boundary: lane
+                .resets_at
+                .as_deref()
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                .map(|date| date.with_timezone(&chrono::Utc)),
+        })
+    };
+    let session = Some(&snapshot.primary)
+        .filter(|lane| {
+            !lane.is_informational && lane.window_minutes.is_some_and(|m| (1..=360).contains(&m))
+        })
+        .and_then(observe);
+    let weekly = snapshot
+        .secondary
+        .as_ref()
+        .filter(|lane| !lane.is_informational && lane.window_minutes == Some(10080))
+        .and_then(observe);
+    LimitResetSample {
+        provider,
+        account,
+        session_transition_account,
+        session,
+        weekly,
+    }
+}
+
+/// Account key a toast lane is deduped under (see `NotificationManager::resolve_warning_account`).
+/// Informational placeholders are not observed, matching `check_session_lane`.
+fn resolve_toast_account(
+    manager: &mut codexbar::notifications::NotificationManager,
+    provider: ProviderId,
+    scope: &WarningScope,
+    window: &str,
+    lane: &RateWindowSnapshot,
+    settings: &Settings,
+) -> String {
+    if lane.is_informational {
+        return scope.key().to_string();
+    }
+    let resets_at = lane
+        .resets_at
+        .as_deref()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|date| date.with_timezone(&chrono::Utc));
+    manager.resolve_warning_account(
+        provider,
+        scope,
+        window,
+        lane.used_percent,
+        resets_at,
+        settings,
+    )
 }
 
 fn dispatch_quota_hooks(
@@ -794,32 +1470,38 @@ fn dispatch_quota_hooks(
 
 /// Stable account discriminator for threshold/session toast dedupe.
 /// Prefer token-account id, then email, org, plan; empty for single-account lanes.
-fn quota_notification_account_identity(
+pub(super) fn quota_notification_account_identity(
     snapshot: &ProviderUsageSnapshot,
     token_account_id: Option<uuid::Uuid>,
 ) -> String {
-    if let Some(id) = token_account_id {
-        return format!("token-account:{}", id.as_hyphenated());
-    }
-    if let Some(email) = snapshot
-        .account_email
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        return email.to_ascii_lowercase();
-    }
-    if let Some(org) = snapshot
-        .account_organization
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        return format!("org:{}", org.to_ascii_lowercase());
-    }
-    // Do not fall back to plan_name/login_method — those are display tiers and
-    // flicker across refreshes, re-arming still-hot windows for a new identity.
-    String::new()
+    ProviderId::from_cli_name(&snapshot.provider_id)
+        .map(|provider| {
+            quota_notification_account_identity_for(
+                provider,
+                &snapshot.source_label,
+                snapshot.account_email.as_deref(),
+                snapshot.account_organization.as_deref(),
+                token_account_id,
+            )
+        })
+        .unwrap_or_default()
+}
+
+pub(super) fn quota_notification_account_identity_for(
+    provider: ProviderId,
+    source_label: &str,
+    account_email: Option<&str>,
+    account_organization: Option<&str>,
+    token_account_id: Option<uuid::Uuid>,
+) -> String {
+    WarningIdentity::new(
+        provider,
+        source_label,
+        account_email,
+        account_organization,
+        token_account_id,
+    )
+    .threshold_key()
 }
 
 fn notify_predictive_pace(
@@ -839,12 +1521,14 @@ fn notify_predictive_pace(
         .get(&provider)
         .and_then(ProviderAccountData::active_account)
         .map(|account| account.id);
-    let Some(identity) = predictive_warning_identity(
+    let warning_identity = WarningIdentity::new(
         provider,
         &snapshot.source_label,
         snapshot.account_email.as_deref(),
+        None,
         token_account_id,
-    ) else {
+    );
+    let Some(identity) = warning_identity.predictive_key() else {
         return;
     };
     let observed_at = chrono::DateTime::parse_from_rfc3339(&snapshot.updated_at)
@@ -879,9 +1563,12 @@ fn notify_predictive_pace(
                 .map(|date| date.with_timezone(&chrono::Utc)),
             window.reset_description.clone(),
         );
-        let Some(pace) =
-            codexbar::core::UsagePace::weekly(&rate_window, observed_at, default_window_minutes)
-        else {
+        let Some(pace) = codexbar::core::UsagePace::weekly(
+            &rate_window,
+            observed_at,
+            default_window_minutes,
+            settings.weekly_progress_work_days,
+        ) else {
             continue;
         };
         manager.check_predictive_pace(
@@ -893,26 +1580,6 @@ fn notify_predictive_pace(
             settings,
         );
     }
-}
-
-fn predictive_warning_identity(
-    provider: ProviderId,
-    source_label: &str,
-    account_email: Option<&str>,
-    token_account_id: Option<uuid::Uuid>,
-) -> Option<String> {
-    if !matches!(provider, ProviderId::Claude | ProviderId::Codex) {
-        return None;
-    }
-    if let Some(id) = token_account_id {
-        return Some(format!("token-account:{}", id.as_hyphenated()));
-    }
-    let source = source_label.trim().to_ascii_lowercase();
-    let account = account_email?.trim().to_ascii_lowercase();
-    if source.is_empty() || account.is_empty() {
-        return None;
-    }
-    Some(format!("{source}:{account}"))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -972,15 +1639,11 @@ pub async fn refresh_providers_if_stale(app: tauri::AppHandle) -> Result<(), Str
 pub fn get_cached_providers(
     state: tauri::State<'_, Mutex<AppState>>,
 ) -> Vec<ProviderUsagePresentationSnapshot> {
-    let mut snapshots = state
+    let snapshots = state
         .lock()
         .map(|guard| guard.provider_cache.clone())
         .unwrap_or_default();
     let settings = Settings::load();
-    let spark_usage_visible = settings.codex_spark_usage_visible();
-    for snapshot in &mut snapshots {
-        super::filter_hidden_codex_spark_rows(snapshot, spark_usage_visible);
-    }
 
     snapshots
         .into_iter()
@@ -989,56 +1652,19 @@ pub fn get_cached_providers(
 }
 
 #[cfg(test)]
+mod refresh_scope_tests {
+    use super::RefreshScope;
+
+    #[test]
+    fn only_full_refreshes_poll_status_pages() {
+        assert!(RefreshScope::AllEnabled.polls_status());
+        assert!(!RefreshScope::AutoResume.polls_status());
+    }
+}
+
+#[cfg(test)]
 mod predictive_warning_tests {
     use super::*;
-
-    #[test]
-    fn predictive_warning_identity_keeps_claude_sources_and_token_accounts_separate() {
-        let account_id = uuid::Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
-
-        assert_eq!(
-            predictive_warning_identity(
-                ProviderId::Claude,
-                "cli",
-                Some("Person@Example.com"),
-                None,
-            )
-            .as_deref(),
-            Some("cli:person@example.com")
-        );
-        assert_eq!(
-            predictive_warning_identity(
-                ProviderId::Claude,
-                "oauth",
-                Some("Person@Example.com"),
-                None,
-            )
-            .as_deref(),
-            Some("oauth:person@example.com")
-        );
-        assert_eq!(
-            predictive_warning_identity(
-                ProviderId::Claude,
-                "oauth",
-                Some("Person@Example.com"),
-                Some(account_id),
-            )
-            .as_deref(),
-            Some("token-account:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
-        );
-    }
-
-    #[test]
-    fn predictive_warning_identity_skips_unidentified_accounts() {
-        assert_eq!(
-            predictive_warning_identity(ProviderId::Claude, "oauth", None, None),
-            None
-        );
-        assert_eq!(
-            predictive_warning_identity(ProviderId::Codex, "cli", Some("  "), None),
-            None
-        );
-    }
 
     fn empty_snapshot() -> ProviderUsageSnapshot {
         let metadata = codexbar::core::instantiate_provider(ProviderId::Claude)
@@ -1076,11 +1702,18 @@ mod predictive_warning_tests {
         );
 
         snapshot.account_organization = None;
-        // plan_name/login_method is not a stable ownership key — fall through to "".
-        assert_eq!(quota_notification_account_identity(&snapshot, None), "");
+        snapshot.source_label = "oauth".to_string();
+        assert_eq!(
+            quota_notification_account_identity(&snapshot, None),
+            "claude:oauth:unknown"
+        );
 
         snapshot.plan_name = None;
-        assert_eq!(quota_notification_account_identity(&snapshot, None), "");
+        snapshot.source_label = "cli (reduced fidelity)".to_string();
+        assert_eq!(
+            quota_notification_account_identity(&snapshot, None),
+            "claude:cli:unknown"
+        );
     }
 
     /// The forecast scope key and the notification identity must never disagree.
@@ -1114,13 +1747,55 @@ mod predictive_warning_tests {
             }
         }
     }
-}
 
+    /// Codex OAuth now publishes the auth.json email. Ambient Codex moves from
+    /// the unscoped key (process-local history only) to the lowercased email;
+    /// a managed token account still wins, and the header-only token-account
+    /// label never feeds any scoping key.
+    #[test]
+    fn codex_email_scopes_forecast_and_warnings_but_label_does_not() {
+        use crate::commands::bridge::forecast_account_key;
+
+        let token = uuid::Uuid::parse_str("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").unwrap();
+        let mut usage = codexbar::core::UsageSnapshot::new(codexbar::core::RateWindow::new(1.0));
+        let mut snapshot = empty_snapshot();
+        snapshot.provider_id = "codex".to_string();
+
+        assert_eq!(forecast_account_key(&usage, None), None);
+        assert_eq!(quota_notification_account_identity(&snapshot, None), "");
+
+        snapshot.account_label = Some("Work account".to_string());
+        assert_eq!(quota_notification_account_identity(&snapshot, None), "");
+
+        usage.account_email = Some("Parity.User@Example.com".to_string());
+        snapshot.account_email = usage.account_email.clone();
+        assert_eq!(
+            forecast_account_key(&usage, None).as_deref(),
+            Some("parity.user@example.com")
+        );
+        assert_eq!(
+            quota_notification_account_identity(&snapshot, None),
+            "parity.user@example.com"
+        );
+        assert_eq!(
+            forecast_account_key(&usage, Some(token)).as_deref(),
+            Some("token-account:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+        );
+    }
+
+    #[test]
+    fn header_label_trims_and_drops_blank_labels() {
+        assert_eq!(
+            header_label("  parity-github "),
+            Some("parity-github".to_string())
+        );
+        assert_eq!(header_label("   "), None);
+    }
+}
 #[cfg(test)]
 mod reset_backfill_tests {
     use super::*;
     use crate::commands::bridge::{ProviderUsageSnapshot, RateWindowSnapshot};
-
     fn win(used: f64, resets_at: Option<&str>) -> RateWindowSnapshot {
         RateWindowSnapshot {
             used_percent: used,
@@ -1131,13 +1806,16 @@ mod reset_backfill_tests {
             is_exhausted: false,
             is_informational: false,
             reserve_percent: None,
-            over_percent: None,
             reserve_description: None,
             reserve_will_last_to_reset: false,
             reserve_eta_seconds: None,
+            pace: None,
+            description_is_detail: false,
+            reset_regenerates: false,
+            hidden_on_card: false,
+            monthly_limit_block: None,
         }
     }
-
     fn codex_snapshot(primary: RateWindowSnapshot) -> ProviderUsageSnapshot {
         ProviderUsageSnapshot {
             provider_id: "codex".into(),
@@ -1146,13 +1824,17 @@ mod reset_backfill_tests {
             primary_label: None,
             secondary: None,
             secondary_label: None,
+            secondary_label_key: None,
             model_specific: None,
             tertiary: None,
             tertiary_label: None,
             extra_rate_windows: Vec::new(),
+            inventory: Vec::new(),
+            display_details: Vec::new(),
             cost: None,
             plan_name: None,
             account_email: None,
+            account_label: None,
             subscription: None,
             source_label: String::new(),
             has_successful_claude_cli_quota: false,
@@ -1160,39 +1842,40 @@ mod reset_backfill_tests {
             error: None,
             error_state: codexbar::core::ProviderStateKind::Ready,
             pace: None,
+            pace_authoritative: true,
             account_organization: None,
             tray_status_label: None,
             fetch_duration_ms: None,
             wayfinder_usage: None,
+            open_ai_api_usage: None,
+            throughput: None,
             session_equivalent_forecast: None,
+            quota_burndown: None,
         }
     }
-
     #[test]
     fn f6_backfills_future_cached_reset() {
         // Cached has a future resets_at; fresh has none → backfilled.
         let future = (chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
         let cached = codex_snapshot(win(50.0, Some(&future)));
         let mut fresh = codex_snapshot(win(30.0, None));
-        codex_reset_backfill(&mut fresh, Some(&cached));
+        reset_backfill::codex_reset_backfill(&mut fresh, Some(&cached));
         assert_eq!(fresh.primary.resets_at.as_deref(), Some(future.as_str()));
         // used_percent is NOT overwritten.
         assert!((fresh.primary.used_percent - 30.0).abs() < f64::EPSILON);
     }
-
     #[test]
     fn f6_does_not_backfill_stale_cached_reset() {
         // Cached reset is in the past → not backfilled.
         let past = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
         let cached = codex_snapshot(win(50.0, Some(&past)));
         let mut fresh = codex_snapshot(win(30.0, None));
-        codex_reset_backfill(&mut fresh, Some(&cached));
+        reset_backfill::codex_reset_backfill(&mut fresh, Some(&cached));
         assert!(
             fresh.primary.resets_at.is_none(),
             "stale reset not backfilled"
         );
     }
-
     #[test]
     fn f6_does_not_overwrite_existing_resets_at() {
         // Fresh already has resets_at → cached not applied.
@@ -1200,10 +1883,9 @@ mod reset_backfill_tests {
         let future2 = (chrono::Utc::now() + chrono::Duration::hours(5)).to_rfc3339();
         let cached = codex_snapshot(win(50.0, Some(&future2)));
         let mut fresh = codex_snapshot(win(30.0, Some(&future1)));
-        codex_reset_backfill(&mut fresh, Some(&cached));
+        reset_backfill::codex_reset_backfill(&mut fresh, Some(&cached));
         assert_eq!(fresh.primary.resets_at.as_deref(), Some(future1.as_str()));
     }
-
     #[test]
     fn f6_skips_non_codex_provider() {
         let future = (chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
@@ -1211,10 +1893,9 @@ mod reset_backfill_tests {
         cached.provider_id = "claude".into();
         let mut fresh = codex_snapshot(win(30.0, None));
         fresh.provider_id = "claude".into();
-        codex_reset_backfill(&mut fresh, Some(&cached));
+        reset_backfill::codex_reset_backfill(&mut fresh, Some(&cached));
         assert!(fresh.primary.resets_at.is_none(), "non-codex skip");
     }
-
     #[test]
     fn zai_five_hour_backfill_rejects_impossible_cached_reset() {
         for (offset, should_backfill) in [
@@ -1227,16 +1908,15 @@ mod reset_backfill_tests {
             let mut fresh = codex_snapshot(win(30.0, None));
             fresh.provider_id = "zai".into();
             fresh.primary.reset_description = Some("5-hour".into());
-            codex_reset_backfill(&mut fresh, Some(&cached));
+            reset_backfill::codex_reset_backfill(&mut fresh, Some(&cached));
             assert_eq!(fresh.primary.resets_at.is_some(), should_backfill);
             assert!((fresh.primary.used_percent - 30.0).abs() < f64::EPSILON);
         }
     }
-
     #[test]
     fn f6_skips_when_no_cached_snapshot() {
         let mut fresh = codex_snapshot(win(30.0, None));
-        codex_reset_backfill(&mut fresh, None);
+        reset_backfill::codex_reset_backfill(&mut fresh, None);
         assert!(fresh.primary.resets_at.is_none());
     }
 }

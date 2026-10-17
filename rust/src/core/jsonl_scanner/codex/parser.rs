@@ -1,83 +1,443 @@
 use super::helpers::*;
-use super::{CodexTotals, CodexUsageRecord, CostUsageDayRange};
+use super::{
+    CodexForkParseResume, CodexForkResumeState, CodexTotals, CodexUsageRecord, CostUsageDayRange,
+};
 use crate::core::CostUsagePricing;
-use chrono::DateTime;
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 pub(super) struct CodexParserState {
     pub(super) current_model: Option<String>,
+    /// Turn opened by the latest `task_started` event; token rows inherit it.
+    current_turn_id: Option<String>,
     pub(super) previous_totals: Option<CodexTotals>,
     /// High watermark of observed cumulative totals (never lowered). Used for
     /// Ultra interleaved-lineage containment (issue #2037 Phase 1).
     totals_watermark: Option<CodexTotals>,
     /// Latched once any cumulative component drops below the watermark.
     saw_interleaved_totals: bool,
-    pub(super) records: Vec<CodexUsageRecord>,
+    pub(super) records: Vec<(CodexUsageRecord, i64)>,
     pub(super) previous_token_timestamp: Option<String>,
+    /// First token timestamp seen by this parse. A fork uses it to prove that
+    /// its inherited origin is still the counter state at a descendant's
+    /// cutoff. Resumed non-fork parses do not observe the whole prefix.
+    pub(super) first_token_timestamp: Option<String>,
     previous_token_timestamp_parsed: Option<DateTime<chrono::FixedOffset>>,
     pub(super) token_timestamps_monotonic: Option<bool>,
     pub(super) token_timestamp_comparisons: u64,
-    fork_baseline: Option<CodexTotals>,
+    pub(super) fork_baseline: Option<CodexTotals>,
+    pub(super) remaining_inherited_totals: Option<CodexTotals>,
+    paginated_continuation: bool,
+    paginated_baseline_checked: bool,
     pub(super) fork_baseline_ambiguous: bool,
+    fork_baseline_inference: Option<ForkBaselineInference>,
+    /// Parent baseline a parent-baseline fork parse started from.
+    fork_parse_baseline: Option<CodexTotals>,
+}
+
+pub(super) enum CodexParseMode {
+    Standard {
+        start_offset: i64,
+        initial_model: Option<String>,
+        initial_totals: Option<CodexTotals>,
+        previous_token_timestamp: Option<String>,
+        token_timestamps_monotonic: Option<bool>,
+    },
+    ParentBaseline {
+        baseline: CodexTotals,
+        paginated_continuation: bool,
+        remaining_inherited_totals: Option<CodexTotals>,
+    },
+    /// Continue an unfinished `ParentBaseline` parse at its saved cursor.
+    ResumeParentBaseline(CodexForkParseResume),
+    InferSubagent {
+        start_ordinal: Option<i64>,
+    },
+}
+
+impl CodexParseMode {
+    pub(super) fn start_offset(&self) -> i64 {
+        match self {
+            Self::Standard { start_offset, .. } => *start_offset,
+            Self::ResumeParentBaseline(resume) => resume.start_offset,
+            Self::ParentBaseline { .. } | Self::InferSubagent { .. } => 0,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ForkBaselineInference {
+    explicit_start_ordinal: Option<i64>,
+    baseline: Option<CodexTotals>,
+    boundary_open: bool,
+    inherited_opening: bool,
+    missing_explicit_ordinal: bool,
+    locally_confirmed: bool,
+    resolved: bool,
+}
+
+enum ForkBaselineDecision {
+    SkipCopiedPrefix,
+    ProcessWithBaseline(CodexTotals),
+}
+
+impl ForkBaselineInference {
+    fn new(explicit_start_ordinal: Option<i64>) -> Self {
+        Self {
+            explicit_start_ordinal,
+            baseline: explicit_start_ordinal.map(|_| CodexTotals {
+                input: 0,
+                cached: 0,
+                output: 0,
+                reasoning: None,
+            }),
+            boundary_open: false,
+            inherited_opening: false,
+            missing_explicit_ordinal: false,
+            locally_confirmed: false,
+            resolved: false,
+        }
+    }
+
+    fn confirm_local_resolution(&mut self) {
+        if !self.missing_explicit_ordinal {
+            self.locally_confirmed = true;
+        }
+    }
+
+    fn mark_missing_explicit_ordinal(&mut self) {
+        self.missing_explicit_ordinal = true;
+        self.locally_confirmed = false;
+    }
+
+    fn observe_non_token(&mut self, obj: &Value) {
+        if obj.get("type").and_then(Value::as_str) == Some("turn_context") && self.inherited_opening
+        {
+            self.boundary_open = true;
+        }
+    }
+
+    fn observe_token(&mut self, obj: &Value) -> ForkBaselineDecision {
+        let Some(payload) = token_count_payload(obj) else {
+            return ForkBaselineDecision::SkipCopiedPrefix;
+        };
+        let Some(info) = payload.get("info") else {
+            return ForkBaselineDecision::SkipCopiedPrefix;
+        };
+        let Some(total_usage) = info.get("total_token_usage") else {
+            return ForkBaselineDecision::SkipCopiedPrefix;
+        };
+        let Some(last_usage) = info.get("last_token_usage") else {
+            return ForkBaselineDecision::SkipCopiedPrefix;
+        };
+        let total = read_token_totals(total_usage);
+        let last = read_token_totals(last_usage);
+        let ordinal = obj.get("ordinal").and_then(Value::as_i64);
+
+        if self.explicit_start_ordinal.is_some() && ordinal.is_none() {
+            self.mark_missing_explicit_ordinal();
+            if !self.boundary_open {
+                self.baseline = Some(total);
+            }
+            return ForkBaselineDecision::SkipCopiedPrefix;
+        }
+
+        if let Some(start) = self.explicit_start_ordinal
+            && !self.boundary_open
+        {
+            let ordinal = ordinal.expect("missing explicit ordinals return above");
+            if ordinal < start {
+                self.baseline = Some(total);
+                return ForkBaselineDecision::SkipCopiedPrefix;
+            }
+            self.boundary_open = true;
+        } else if self.baseline.is_none() {
+            if totals_contain_usage(&total) && !totals_contain_usage(&last) {
+                self.baseline = Some(total);
+                self.inherited_opening = true;
+                self.confirm_local_resolution();
+            }
+            return ForkBaselineDecision::SkipCopiedPrefix;
+        } else if !self.boundary_open {
+            let changed = self
+                .baseline
+                .as_ref()
+                .is_some_and(|baseline| baseline != &total);
+            if self.inherited_opening && changed && totals_contain_usage(&last) {
+                self.boundary_open = true;
+            } else {
+                return ForkBaselineDecision::SkipCopiedPrefix;
+            }
+        }
+
+        let baseline = self.baseline.clone().unwrap_or(CodexTotals {
+            input: 0,
+            cached: 0,
+            output: 0,
+            reasoning: None,
+        });
+        if total == baseline {
+            return ForkBaselineDecision::SkipCopiedPrefix;
+        }
+        let copied_snapshot =
+            totals_contain_usage(&baseline) && total == last && totals_at_least(&total, &baseline);
+        if copied_snapshot {
+            self.baseline = Some(total);
+            self.confirm_local_resolution();
+            return ForkBaselineDecision::SkipCopiedPrefix;
+        }
+
+        let owned_baseline = totals_delta(&last, &total);
+        self.baseline = Some(owned_baseline.clone());
+        self.confirm_local_resolution();
+        self.resolved = true;
+        ForkBaselineDecision::ProcessWithBaseline(owned_baseline)
+    }
+}
+
+fn totals_contain_usage(totals: &CodexTotals) -> bool {
+    totals.input > 0 || totals.cached > 0 || totals.output > 0
+}
+
+fn totals_at_least(total: &CodexTotals, baseline: &CodexTotals) -> bool {
+    total.input >= baseline.input
+        && total.cached >= baseline.cached
+        && total.output >= baseline.output
+}
+
+fn totals_delta(last: &CodexTotals, total: &CodexTotals) -> CodexTotals {
+    CodexTotals {
+        input: total.input.saturating_sub(last.input).max(0),
+        cached: total.cached.saturating_sub(last.cached).max(0),
+        output: total.output.saturating_sub(last.output).max(0),
+        reasoning: subtract_optional(total.reasoning, last.reasoning),
+    }
 }
 
 impl CodexParserState {
     pub(super) fn new(initial_model: Option<String>, initial_totals: Option<CodexTotals>) -> Self {
-        Self::with_timestamp_state(initial_model, initial_totals, None, None)
+        Self::from_mode(CodexParseMode::Standard {
+            start_offset: 0,
+            initial_model,
+            initial_totals,
+            previous_token_timestamp: None,
+            token_timestamps_monotonic: None,
+        })
     }
 
-    fn with_timestamp_state(
-        initial_model: Option<String>,
-        initial_totals: Option<CodexTotals>,
-        previous_token_timestamp: Option<String>,
-        token_timestamps_monotonic: Option<bool>,
-    ) -> Self {
-        Self::with_timestamp_state_and_fork_mode(
+    pub(super) fn from_mode(mode: CodexParseMode) -> Self {
+        let fork_parse_baseline = match &mode {
+            CodexParseMode::ParentBaseline { baseline, .. } => Some(baseline.clone()),
+            _ => None,
+        };
+        let (
             initial_model,
             initial_totals,
             previous_token_timestamp,
             token_timestamps_monotonic,
-            false,
-        )
-    }
-
-    pub(super) fn with_timestamp_state_and_fork_mode(
-        initial_model: Option<String>,
-        initial_totals: Option<CodexTotals>,
-        previous_token_timestamp: Option<String>,
-        token_timestamps_monotonic: Option<bool>,
-        fork_baseline_mode: bool,
-    ) -> Self {
+            fork_baseline,
+            paginated_continuation,
+            remaining_inherited_totals,
+            fork_baseline_inference,
+        ) = match mode {
+            CodexParseMode::Standard {
+                initial_model,
+                initial_totals,
+                previous_token_timestamp,
+                token_timestamps_monotonic,
+                ..
+            } => (
+                initial_model,
+                initial_totals,
+                previous_token_timestamp,
+                token_timestamps_monotonic,
+                None,
+                false,
+                None,
+                None,
+            ),
+            CodexParseMode::ParentBaseline {
+                baseline,
+                paginated_continuation,
+                remaining_inherited_totals,
+            } => {
+                let remaining_inherited_totals =
+                    remaining_inherited_totals.or_else(|| Some(baseline.clone()));
+                (
+                    None,
+                    Some(baseline.clone()),
+                    None,
+                    None,
+                    Some(baseline),
+                    paginated_continuation,
+                    remaining_inherited_totals,
+                    None,
+                )
+            }
+            CodexParseMode::ResumeParentBaseline(resume) => return Self::resume_fork(resume),
+            CodexParseMode::InferSubagent { start_ordinal } => (
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                Some(ForkBaselineInference::new(start_ordinal)),
+            ),
+        };
         let previous_token_timestamp_parsed = previous_token_timestamp
             .as_deref()
             .and_then(parse_rfc3339_timestamp);
-        let fork_baseline = fork_baseline_mode.then(|| initial_totals.clone()).flatten();
         Self {
             current_model: initial_model,
+            current_turn_id: None,
             previous_totals: initial_totals.clone(),
             totals_watermark: initial_totals,
             saw_interleaved_totals: false,
             records: Vec::new(),
             previous_token_timestamp,
+            first_token_timestamp: None,
             previous_token_timestamp_parsed,
             // A parser always validates a fresh prefix.  `None` is only an
             // input marker for the legacy-cache path, not an output state.
             token_timestamps_monotonic: Some(token_timestamps_monotonic.unwrap_or(true)),
             token_timestamp_comparisons: 0,
             fork_baseline,
+            remaining_inherited_totals,
+            paginated_continuation,
+            paginated_baseline_checked: false,
             fork_baseline_ambiguous: false,
+            fork_baseline_inference,
+            fork_parse_baseline,
         }
     }
 
+    /// Restore an unfinished fork parse at its saved cursor. A resumable parse
+    /// never latched an ambiguous baseline: that result is cached unresolved.
+    fn resume_fork(resume: CodexForkParseResume) -> Self {
+        let CodexForkParseResume {
+            start_offset,
+            paginated_continuation,
+            inherited_totals,
+            remaining_inherited_totals,
+            last_model,
+            last_totals,
+            last_token_timestamp,
+            first_token_timestamp,
+            token_timestamps_monotonic,
+            state,
+        } = resume;
+        let mut parser = Self::from_mode(CodexParseMode::Standard {
+            start_offset,
+            initial_model: last_model,
+            initial_totals: Some(last_totals),
+            previous_token_timestamp: last_token_timestamp,
+            token_timestamps_monotonic,
+        });
+        parser.totals_watermark = state.totals_watermark;
+        parser.saw_interleaved_totals = state.saw_interleaved_totals;
+        parser.first_token_timestamp = first_token_timestamp;
+        parser.fork_baseline = Some(inherited_totals);
+        // Kept verbatim: `None` means the inherited counters are used up.
+        parser.remaining_inherited_totals = remaining_inherited_totals;
+        parser.paginated_continuation = paginated_continuation;
+        parser.paginated_baseline_checked = state.paginated_baseline_checked;
+        parser.fork_parse_baseline = Some(state.parse_baseline);
+        parser
+    }
+
+    /// State a later pass needs to continue this parent-baseline fork parse.
+    pub(super) fn fork_resume_state(&self) -> Option<CodexForkResumeState> {
+        Some(CodexForkResumeState {
+            parse_baseline: self.fork_parse_baseline.clone()?,
+            totals_watermark: self.totals_watermark.clone(),
+            saw_interleaved_totals: self.saw_interleaved_totals,
+            paginated_baseline_checked: self.paginated_baseline_checked,
+        })
+    }
+
+    pub(super) fn fork_baseline_locally_resolved(&self) -> bool {
+        self.fork_baseline_inference
+            .as_ref()
+            .is_some_and(|inference| inference.locally_confirmed)
+    }
+
     pub(super) fn process_line(&mut self, line: &str, range: &CostUsageDayRange) {
+        self.process_line_with_source_offset(line, range, 0);
+    }
+
+    pub(super) fn process_line_with_source_offset(
+        &mut self,
+        line: &str,
+        range: &CostUsageDayRange,
+        source_end_offset: i64,
+    ) {
+        if self
+            .fork_baseline_inference
+            .as_ref()
+            .is_some_and(|inference| !inference.resolved)
+        {
+            let Ok(obj) = serde_json::from_str::<Value>(line) else {
+                return;
+            };
+            if token_count_payload(&obj).is_some() {
+                let decision = self
+                    .fork_baseline_inference
+                    .as_mut()
+                    .expect("inference exists")
+                    .observe_token(&obj);
+                let ForkBaselineDecision::ProcessWithBaseline(baseline) = decision else {
+                    return;
+                };
+                self.fork_baseline = Some(baseline.clone());
+                self.remaining_inherited_totals = Some(baseline.clone());
+                self.previous_totals = Some(baseline.clone());
+                self.totals_watermark = Some(baseline);
+            } else {
+                self.fork_baseline_inference
+                    .as_mut()
+                    .expect("inference exists")
+                    .observe_non_token(&obj);
+                if obj.get("type").and_then(Value::as_str) == Some("turn_context") {
+                    self.update_current_model(&obj);
+                }
+                return;
+            }
+        }
+
         let event_candidate = is_candidate_codex_line(line);
-        let bare_candidate = !event_candidate && line.contains("\"usage\"");
+        if event_candidate
+            && self
+                .fork_baseline_inference
+                .as_ref()
+                .is_some_and(|inference| {
+                    inference.resolved && inference.explicit_start_ordinal.is_some()
+                })
+        {
+            let Ok(obj) = serde_json::from_str::<Value>(line) else {
+                return;
+            };
+            if token_count_payload(&obj).is_some()
+                && obj.get("ordinal").and_then(Value::as_i64).is_none()
+            {
+                self.fork_baseline_inference
+                    .as_mut()
+                    .expect("resolved inference exists")
+                    .mark_missing_explicit_ordinal();
+                return;
+            }
+        }
+        // Event candidacy is only a fast-path hint. It must not suppress the
+        // independent bare-usage record family when a model value happens to
+        // contain an event marker such as "turn_context".
+        let bare_candidate = line.contains("\"usage\"");
         if !event_candidate && !bare_candidate {
             return;
         }
 
         if event_candidate && let Some(event) = parse_codex_fast_event(line) {
-            self.process_fast_event(event, range);
+            self.process_fast_event(event, range, source_end_offset);
             return;
         }
 
@@ -104,7 +464,11 @@ impl CodexParserState {
                 .filter(|day_key| {
                     CostUsageDayRange::is_in_range(day_key, &range.since_key, &range.until_key)
                 })
-                .or_else(|| self.records.last().map(|record| record.day_key.clone()));
+                .or_else(|| {
+                    self.records
+                        .last()
+                        .map(|(record, _)| record.day_key.clone())
+                });
             let Some(day_key) = day_key else {
                 return;
             };
@@ -119,13 +483,35 @@ impl CodexParserState {
                 self.record_usage(
                     range,
                     day_key,
+                    parsed_timestamp.as_ref().and_then(|timestamp| {
+                        timestamp.parsed.map(|value| value.with_timezone(&Utc))
+                    }),
                     &model,
                     totals.input,
                     totals.cached,
                     totals.output,
                     totals.reasoning,
+                    self.current_turn_id.clone(),
+                    source_end_offset,
                 );
             }
+            return;
+        }
+
+        if event_payload_type(&obj) == Some("task_started") {
+            // A turn boundary is not a usage row, so it applies regardless of
+            // the requested day window.
+            let payload = obj.get("payload").or_else(|| obj.get("event_msg"));
+            self.current_turn_id = payload
+                .and_then(|payload| {
+                    codex_turn_id(payload).or_else(|| {
+                        payload
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .and_then(model_evidence)
+                    })
+                })
+                .map(str::to_string);
             return;
         }
 
@@ -154,17 +540,33 @@ impl CodexParserState {
         }
 
         if is_token_count {
-            self.record_token_count(&obj, day_key, range);
+            self.record_token_count(
+                &obj,
+                day_key,
+                parsed_timestamp
+                    .as_ref()
+                    .and_then(|timestamp| timestamp.parsed.map(|value| value.with_timezone(&Utc))),
+                range,
+                source_end_offset,
+            );
         }
     }
 
-    fn process_fast_event(&mut self, event: CodexFastEvent<'_>, range: &CostUsageDayRange) {
+    fn process_fast_event(
+        &mut self,
+        event: CodexFastEvent<'_>,
+        range: &CostUsageDayRange,
+        source_end_offset: i64,
+    ) {
         match event {
             CodexFastEvent::TurnContext { model } => {
                 // Explicit blank model evidence clears stale turn context.
                 if let Some(raw) = model {
                     self.current_model = model_evidence(raw).map(str::to_string);
                 }
+            }
+            CodexFastEvent::TaskStarted { turn_id } => {
+                self.current_turn_id = turn_id.map(str::to_string);
             }
             CodexFastEvent::TokenCount { timestamp, payload } => {
                 let parsed_timestamp = parse_codex_timestamp(timestamp);
@@ -176,7 +578,15 @@ impl CodexParserState {
                 if !CostUsageDayRange::is_in_range(&day_key, &range.since_key, &range.until_key) {
                     return;
                 }
-                self.record_fast_token_count(payload, day_key, range);
+                self.record_fast_token_count(
+                    payload,
+                    day_key,
+                    parsed_timestamp
+                        .parsed
+                        .map(|value| value.with_timezone(&Utc)),
+                    range,
+                    source_end_offset,
+                );
             }
         }
     }
@@ -212,7 +622,14 @@ impl CodexParserState {
             .map(str::to_string);
     }
 
-    fn record_token_count(&mut self, obj: &Value, day_key: String, range: &CostUsageDayRange) {
+    fn record_token_count(
+        &mut self,
+        obj: &Value,
+        day_key: String,
+        timestamp: Option<DateTime<Utc>>,
+        range: &CostUsageDayRange,
+        source_end_offset: i64,
+    ) {
         let Some(payload) = token_count_payload(obj) else {
             return;
         };
@@ -226,14 +643,20 @@ impl CodexParserState {
 
         let info = payload.get("info");
         let model = self.resolve_token_model(info, payload, obj);
+        let turn_id = codex_turn_id(payload)
+            .map(str::to_string)
+            .or_else(|| self.current_turn_id.clone());
         self.record_usage(
             range,
             day_key,
+            timestamp,
             &model,
             delta_input,
             delta_cached,
             delta_output,
             reasoning,
+            turn_id,
+            source_end_offset,
         );
     }
 
@@ -241,7 +664,9 @@ impl CodexParserState {
         &mut self,
         payload: CodexFastPayload<'_>,
         day_key: String,
+        timestamp: Option<DateTime<Utc>>,
         range: &CostUsageDayRange,
+        source_end_offset: i64,
     ) {
         let Some((delta_input, delta_cached, delta_output, reasoning)) =
             self.fast_token_deltas(&payload)
@@ -267,14 +692,23 @@ impl CodexParserState {
             .or(event_model)
             .unwrap_or(CostUsagePricing::CODEX_UNATTRIBUTED_MODEL)
             .to_string();
+        let turn_id = payload
+            .turn_id
+            .or_else(|| payload.info.as_ref().and_then(|info| info.turn_id))
+            .and_then(model_evidence)
+            .map(str::to_string)
+            .or_else(|| self.current_turn_id.clone());
         self.record_usage(
             range,
             day_key,
+            timestamp,
             &model,
             delta_input,
             delta_cached,
             delta_output,
             reasoning,
+            turn_id,
+            source_end_offset,
         );
     }
 
@@ -286,23 +720,31 @@ impl CodexParserState {
         &mut self,
         range: &CostUsageDayRange,
         day_key: String,
+        timestamp: Option<DateTime<Utc>>,
         model: &str,
         input: i64,
         cached: i64,
         output: i64,
         reasoning: Option<i64>,
+        turn_id: Option<String>,
+        source_end_offset: i64,
     ) {
         if !CostUsageDayRange::is_in_range(&day_key, &range.since_key, &range.until_key) {
             return;
         }
-        self.records.push(CodexUsageRecord {
-            day_key,
-            model: CostUsagePricing::normalize_codex_model(model),
-            input,
-            cached: cached.min(input),
-            output,
-            reasoning: clamp_reasoning(reasoning, output),
-        });
+        self.records.push((
+            CodexUsageRecord {
+                day_key,
+                timestamp,
+                model: CostUsagePricing::normalize_codex_model(model),
+                input,
+                cached: cached.min(input),
+                output,
+                reasoning: clamp_reasoning(reasoning, output),
+                turn_id,
+            },
+            source_end_offset,
+        ));
     }
 
     fn resolve_token_model(&self, info: Option<&Value>, payload: &Value, obj: &Value) -> String {
@@ -323,11 +765,17 @@ impl CodexParserState {
     fn token_deltas(&mut self, payload: &Value) -> Option<(i64, i64, i64, Option<i64>)> {
         let info = payload.get("info");
         if let Some(total) = info.and_then(|i| i.get("total_token_usage")) {
+            if let Some(last) = info.and_then(|i| i.get("last_token_usage")) {
+                self.raise_inherited_baseline_if_continued_counter(
+                    read_token_totals(total),
+                    read_token_totals(last),
+                );
+            }
             return Some(self.total_usage_delta(total));
         }
 
         if let Some(last) = info.and_then(|i| i.get("last_token_usage")) {
-            return Some(last_usage_delta(last));
+            return Some(self.last_usage_delta(read_token_totals(last)));
         }
 
         let direct = read_token_totals(payload);
@@ -348,11 +796,17 @@ impl CodexParserState {
             .as_ref()
             .and_then(|info| info.total_token_usage)
         {
+            if let Some(last) = payload.info.as_ref().and_then(|info| info.last_token_usage) {
+                self.raise_inherited_baseline_if_continued_counter(
+                    codex_totals_from_fast(total),
+                    codex_totals_from_fast(last),
+                );
+            }
             return Some(self.fast_total_usage_delta(total));
         }
 
         if let Some(last) = payload.info.as_ref().and_then(|info| info.last_token_usage) {
-            return Some(fast_last_usage_delta(last));
+            return Some(self.last_usage_delta(codex_totals_from_fast(last)));
         }
 
         let direct = fast_totals_from_payload(payload);
@@ -401,7 +855,71 @@ impl CodexParserState {
 
         self.previous_totals = Some(totals.clone());
         self.raise_watermark(&totals);
+        self.remaining_inherited_totals = None;
         (delta.input, delta.cached, delta.output, delta.reasoning)
+    }
+
+    fn last_usage_delta(&mut self, raw: CodexTotals) -> (i64, i64, i64, Option<i64>) {
+        let adjusted = if let Some(mut remaining) = self.remaining_inherited_totals.take() {
+            let adjusted = CodexTotals {
+                input: raw.input.saturating_sub(remaining.input).max(0),
+                cached: raw.cached.saturating_sub(remaining.cached).max(0),
+                output: raw.output.saturating_sub(remaining.output).max(0),
+                reasoning: subtract_optional(raw.reasoning, remaining.reasoning),
+            };
+            remaining.input = remaining.input.saturating_sub(raw.input).max(0);
+            remaining.cached = remaining.cached.saturating_sub(raw.cached).max(0);
+            remaining.output = remaining.output.saturating_sub(raw.output).max(0);
+            remaining.reasoning = subtract_optional(remaining.reasoning, raw.reasoning);
+            if remaining.input > 0 || remaining.cached > 0 || remaining.output > 0 {
+                self.remaining_inherited_totals = Some(remaining);
+            }
+            adjusted
+        } else {
+            raw
+        };
+        (
+            adjusted.input,
+            adjusted.cached,
+            adjusted.output,
+            adjusted.reasoning,
+        )
+    }
+
+    fn raise_inherited_baseline_if_continued_counter(
+        &mut self,
+        total: CodexTotals,
+        last: CodexTotals,
+    ) {
+        if !self.paginated_continuation || self.paginated_baseline_checked {
+            return;
+        }
+        self.paginated_baseline_checked = true;
+        let Some(current_inherited) = self.fork_baseline.clone() else {
+            return;
+        };
+        if total.input < last.input || total.cached < last.cached || total.output < last.output {
+            return;
+        }
+        let local_inherited = CodexTotals {
+            input: total.input.saturating_sub(last.input),
+            cached: total.cached.saturating_sub(last.cached),
+            output: total.output.saturating_sub(last.output),
+            reasoning: subtract_optional(total.reasoning, last.reasoning),
+        };
+        let has_positive_usage =
+            local_inherited.input > 0 || local_inherited.cached > 0 || local_inherited.output > 0;
+        let at_least_current = local_inherited.input >= current_inherited.input
+            && local_inherited.cached >= current_inherited.cached
+            && local_inherited.output >= current_inherited.output;
+        if !has_positive_usage || !at_least_current || local_inherited == current_inherited {
+            return;
+        }
+        self.fork_baseline = Some(local_inherited.clone());
+        self.remaining_inherited_totals = Some(local_inherited.clone());
+        self.previous_totals = Some(local_inherited.clone());
+        self.totals_watermark = Some(local_inherited);
+        self.saw_interleaved_totals = false;
     }
 
     fn observe_token_timestamp(
@@ -429,6 +947,9 @@ impl CodexParserState {
             if !ordered {
                 self.token_timestamps_monotonic = Some(false);
             }
+        }
+        if self.first_token_timestamp.is_none() {
+            self.first_token_timestamp = Some(timestamp.to_string());
         }
         self.previous_token_timestamp = Some(timestamp.to_string());
         self.previous_token_timestamp_parsed = current_parsed;
@@ -469,4 +990,8 @@ impl CodexParserState {
             None => totals.clone(),
         });
     }
+}
+
+fn subtract_optional(current: Option<i64>, inherited: Option<i64>) -> Option<i64> {
+    current.map(|current| current.saturating_sub(inherited.unwrap_or(0)).max(0))
 }

@@ -12,22 +12,58 @@
 )]
 
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use crate::core::ProviderId;
+use crate::cost_reporting_period::CostReportingPeriod;
+
+/// Stable namespace used by the desktop bridge for quota metric rows.
+pub const USAGE_ITEM_METRIC_PREFIX: &str = "metric:";
+/// Stable namespace for provider detail sections (upstream 0.62.0 #3638).
+pub const USAGE_ITEM_DETAIL_SECTION_PREFIX: &str = "detailSection:";
+pub const CODEX_SPARK_USAGE_ITEM_IDS: [&str; 2] = [
+    "metric:extra-codex-spark",
+    "metric:extra-codex-spark-weekly",
+];
+pub const CLAUDE_DAILY_ROUTINES_USAGE_ITEM_ID: &str = "metric:extra-claude-routines";
+/// Namespace for non-metric card sections with their own visibility choice
+/// (upstream 0.75.0 #4484). The raw IDs match upstream's.
+pub const USAGE_ITEM_SECTION_PREFIX: &str = "section:";
+/// Claude saved limit-reset credits (the `reset-credits` inventory row).
+pub const CLAUDE_RESET_CREDITS_USAGE_ITEM_ID: &str = "section:claude-reset-credits";
+/// Claude Extra usage / prepaid balance block. Admin API spend is excluded.
+pub const CLAUDE_EXTRA_USAGE_USAGE_ITEM_ID: &str = "section:claude-extra-usage";
+/// Plan renewal / expiry dates shown beside the quota rows.
+pub const SUBSCRIPTION_USAGE_ITEM_ID: &str = "section:subscription";
 
 mod api_keys;
+mod config_path;
+mod cost_time_zone;
 mod manual_cookies;
+mod model_rate_limits;
+mod optional_details;
+mod preferences_document;
 mod provider_workspace;
 mod raw;
+mod spend_dashboard;
 mod status;
+mod system_language;
 mod types;
 
 pub use api_keys::*;
+pub use config_path::{
+    CONFIG_PATH_ENV, apply_config_path_env, config_store_dir, resolve_config_path,
+    settings_file_override,
+};
+pub use cost_time_zone::*;
 pub use manual_cookies::*;
+pub use model_rate_limits::{ModelRateLimit, rate_limit_number};
+pub use optional_details::provider_has_optional_details;
+pub use preferences_document::*;
 pub use provider_workspace::*;
 use raw::RawSettings;
+pub use spend_dashboard::*;
 pub use status::*;
 pub use types::*;
 
@@ -74,6 +110,10 @@ impl LowPowerModePreference {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(from = "RawSettings", default)]
 pub struct Settings {
+    /// Preferred display currency for supported spend amounts; AUTO keeps provider currencies.
+    #[serde(default = "default_preferred_currency_code")]
+    pub preferred_currency_code: String,
+
     /// Enabled provider IDs (by CLI name)
     pub enabled_providers: HashSet<String>,
 
@@ -88,6 +128,11 @@ pub struct Settings {
     /// Force-refresh enabled providers whenever the tray/menu surface opens.
     #[serde(default)]
     pub refresh_all_providers_on_menu_open: bool,
+
+    /// Poll provider status pages and surface incidents (upstream
+    /// `statusChecksEnabled`, default on).
+    #[serde(default = "default_true")]
+    pub status_checks_enabled: bool,
 
     /// Off/On/Automatic background-work power preference (upstream 0.53).
     #[serde(default)]
@@ -119,14 +164,22 @@ pub struct Settings {
     /// Critical usage threshold for alerts (percentage)
     pub critical_usage_threshold: f64,
 
-    pub provider_usage_thresholds: HashMap<String, UsageThresholdOverride>,
-
     /// Merge mode: show all enabled providers in a single tray icon
     pub merge_tray_icons: bool,
 
     /// Tray icon display mode: single icon or per-provider icons
     #[serde(default)]
     pub tray_icon_mode: TrayIconMode,
+
+    /// Optional preferred provider for the upper row of a stacked tray icon.
+    /// Stale or disabled values are retained and ignored until eligible again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stacked_tray_top_provider: Option<String>,
+
+    /// Optional preferred provider for the lower row of a stacked tray icon.
+    /// Stale or duplicate values fall back to the next eligible provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stacked_tray_bottom_provider: Option<String>,
 
     /// Show provider icons in the merged switcher UI
     #[serde(default = "default_true")]
@@ -136,9 +189,59 @@ pub struct Settings {
     #[serde(default)]
     pub menu_bar_shows_highest_usage: bool,
 
-    /// Replace bar-only tray display with provider branding plus percent text where supported
+    /// Legacy "Show percent in tray" flag. No longer read: it only seeds
+    /// `menu_bar_icon_style` for files written before that key existed.
+    /// Kept (and still written) for one release so a downgrade keeps the style.
     #[serde(default)]
     pub menu_bar_shows_percent: bool,
+
+    /// How the single tray icon is drawn: meter bars or icon + percent.
+    /// Legacy files without the key follow `menu_bar_shows_percent`.
+    #[serde(default)]
+    pub menu_bar_icon_style: MenuBarIconStyle,
+
+    /// Providers shown in the merged Overview, in provider order, at most
+    /// [`MERGED_OVERVIEW_PROVIDER_LIMIT`]. Empty = the first enabled ones.
+    #[serde(default)]
+    pub merged_overview_selected_providers: Vec<String>,
+
+    /// Draw quota-warning threshold ticks on usage bars.
+    #[serde(default = "default_true")]
+    pub quota_warning_markers_visible: bool,
+
+    /// Tray panel Refresh row highlights under the pointer. Keyboard focus
+    /// stays highlighted either way.
+    #[serde(default = "default_true")]
+    pub highlight_menu_cards_on_hover: bool,
+
+    /// How workday boundaries appear on weekly usage bars.
+    #[serde(default)]
+    pub workday_tick_style: WorkdayTickStyle,
+
+    /// Colour the Windows tray usage indicator by pace when enabled.
+    #[serde(default)]
+    pub menu_bar_color_pace: bool,
+
+    /// Tint the Windows tray usage indicator with each shown provider's accent
+    /// color (upstream "Color by provider", #4321). Defaults off.
+    #[serde(default)]
+    pub menu_bar_color_by_provider: bool,
+
+    /// Show reserve as `+` and deficit as `-` in signed pace text (upstream
+    /// `menuBarPaceReservePositive`). Display only: the stored pace delta stays
+    /// usage-ahead, so pace colours and stages keep their meaning.
+    #[serde(default)]
+    pub menu_bar_pace_reserve_positive: bool,
+
+    /// Settings sidebar lists providers alphabetically (enabled first)
+    /// instead of in `provider_order`. Display only; never rewrites the order.
+    #[serde(default)]
+    pub providers_sorted_alphabetically: bool,
+
+    /// Settings sidebar lists only enabled providers (upstream `providersEnabledOnly`).
+    /// Local browsing filter: not part of the portable preferences document.
+    #[serde(default)]
+    pub providers_enabled_only: bool,
 
     /// Show usage bars as "used" (true) or "remaining" (false)
     pub show_as_used: bool,
@@ -157,17 +260,31 @@ pub struct Settings {
     #[serde(default)]
     pub predictive_pace_warning_enabled: bool,
 
+    /// Announce when a session or weekly limit resets (opt-in).
+    #[serde(default)]
+    pub limit_reset_notifications_enabled: bool,
+
+    /// Notify once per failure episode when a provider account needs sign-in again.
+    #[serde(default)]
+    pub credential_expiry_notifications_enabled: bool,
+
+    /// Notify when a 5-hour session quota is depleted and when it becomes
+    /// available again. Legacy files without the key inherit `show_notifications`.
+    #[serde(default = "default_true")]
+    pub session_quota_notifications_enabled: bool,
+
     /// Show pace visualizations and forecast text in provider menu cards.
     #[serde(default = "default_true")]
     pub show_pace: bool,
 
-    /// Tighten menu card padding, spacing and type so the flyout fits more
-    /// on screen. Purely visual density — no rows are hidden.
-    #[serde(default)]
-    pub compact_menu_layout: bool,
-
-    /// Menu bar display mode: "minimal", "compact", or "detailed"
+    /// Retired "Display mode" row ("minimal", "compact", "detailed"). Kept
+    /// readable for one release; "minimal" is folded into
+    /// `menu_bar_shows_highest_usage` once on load (`.display-mode-fold-v1`).
     pub menu_bar_display_mode: String,
+
+    /// Overview card layout: "detailed" or "compact".
+    #[serde(default = "default_overview_layout")]
+    pub overview_layout: String,
 
     /// Show all token accounts in provider menus instead of collapsing behind switchers
     #[serde(default)]
@@ -205,13 +322,29 @@ pub struct Settings {
     #[serde(default = "default_global_shortcut")]
     pub global_shortcut: String,
 
+    /// Provider-switcher shortcut overrides (action -> shortcut, normalized).
+    /// Empty means every action uses its default; see
+    /// [`crate::switcher_shortcuts`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub switcher_shortcuts: BTreeMap<String, String>,
+
     /// Additional Codex home or sessions directories to include in local cost scans.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub codex_custom_sessions_dirs: Vec<String>,
 
+    /// Extra Gemini home directories (each one's `.gemini`) whose Antigravity
+    /// local token history is combined with the primary home. Empty keeps the
+    /// single-home default. Affects local history only, not sign-in or quotas.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub antigravity_additional_profile_homes: Vec<String>,
+
     /// Discover local and configured SSH Codex/Claude sessions.
     #[serde(default)]
     pub agent_sessions_enabled: bool,
+
+    /// Keep the system awake (no idle sleep) while a local agent session is live.
+    #[serde(default)]
+    pub stay_awake_enabled: bool,
 
     /// SSH targets queried for remote agent sessions.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -249,6 +382,13 @@ pub struct Settings {
     #[serde(default)]
     pub ui_language: Language,
 
+    /// Language "System": `ui_language` follows the Windows display
+    /// language (Mac `AppLanguage.system`). True for new installs; false
+    /// for files written before this setting existed, so their chosen
+    /// language stays put.
+    #[serde(default)]
+    pub ui_language_follows_system: bool,
+
     /// UI theme preference (Phase 12). Defaults to Auto (prefers-color-scheme).
     #[serde(default)]
     pub theme: ThemePreference,
@@ -262,6 +402,11 @@ pub struct Settings {
     /// 100 % is normal size; higher values enlarge the flyout content.
     #[serde(default = "default_tray_scale_percent")]
     pub tray_scale_percent: u16,
+
+    /// Keep the tray flyout above other windows after it loses focus.
+    /// Disabled by default so the flyout retains normal z-order behavior.
+    #[serde(default)]
+    pub tray_panel_always_on_top: bool,
 
     /// Enable the local PowerToys Command Palette status pipe.
     #[serde(default)]
@@ -329,7 +474,7 @@ pub struct Settings {
     #[serde(default)]
     pub claude_allow_reading_claude_code_credentials: bool,
 
-    /// Optional work-week length [2,6] for session-equivalent weekly forecast.
+    /// Optional work-week length [2,7] for session-equivalent weekly forecast.
     /// `None` uses wall-clock time until weekly reset.
     #[serde(default)]
     pub weekly_progress_work_days: Option<u8>,
@@ -338,11 +483,11 @@ pub struct Settings {
     #[serde(default = "default_alibaba_token_plan_region")]
     pub alibaba_token_plan_region: String,
 
-    /// Opt-in: allow Codex usage reads from external (non-CLI-owned) OAuth
-    /// credential sources. Default OFF — when disabled, stale external OAuth
-    /// credential files fail closed instead of being used silently (upstream
-    /// 0.50.1 #2944). The CLI-owned `auth.json` is always read read-only; this
-    /// gate only controls whether stale external OAuth tokens are trusted.
+    /// Opt-in: allow read-only Codex usage reads from the CLI-owned OAuth
+    /// credential source. Win-CodexBar never refreshes or writes `auth.json`.
+    /// Default OFF — when disabled, the source must contain refresh
+    /// provenance; JWT expiry is checked when available (upstream 0.50.1
+    /// #2944).
     #[serde(default)]
     pub codex_external_oauth_sources_allowed: bool,
 
@@ -357,6 +502,39 @@ pub struct Settings {
     /// Hide native Codex spend rows when an OpenCodex import is present.
     #[serde(default)]
     pub hide_native_codex_cost_when_open_codex_present: bool,
+
+    /// History window for local cost surfaces: `rolling:N`, `month-to-date`, or
+    /// `all` (upstream 0.67.0). Missing or unreadable values read as `rolling:30`.
+    #[serde(default)]
+    pub cost_reporting_period: CostReportingPeriod,
+
+    /// IANA zone local cost history is bucketed in; empty means the machine
+    /// zone (upstream 0.67.0 `tokenCostUsageBucketTimeZone`).
+    #[serde(default)]
+    pub cost_usage_bucket_time_zone: String,
+
+    /// "Track costs" in Usage & Spend (Mac `costUsageEnabled`). Off stops the
+    /// local cost-log scan, which blanks cost on the dashboard, cards and float
+    /// bar. True for new installs and for files written before the key existed.
+    #[serde(default = "default_true")]
+    pub cost_usage_enabled: bool,
+
+    /// Time range of the Usage & Spend dashboard, kept apart from
+    /// `cost_reporting_period` (menu, float bar, share exports). A file without
+    /// the key copies `cost_reporting_period`.
+    #[serde(default)]
+    pub spend_dashboard_period: CostReportingPeriod,
+
+    /// Usage & Spend sources (provider ids) left out of the stat strip, charts,
+    /// Copy JSON and Export JSON. Sorted and unique.
+    #[serde(default)]
+    pub spend_dashboard_hidden_source_ids: Vec<String>,
+
+    /// Set when the loaded file still carried legacy `provider_usage_thresholds`;
+    /// the desktop shell saves once at startup so only the new key stays on disk.
+    /// Public only so other crates can build `Settings { .., ..Settings::default() }`.
+    #[serde(skip)]
+    pub legacy_usage_thresholds_pending: bool,
 }
 
 fn default_window_scale_percent() -> u16 {
@@ -375,8 +553,13 @@ fn default_tray_scale_percent() -> u16 {
     100
 }
 
+/// Smallest Panel scale; `apps/desktop-tauri/src/lib/trayScale.ts` mirrors it.
+pub const TRAY_SCALE_PERCENT_MIN: u16 = 100;
+/// Largest Panel scale; `apps/desktop-tauri/src/lib/trayScale.ts` mirrors it.
+pub const TRAY_SCALE_PERCENT_MAX: u16 = 200;
+
 pub fn clamp_tray_scale_percent(value: u16) -> u16 {
-    value.clamp(100, 200)
+    value.clamp(TRAY_SCALE_PERCENT_MIN, TRAY_SCALE_PERCENT_MAX)
 }
 
 fn default_float_bar_opacity() -> u8 {
@@ -456,6 +639,33 @@ pub fn normalize_provider_order(requested: &[String]) -> Vec<String> {
     out
 }
 
+/// Replace only the slots held by `visible` inside `full`, so every other
+/// provider (for example a soft-removed one) keeps its position. Returns
+/// `None` unless `full` and `visible` have no repeats and every visible id is
+/// present in `full`.
+pub fn merge_visible_provider_order(full: &[String], visible: &[String]) -> Option<Vec<String>> {
+    let full_set: HashSet<&str> = full.iter().map(String::as_str).collect();
+    let visible_set: HashSet<&str> = visible.iter().map(String::as_str).collect();
+    if full_set.len() != full.len()
+        || visible_set.len() != visible.len()
+        || !visible_set.is_subset(&full_set)
+    {
+        return None;
+    }
+    let mut next = visible.iter();
+    Some(
+        full.iter()
+            .map(|id| {
+                if visible_set.contains(id.as_str()) {
+                    next.next().cloned().unwrap_or_else(|| id.clone())
+                } else {
+                    id.clone()
+                }
+            })
+            .collect(),
+    )
+}
+
 fn default_global_shortcut() -> String {
     "Ctrl+Shift+U".to_string()
 }
@@ -488,6 +698,25 @@ fn default_api_region(id: ProviderId) -> &'static str {
 const DEFAULT_CODEX_OPENAI_WEB_EXTRAS: bool = true;
 const DEFAULT_CODEX_SPARK_USAGE_VISIBLE: bool = true;
 
+fn normalize_hidden_usage_item_ids(ids: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut normalized = ids
+        .into_iter()
+        .map(|id| id.trim().to_string())
+        .filter(|id| {
+            !id.is_empty()
+                && id.len() <= 128
+                && !id.chars().any(char::is_control)
+                && (id.starts_with(USAGE_ITEM_METRIC_PREFIX)
+                    || id.starts_with(USAGE_ITEM_DETAIL_SECTION_PREFIX)
+                    || id.starts_with(USAGE_ITEM_SECTION_PREFIX))
+        })
+        .filter(|id| seen.insert(id.clone()))
+        .collect::<Vec<_>>();
+    normalized.sort_unstable();
+    normalized
+}
+
 impl Default for Settings {
     fn default() -> Self {
         let mut enabled = HashSet::new();
@@ -496,10 +725,14 @@ impl Default for Settings {
         enabled.insert("codex".to_string());
 
         Self {
+            preferred_currency_code: "AUTO".to_string(),
             enabled_providers: enabled,
             refresh_interval_secs: 300, // 5 minutes
-            adaptive_refresh: false,
+            // New installs use adaptive refresh; legacy files without the key
+            // keep the fixed interval through the field default in `RawSettings`.
+            adaptive_refresh: true,
             refresh_all_providers_on_menu_open: false,
+            status_checks_enabled: true,
             low_power_mode_preference: LowPowerModePreference::Off,
             start_minimized: false,
             start_at_login: false,
@@ -509,20 +742,34 @@ impl Default for Settings {
             notification_sound_theme: NotificationSoundTheme::default(),
             high_usage_threshold: 70.0,
             critical_usage_threshold: 90.0,
-            provider_usage_thresholds: HashMap::new(),
             merge_tray_icons: false, // Show single provider by default
             tray_icon_mode: TrayIconMode::default(), // Single icon by default
+            stacked_tray_top_provider: None,
+            stacked_tray_bottom_provider: None,
             switcher_shows_icons: true,
             menu_bar_shows_highest_usage: false,
             menu_bar_shows_percent: false,
-            show_as_used: true,        // Show as "used" by default
+            menu_bar_icon_style: MenuBarIconStyle::Bars,
+            merged_overview_selected_providers: Vec::new(),
+            quota_warning_markers_visible: true,
+            highlight_menu_cards_on_hover: true,
+            workday_tick_style: WorkdayTickStyle::Subtle,
+            menu_bar_color_pace: false,
+            menu_bar_color_by_provider: false,
+            menu_bar_pace_reserve_positive: false,
+            providers_sorted_alphabetically: false,
+            providers_enabled_only: false,
+            show_as_used: false,
             enable_animations: true,   // Animations enabled by default
             reset_time_relative: true, // Show relative times by default
             show_reset_when_exhausted: false,
             predictive_pace_warning_enabled: false,
+            limit_reset_notifications_enabled: false,
+            credential_expiry_notifications_enabled: false,
+            session_quota_notifications_enabled: true,
             show_pace: true,
-            compact_menu_layout: false,
             menu_bar_display_mode: "detailed".to_string(), // Detailed mode by default
+            overview_layout: default_overview_layout(),
             show_all_token_accounts_in_menu: false,
             provider_configs: HashMap::new(),
             disable_keychain_access: false,
@@ -531,8 +778,11 @@ impl Default for Settings {
             provider_metrics: HashMap::new(), // Empty = use Automatic for all
             provider_order: Vec::new(), // Empty = canonical ProviderId::all() order
             global_shortcut: default_global_shortcut(), // Ctrl+Shift+U by default
+            switcher_shortcuts: BTreeMap::new(),
             codex_custom_sessions_dirs: Vec::new(),
+            antigravity_additional_profile_homes: Vec::new(),
             agent_sessions_enabled: false,
+            stay_awake_enabled: false,
             agent_session_ssh_hosts: Vec::new(),
             hooks_enabled: false,
             http_proxy_enabled: false,
@@ -541,10 +791,12 @@ impl Default for Settings {
             http_proxy_password: String::new(),
             auto_download_updates: false, // Require explicit opt-in for background downloads
             install_updates_on_quit: false, // Don't auto-install on quit by default
-            ui_language: Language::default(), // English by default
+            ui_language: Language::default(), // English until the system language resolves
+            ui_language_follows_system: true,
             theme: ThemePreference::default(), // Auto (follows prefers-color-scheme)
             window_scale_percent: default_window_scale_percent(),
             tray_scale_percent: default_tray_scale_percent(),
+            tray_panel_always_on_top: false,
             powertoys_status_pipe_enabled: false,
             float_bar_enabled: false,
             float_bar_opacity: default_float_bar_opacity(),
@@ -562,43 +814,105 @@ impl Default for Settings {
             weekly_progress_work_days: None,
             alibaba_token_plan_region: default_alibaba_token_plan_region(),
             codex_external_oauth_sources_allowed: false,
+            legacy_usage_thresholds_pending: false,
             cost_summary_display_style: CostSummaryDisplayStyle::default(),
             open_codex_usage_logs_enabled: false,
             hide_native_codex_cost_when_open_codex_present: false,
+            cost_reporting_period: CostReportingPeriod::default(),
+            cost_usage_bucket_time_zone: String::new(),
+            cost_usage_enabled: true,
+            spend_dashboard_period: CostReportingPeriod::default(),
+            spend_dashboard_hidden_source_ids: Vec::new(),
         }
     }
 }
 
+fn default_preferred_currency_code() -> String {
+    "AUTO".to_string()
+}
+
+fn default_overview_layout() -> String {
+    "detailed".to_string()
+}
+
+pub fn normalize_overview_layout(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "compact" => "compact".to_string(),
+        "detailed" => "detailed".to_string(),
+        _ => default_overview_layout(),
+    }
+}
+
 impl Settings {
-    /// Get the settings file path
+    /// Get the settings file path (`CODEXBAR_CONFIG` when the CLI applied it).
     pub fn settings_path() -> Option<PathBuf> {
-        crate::logging::config_root().map(|p| p.join("settings.json"))
+        config_path::settings_file_for(settings_file_override(), crate::logging::config_root())
     }
 
     /// Load settings from disk
     pub fn load() -> Self {
+        let path = Self::settings_path();
         #[allow(
             unused_mut,
             reason = "mutability is needed for conditional initialization paths that the compiler cannot prove"
         )]
-        let mut settings = match Self::settings_path() {
-            Some(path) if path.exists() => match crate::secure_file::read_string(&path) {
+        let mut settings = Self::load_from_path(path.as_deref());
+
+        // Sync autostart toggle with actual registry state and repair stale commands from older builds.
+        // A CLI run on a `CODEXBAR_CONFIG` file skips these desktop integrations, so it touches
+        // neither the Run key nor the default config root.
+        #[cfg(target_os = "windows")]
+        if settings_file_override().is_none() {
+            settings.start_at_login = Self::sync_start_at_login_registry();
+            settings.apply_promote_tray_default_migration();
+        }
+
+        // One-shot migration: materialize the persisted hidden usage-item list
+        // from the pre-0.62 per-provider visibility flags. After this the list
+        // is the sole source of truth and the flags stay untouched.
+        settings.migrate_legacy_usage_item_flags();
+
+        settings.resolve_system_language();
+
+        settings
+    }
+
+    fn load_from_path(path: Option<&Path>) -> Self {
+        match path {
+            Some(path) if path.exists() => match crate::secure_file::read_string(path) {
                 Ok(content) => {
                     serde_json::from_str(content.trim_start_matches('\u{feff}')).unwrap_or_default()
                 }
                 Err(_) => Self::default(),
             },
             _ => Self::default(),
-        };
-
-        // Sync autostart toggle with actual registry state and repair stale commands from older builds.
-        #[cfg(target_os = "windows")]
-        {
-            settings.start_at_login = Self::sync_start_at_login_registry();
-            settings.apply_promote_tray_default_migration();
         }
+    }
 
-        settings
+    /// Materialize `hidden_usage_item_ids` from the pre-0.62 per-provider
+    /// visibility flags where the list was never persisted. Idempotent: a
+    /// provider with an explicit list is left alone.
+    fn migrate_legacy_usage_item_flags(&mut self) {
+        if self
+            .provider_config(ProviderId::Codex)
+            .and_then(|config| config.hidden_usage_item_ids.as_ref())
+            .is_none()
+            && !self.spark_usage_visible(ProviderId::Codex)
+        {
+            self.toggle_hidden_items(ProviderId::Codex, &CODEX_SPARK_USAGE_ITEM_IDS, false);
+        }
+        if self
+            .provider_config(ProviderId::Claude)
+            .and_then(|config| config.hidden_usage_item_ids.as_ref())
+            .is_none()
+            && !self.claude_daily_routines_usage_visible
+        {
+            self.toggle_hidden_items(
+                ProviderId::Claude,
+                &[CLAUDE_DAILY_ROUTINES_USAGE_ITEM_ID],
+                false,
+            );
+        }
     }
 
     /// Marker written after the one-shot "pin tray by default" migration (issue #237).
@@ -636,18 +950,109 @@ impl Settings {
         }
     }
 
+    /// Marker written after the one-shot Display mode "minimal" fold (Mac parity PR 3).
+    fn display_mode_fold_marker_path() -> Option<PathBuf> {
+        crate::logging::config_root().map(|p| p.join(".display-mode-fold-v1"))
+    }
+
+    /// The Display mode row is gone. "Minimal" used to force the most-used
+    /// provider into the tray, so carry that into `menu_bar_shows_highest_usage`
+    /// once. Returns true when the settings changed. Later opt-outs stick
+    /// because the marker remains.
+    fn fold_minimal_display_mode(&mut self, already_migrated: bool) -> bool {
+        if already_migrated
+            || self.menu_bar_shows_highest_usage
+            || !self
+                .menu_bar_display_mode
+                .trim()
+                .eq_ignore_ascii_case("minimal")
+        {
+            return false;
+        }
+        self.menu_bar_shows_highest_usage = true;
+        true
+    }
+
+    /// Run the one-shot Display mode fold against the default config root.
+    /// The desktop shell calls this once at startup rather than from
+    /// [`Settings::load`], so unit tests and helpers that load settings never
+    /// write the marker into the real config dir. A `CODEXBAR_CONFIG` run skips it.
+    pub fn apply_display_mode_fold_migration(&mut self) {
+        if settings_file_override().is_some() {
+            return;
+        }
+        let Some(marker) = Self::display_mode_fold_marker_path() else {
+            return;
+        };
+        self.apply_display_mode_fold_with_marker(&marker, Self::save);
+    }
+
+    fn apply_display_mode_fold_with_marker(
+        &mut self,
+        marker: &Path,
+        persist: impl FnOnce(&Self) -> anyhow::Result<()>,
+    ) {
+        let already_migrated = marker.exists();
+        if self.fold_minimal_display_mode(already_migrated)
+            && let Err(error) = persist(self)
+        {
+            // No marker: the fold retries on the next launch instead of being lost.
+            tracing::warn!("Failed to persist display mode fold migration: {error}");
+            return;
+        }
+        if !already_migrated && let Some(parent) = marker.parent() {
+            // Best-effort marker dir creation; the write below reports failure.
+            let _created_dir = std::fs::create_dir_all(parent);
+            if let Err(error) = std::fs::write(marker, b"1") {
+                tracing::warn!("Failed to write display mode fold marker: {error}");
+            }
+        }
+    }
+
+    /// Migration #5 write-back: when the loaded file still had legacy
+    /// `provider_usage_thresholds` (already folded into `quota_warnings` on
+    /// read), save once so the file holds only the new key. The desktop shell
+    /// calls this at startup; tests and helpers that only load never write.
+    pub fn apply_quota_warning_migration(&mut self) {
+        self.apply_quota_warning_migration_with(Self::save);
+    }
+
+    fn apply_quota_warning_migration_with(
+        &mut self,
+        persist: impl FnOnce(&Self) -> anyhow::Result<()>,
+    ) {
+        if !self.legacy_usage_thresholds_pending {
+            return;
+        }
+        match persist(self) {
+            Ok(()) => self.legacy_usage_thresholds_pending = false,
+            // The legacy key stays readable, so the write retries next launch.
+            Err(error) => tracing::warn!("Failed to persist quota warning migration: {error}"),
+        }
+    }
+
+    /// Store the merged Overview selection: canonical ids, deduplicated,
+    /// at most [`MERGED_OVERVIEW_PROVIDER_LIMIT`].
+    pub fn set_merged_overview_selected_providers(&mut self, ids: Vec<String>) {
+        self.merged_overview_selected_providers = raw::normalize_merged_overview_selection(ids);
+    }
+
     /// Save settings to disk
     pub fn save(&self) -> anyhow::Result<()> {
         let path = Self::settings_path()
             .ok_or_else(|| anyhow::anyhow!("Could not determine settings path"))?;
 
+        self.save_to_path(&path)
+    }
+
+    fn save_to_path(&self, path: &Path) -> anyhow::Result<()> {
         // Ensure parent directory exists
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
         let json = serde_json::to_string_pretty(self)?;
-        crate::secure_file::write_string(&path, &json)?;
+        crate::secure_file::write_string(path, &json)?;
 
         Ok(())
     }
@@ -771,6 +1176,12 @@ impl Settings {
         self.enabled_providers.contains(id.cli_name())
     }
 
+    /// Whether a provider belongs in user-facing listings: retired
+    /// (deprecated) providers are shown only while enabled.
+    pub fn is_provider_listed(&self, id: ProviderId) -> bool {
+        !id.is_deprecated() || self.is_provider_enabled(id)
+    }
+
     /// Enable a provider
     pub fn enable_provider(&mut self, id: ProviderId) {
         self.enabled_providers.insert(id.cli_name().to_string());
@@ -860,12 +1271,26 @@ impl Settings {
         self.provider_configs.entry(id).or_default()
     }
 
-    /// Cookie source for `id`, or the default `"manual"` if unset.
+    /// Cookie source for `id`. Kimi, Charm Hyper and Groq follow upstream's
+    /// automatic default; providers with no specific default retain the
+    /// legacy manual default.
     pub fn cookie_source(&self, id: ProviderId) -> &str {
         self.provider_configs
             .get(&id)
             .and_then(|c| c.cookie_source.as_deref())
-            .unwrap_or(DEFAULT_COOKIE_SOURCE)
+            .unwrap_or(match id {
+                ProviderId::Kimi
+                | ProviderId::Hyper
+                | ProviderId::Groq
+                | ProviderId::Langdock
+                | ProviderId::LithosAI
+                | ProviderId::MuseAI
+                | ProviderId::WorkBuddy
+                | ProviderId::TinyApi
+                | ProviderId::Xapi
+                | ProviderId::Parallel => "auto",
+                _ => DEFAULT_COOKIE_SOURCE,
+            })
     }
 
     pub fn set_cookie_source(&mut self, id: ProviderId, source: impl Into<String>) {
@@ -954,6 +1379,39 @@ impl Settings {
         self.provider_config_mut(id).workspace_id = Some(value.into());
     }
 
+    /// Optional user-entered allowance for Copilot seat AI credits.
+    ///
+    /// GitHub reports the absolute `credits_used` counter but does not expose
+    /// a documented included-credit ceiling, so callers must keep an absent
+    /// or non-positive value as unknown rather than inventing a denominator.
+    ///
+    /// This setter is the single owner of the positive-finite invariant:
+    /// invalid values are rejected instead of silently dropped, while the
+    /// getter keeps defensively filtering values persisted by older builds.
+    pub fn seat_credit_entitlement(&self, id: ProviderId) -> Option<f64> {
+        self.provider_configs
+            .get(&id)
+            .and_then(|config| config.seat_credit_entitlement)
+            .filter(|value| value.is_finite() && *value > 0.0)
+    }
+
+    pub fn set_seat_credit_entitlement(
+        &mut self,
+        id: ProviderId,
+        value: Option<f64>,
+    ) -> Result<(), String> {
+        if let Some(value) = value
+            && (!value.is_finite() || value <= 0.0)
+        {
+            return Err(
+                "Copilot seat AI-credit allowance must be a finite number greater than zero"
+                    .to_string(),
+            );
+        }
+        self.provider_config_mut(id).seat_credit_entitlement = value;
+        Ok(())
+    }
+
     /// Wayfinder gateway URL, defaulting to the local loopback gateway.
     pub fn gateway_url(&self, id: ProviderId) -> &str {
         self.provider_configs
@@ -1008,6 +1466,42 @@ impl Settings {
         self.provider_config_mut(id).spark_usage_visible = Some(value);
     }
 
+    /// Return the persisted hidden usage-item IDs for `id`.
+    pub fn hidden_usage_item_ids(&self, id: ProviderId) -> Vec<String> {
+        self.provider_configs
+            .get(&id)
+            .and_then(|config| config.hidden_usage_item_ids.as_ref())
+            .map_or_else(Vec::new, |ids| normalize_hidden_usage_item_ids(ids.clone()))
+    }
+
+    /// Persist an explicit presentation-only usage-item visibility list.
+    pub fn set_hidden_usage_item_ids(&mut self, id: ProviderId, ids: Vec<String>) {
+        let hidden = normalize_hidden_usage_item_ids(ids);
+        self.provider_config_mut(id).hidden_usage_item_ids = Some(hidden);
+    }
+
+    /// Add or remove `items` from the provider's hidden usage-item list.
+    ///
+    /// `visible = false` hides the items; `visible = true` un-hides them. This
+    /// is the single write path for usage-item visibility; it only touches the
+    /// presentation list and never the legacy per-provider boolean flags.
+    pub fn toggle_hidden_items(&mut self, id: ProviderId, items: &[&str], visible: bool) {
+        let mut hidden = self.hidden_usage_item_ids(id);
+        if visible {
+            hidden.retain(|item| !items.contains(&item.as_str()));
+        } else {
+            hidden.extend(items.iter().map(|item| (*item).to_string()));
+        }
+        self.set_hidden_usage_item_ids(id, hidden);
+    }
+
+    /// Update the old Claude Daily Routines flag without touching the
+    /// usage-item list; the flag is presentation-only and kept for callers
+    /// that still read the boolean directly.
+    pub fn set_claude_daily_routines_usage_visible(&mut self, value: bool) {
+        self.claude_daily_routines_usage_visible = value;
+    }
+
     /// Per-provider historical-tracking toggle (currently codex-only).
     pub fn historical_tracking(&self, id: ProviderId) -> bool {
         self.provider_configs
@@ -1020,6 +1514,30 @@ impl Settings {
         self.provider_config_mut(id).historical_tracking = value;
     }
 
+    /// Codex "Local session cost estimates" option (persisted only).
+    pub fn local_session_cost_ledger_enabled(&self, id: ProviderId) -> bool {
+        self.provider_configs
+            .get(&id)
+            .is_some_and(|c| c.local_session_cost_ledger_enabled)
+    }
+
+    pub fn set_local_session_cost_ledger_enabled(&mut self, id: ProviderId, value: bool) {
+        self.provider_config_mut(id)
+            .local_session_cost_ledger_enabled = value;
+    }
+
+    /// Codex OpenAI web battery saver option (persisted only).
+    pub fn openai_web_battery_saver_enabled(&self, id: ProviderId) -> bool {
+        self.provider_configs
+            .get(&id)
+            .is_some_and(|c| c.openai_web_battery_saver_enabled)
+    }
+
+    pub fn set_openai_web_battery_saver_enabled(&mut self, id: ProviderId, value: bool) {
+        self.provider_config_mut(id)
+            .openai_web_battery_saver_enabled = value;
+    }
+
     /// Per-provider "avoid keychain prompts" toggle (currently claude-only).
     pub fn avoid_keychain_prompts(&self, id: ProviderId) -> bool {
         self.provider_configs
@@ -1030,6 +1548,19 @@ impl Settings {
 
     pub fn set_avoid_keychain_prompts(&mut self, id: ProviderId, value: bool) {
         self.provider_config_mut(id).avoid_keychain_prompts = value;
+    }
+
+    /// Whether the desktop shell may reopen a captured CLI session after its
+    /// provider quota becomes available again. This is intentionally opt-in.
+    pub fn auto_resume_after_quota_reset(&self, id: ProviderId) -> bool {
+        self.provider_configs
+            .get(&id)
+            .map(|config| config.auto_resume_after_quota_reset)
+            .unwrap_or(false)
+    }
+
+    pub fn set_auto_resume_after_quota_reset(&mut self, id: ProviderId, value: bool) {
+        self.provider_config_mut(id).auto_resume_after_quota_reset = value;
     }
 
     // ── Legacy field-name aliases ────────────────────────────────────

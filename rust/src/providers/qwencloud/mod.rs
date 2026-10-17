@@ -1,8 +1,15 @@
-//! Qwen Cloud personal token-plan provider (upstream 0.46.0).
+//! Qwen Cloud personal and team token-plan provider (upstream 0.46.0; team 0.74.0+).
 //!
 //! Cookie-authenticated OneConsole gateway:
 //! `POST https://cs-data.qwencloud.com/data/api.json?...`
-//! with `IntlBroadScopeAspnGateway` / `sfm_bailian`.
+//! with `IntlBroadScopeAspnGateway` / `sfm_bailian` for individual.
+//! Team (see [`team`]) runs first and falls back to Individual.
+
+#[cfg(test)]
+mod monthly_tests;
+mod team;
+#[cfg(test)]
+mod team_tests;
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
@@ -47,6 +54,7 @@ const COOKIE_DOMAINS: &[&str] = &[
 const FIVE_HOUR_MINUTES: u32 = 5 * 60;
 const WEEKLY_MINUTES: u32 = 7 * 24 * 60;
 const LEGACY_MINUTES: u32 = 30 * 24 * 60;
+const MONTHLY_MINUTES: u32 = 30 * 24 * 60;
 
 pub struct QwenCloudProvider {
     metadata: ProviderMetadata,
@@ -65,7 +73,25 @@ struct QwenCloudSnapshot {
     weekly_used_percent: Option<f64>,
     weekly_total_quota: Option<f64>,
     weekly_resets_at: Option<DateTime<Utc>>,
+    monthly_used_percent: Option<f64>,
+    monthly_total_quota: Option<f64>,
+    monthly_resets_at: Option<DateTime<Utc>>,
 }
+
+/// Per-window credit totals from the quota-config payload.
+#[derive(Clone, Copy)]
+struct QuotaTotals {
+    five_hour: Option<f64>,
+    weekly: Option<f64>,
+    monthly: Option<f64>,
+}
+
+/// Usage-object keys that mark a payload as carrying token-plan window data.
+const USAGE_WINDOW_KEYS: &[&str] = &[
+    "per5HourPercentage",
+    "per1WeekPercentage",
+    "per1MonthPercentage",
+];
 
 impl QwenCloudProvider {
     pub fn new() -> Self {
@@ -81,11 +107,15 @@ impl QwenCloudProvider {
                 is_primary: false,
                 dashboard_url: Some(DASHBOARD_URL),
                 status_page_url: Some(STATUS_PAGE_URL),
+                tertiary_label_key: None,
             },
         }
     }
 
-    async fn fetch_via_web(&self, ctx: &FetchContext) -> Result<UsageSnapshot, ProviderError> {
+    async fn fetch_via_web(
+        &self,
+        ctx: &FetchContext,
+    ) -> Result<ProviderFetchResult, ProviderError> {
         let cookie_header = Self::resolve_cookie_header(ctx)?;
         let client = crate::core::credentialed_http_client_builder()
             .timeout(std::time::Duration::from_secs(ctx.web_timeout.max(1)))
@@ -93,22 +123,51 @@ impl QwenCloudProvider {
             .build()
             .map_err(|e| ProviderError::Other(e.to_string()))?;
 
-        let sec_token = Self::resolve_sec_token(&client, &cookie_header, ctx)
+        let team_timeout =
+            team::REQUEST_TIMEOUT.min(std::time::Duration::from_secs(ctx.web_timeout.max(1)));
+        let team_error = match team::fetch(
+            &client,
+            team::BASE_URL,
+            &cookie_header,
+            team_timeout,
+            Utc::now().timestamp_millis(),
+        )
+        .await
+        {
+            Ok(Some(team)) => return Ok(team::to_result(&team)),
+            Ok(None) => None,
+            Err(error) => Some(error),
+        };
+
+        let individual = self
+            .fetch_individual(&client, &cookie_header, ctx)
+            .await
+            .map(|usage| ProviderFetchResult::new(usage, "web"));
+        team::choose_result(team_error, individual)
+    }
+
+    async fn fetch_individual(
+        &self,
+        client: &reqwest::Client,
+        cookie_header: &str,
+        ctx: &FetchContext,
+    ) -> Result<UsageSnapshot, ProviderError> {
+        let sec_token = Self::resolve_sec_token(client, cookie_header, ctx)
             .await
             .ok_or(ProviderError::AuthRequired)?;
 
         let usage_body = Self::post_api(
-            &client,
+            client,
             USAGE_API,
             Map::new(),
             &sec_token,
-            &cookie_header,
+            cookie_header,
             ctx,
         )
         .await?;
 
         let subscription_body = Self::post_api_optional(
-            &client,
+            client,
             SUBSCRIPTION_API,
             {
                 let mut data = Map::new();
@@ -119,17 +178,17 @@ impl QwenCloudProvider {
                 data
             },
             &sec_token,
-            &cookie_header,
+            cookie_header,
             ctx,
         )
         .await;
 
         let quota_config_body = Self::post_api_optional(
-            &client,
+            client,
             QUOTA_CONFIG_API,
             Map::new(),
             &sec_token,
-            &cookie_header,
+            cookie_header,
             ctx,
         )
         .await;
@@ -139,7 +198,7 @@ impl QwenCloudProvider {
             subscription_body.as_deref(),
             quota_config_body.as_deref(),
         )?;
-        Self::snapshot_to_usage(snapshot)
+        self.snapshot_to_usage(snapshot)
     }
 
     fn resolve_cookie_header(ctx: &FetchContext) -> Result<String, ProviderError> {
@@ -317,7 +376,10 @@ impl QwenCloudProvider {
         parse_legacy_token_plan(&expanded)
     }
 
-    fn snapshot_to_usage(snapshot: QwenCloudSnapshot) -> Result<UsageSnapshot, ProviderError> {
+    fn snapshot_to_usage(
+        &self,
+        snapshot: QwenCloudSnapshot,
+    ) -> Result<UsageSnapshot, ProviderError> {
         let five_hour = snapshot.five_hour_used_percent.map(|percent| {
             RateWindow::with_details(
                 percent,
@@ -352,19 +414,43 @@ impl QwenCloudProvider {
             )
         });
 
+        let monthly = snapshot.monthly_used_percent.map(|percent| {
+            RateWindow::with_details(
+                percent,
+                Some(MONTHLY_MINUTES),
+                snapshot.monthly_resets_at,
+                quota_detail_percent(percent, snapshot.monthly_total_quota),
+            )
+        });
+
         // Prefer the 5-hour window, then the legacy 30-day envelope. Individual
         // Qwen Cloud plans expose only the weekly window (`per1WeekPercentage`);
         // promote it to primary in that case instead of failing the whole fetch.
-        let (primary, secondary) = match (five_hour.or(legacy), weekly) {
-            (Some(primary), secondary) => (primary, secondary),
-            (None, Some(weekly)) => (weekly, None),
-            (None, None) => {
-                return Err(ProviderError::Parse(
-                    "Qwen Cloud usage windows missing".into(),
-                ));
-            }
-        };
+        // A monthly window takes the primary bar only when no other window exists;
+        // otherwise it is an extra "Monthly" row.
+        let (primary, secondary, mut primary_label, monthly_extra) =
+            match (five_hour.or(legacy), weekly) {
+                (Some(primary), secondary) => (primary, secondary, None, monthly),
+                (None, Some(weekly)) => (weekly, None, Some(self.metadata.weekly_label), monthly),
+                (None, None) => match monthly {
+                    Some(monthly) => (monthly, None, None, None),
+                    None => {
+                        return Err(ProviderError::Parse(
+                            "Qwen Cloud usage windows missing".into(),
+                        ));
+                    }
+                },
+            };
+        if primary.window_minutes == Some(MONTHLY_MINUTES) {
+            primary_label = Some("Monthly");
+        }
         let mut usage = UsageSnapshot::new(primary);
+        if let Some(label) = primary_label {
+            usage = usage.with_primary_label(label);
+        }
+        if let Some(monthly) = monthly_extra {
+            usage = usage.with_extra_rate_window("monthly", "Monthly", monthly);
+        }
         if let Some(secondary) = secondary {
             usage = usage.with_secondary(secondary);
         }
@@ -394,10 +480,7 @@ impl Provider for QwenCloudProvider {
 
     async fn fetch_usage(&self, ctx: &FetchContext) -> Result<ProviderFetchResult, ProviderError> {
         match ctx.source_mode {
-            SourceMode::Auto | SourceMode::Web => {
-                let usage = self.fetch_via_web(ctx).await?;
-                Ok(ProviderFetchResult::new(usage, "web"))
-            }
+            SourceMode::Auto | SourceMode::Web => self.fetch_via_web(ctx).await,
             SourceMode::Cli | SourceMode::OAuth => {
                 Err(ProviderError::UnsupportedSource(ctx.source_mode))
             }
@@ -410,6 +493,14 @@ impl Provider for QwenCloudProvider {
 
     fn supports_web(&self) -> bool {
         true
+    }
+
+    fn error_state_kind(&self, error: &ProviderError) -> crate::core::ProviderStateKind {
+        if team::is_auth_expired(error) {
+            crate::core::ProviderStateKind::ExpiredSession
+        } else {
+            error.state_kind()
+        }
     }
 }
 
@@ -457,11 +548,11 @@ fn parse_current_token_plan(
     subscription_data: Option<&[u8]>,
     quota_config_data: Option<&[u8]>,
 ) -> Option<QwenCloudSnapshot> {
-    let usage =
-        find_object_containing_any_of(expanded, &["per5HourPercentage", "per1WeekPercentage"])?;
+    let usage = find_object_containing_any_of(expanded, USAGE_WINDOW_KEYS)?;
     let five_hour = percentage_points(number_field(&usage, "per5HourPercentage"));
     let weekly = percentage_points(number_field(&usage, "per1WeekPercentage"));
-    if five_hour.is_none() && weekly.is_none() {
+    let monthly = percentage_points(number_field(&usage, "per1MonthPercentage"));
+    if five_hour.is_none() && weekly.is_none() && monthly.is_none() {
         return None;
     }
 
@@ -478,11 +569,14 @@ fn parse_current_token_plan(
         remaining_quota: None,
         resets_at: None,
         five_hour_used_percent: five_hour,
-        five_hour_total_quota: quota.map(|q| q.0).unwrap_or(None),
+        five_hour_total_quota: quota.and_then(|q| q.five_hour),
         five_hour_resets_at: date_field(&usage, "per5HourResetTime"),
         weekly_used_percent: weekly,
-        weekly_total_quota: quota.map(|q| q.1).unwrap_or(None),
+        weekly_total_quota: quota.and_then(|q| q.weekly),
         weekly_resets_at: date_field(&usage, "per1WeekResetTime"),
+        monthly_used_percent: monthly,
+        monthly_total_quota: quota.and_then(|q| q.monthly),
+        monthly_resets_at: date_field(&usage, "per1MonthResetTime"),
     })
 }
 
@@ -531,6 +625,9 @@ fn parse_legacy_token_plan(expanded: &Value) -> Result<QwenCloudSnapshot, Provid
         weekly_used_percent: None,
         weekly_total_quota: None,
         weekly_resets_at: None,
+        monthly_used_percent: None,
+        monthly_total_quota: None,
+        monthly_resets_at: None,
     })
 }
 
@@ -562,19 +659,20 @@ fn display_plan_name(plan_code: &str) -> String {
     }
 }
 
-fn quota_totals_from_bytes(data: &[u8], plan_code: &str) -> Option<(Option<f64>, Option<f64>)> {
+fn quota_totals_from_bytes(data: &[u8], plan_code: &str) -> Option<QuotaTotals> {
     let value: Value = serde_json::from_slice(data).ok()?;
     let expanded = expand_json_strings(value);
-    let quota = find_first_value_for_key(&expanded, plan_code)?
-        .as_object()?
-        .clone();
-    let five_hour = number_field(&Value::Object(quota.clone()), "five_hour")
-        .or_else(|| number_field(&Value::Object(quota.clone()), "fiveHour"));
-    let weekly = number_field(&Value::Object(quota), "weekly");
-    if five_hour.is_none() && weekly.is_none() {
+    let quota = find_first_value_for_key(&expanded, plan_code)?;
+    if !quota.is_object() {
         return None;
     }
-    Some((five_hour, weekly))
+    let totals = QuotaTotals {
+        five_hour: number_field(&quota, "five_hour").or_else(|| number_field(&quota, "fiveHour")),
+        weekly: number_field(&quota, "weekly"),
+        monthly: number_field(&quota, "monthly"),
+    };
+    (totals.five_hour.is_some() || totals.weekly.is_some() || totals.monthly.is_some())
+        .then_some(totals)
 }
 
 fn throw_if_error_payload(value: &Value) -> Result<(), ProviderError> {
@@ -1256,9 +1354,12 @@ mod tests {
             Some(Utc.timestamp_opt(1_700_086_400, 0).single().unwrap())
         );
 
-        let usage = QwenCloudProvider::snapshot_to_usage(snapshot).unwrap();
+        let usage = QwenCloudProvider::new()
+            .snapshot_to_usage(snapshot)
+            .unwrap();
         assert_eq!(usage.primary.used_percent, 3.0);
         assert_eq!(usage.primary.window_minutes, Some(FIVE_HOUR_MINUTES));
+        assert_eq!(usage.primary_label, None);
         assert_eq!(usage.secondary.as_ref().map(|w| w.used_percent), Some(1.0));
         assert_eq!(
             usage.secondary.as_ref().and_then(|w| w.window_minutes),
@@ -1287,10 +1388,11 @@ mod tests {
             },
             "successResponse": true
         });
-        let usage = QwenCloudProvider::snapshot_to_usage(
-            QwenCloudProvider::parse(payload.to_string().as_bytes(), None, None).unwrap(),
-        )
-        .unwrap();
+        let usage = QwenCloudProvider::new()
+            .snapshot_to_usage(
+                QwenCloudProvider::parse(payload.to_string().as_bytes(), None, None).unwrap(),
+            )
+            .unwrap();
         assert!((usage.primary.used_percent - 0.09973083333333333).abs() < 1e-9);
         assert_eq!(usage.primary.window_minutes, Some(300));
         assert!(usage.secondary.is_some());
@@ -1327,7 +1429,9 @@ mod tests {
             QwenCloudProvider::parse(payload.to_string().as_bytes(), None, None).unwrap();
         assert_eq!(snapshot.total_quota, Some(1000.0));
         assert_eq!(snapshot.remaining_quota, Some(875.0));
-        let usage = QwenCloudProvider::snapshot_to_usage(snapshot).unwrap();
+        let usage = QwenCloudProvider::new()
+            .snapshot_to_usage(snapshot)
+            .unwrap();
         assert_eq!(usage.primary.used_percent, 12.5);
         assert_eq!(usage.primary.window_minutes, Some(LEGACY_MINUTES));
     }
@@ -1387,7 +1491,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(snapshot.plan_name.as_deref(), Some("Pro"));
-        let usage = QwenCloudProvider::snapshot_to_usage(snapshot).unwrap();
+        let usage = QwenCloudProvider::new()
+            .snapshot_to_usage(snapshot)
+            .unwrap();
         assert_eq!(usage.login_method.as_deref(), Some("Pro"));
     }
 
@@ -1435,12 +1541,14 @@ mod tests {
             },
             "successResponse": true
         });
-        let usage = QwenCloudProvider::snapshot_to_usage(
-            QwenCloudProvider::parse(payload.to_string().as_bytes(), None, None).unwrap(),
-        )
-        .unwrap();
+        let usage = QwenCloudProvider::new()
+            .snapshot_to_usage(
+                QwenCloudProvider::parse(payload.to_string().as_bytes(), None, None).unwrap(),
+            )
+            .unwrap();
         assert!((usage.primary.used_percent - 84.39116574634).abs() < 1e-9);
         assert_eq!(usage.primary.window_minutes, Some(WEEKLY_MINUTES));
+        assert_eq!(usage.primary_label.as_deref(), Some("Weekly"));
         assert!(usage.secondary.is_none());
     }
 }

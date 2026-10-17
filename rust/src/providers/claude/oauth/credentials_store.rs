@@ -14,16 +14,12 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use super::ClaudeOAuthCredentials;
+use crate::atomic_file;
 use crate::core::ProviderError;
 
 const KEYRING_SERVICE: &str = "Claude Code-credentials";
 const ENV_TOKEN_KEY: &str = "CODEXBAR_CLAUDE_OAUTH_TOKEN";
 const ENV_SCOPES_KEY: &str = "CODEXBAR_CLAUDE_OAUTH_SCOPES";
-
-/// Monotonic counter to make the persist temp-file name unique per write, so
-/// concurrent refreshes (multiple instances / overlapping polls) never share a
-/// temp path.
-static PERSIST_TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Identifies where a set of OAuth credentials was loaded from, so the
 /// refreshed-credentials cache never mixes tokens across sources.
@@ -32,6 +28,20 @@ pub(super) enum CredentialSource {
     Environment,
     File(PathBuf),
     Keyring(String), // the account string that matched
+    SavedAccount(PathBuf, String, String),
+}
+
+impl CredentialSource {
+    pub(super) fn saved_account(path: PathBuf, id: &str, oauth: &str) -> Self {
+        // A later sign-in must supersede a pending rotation even when the new
+        // token has a shorter lifetime. Unchanged disk credentials still find
+        // their in-memory replacement after a failed persistence attempt.
+        Self::SavedAccount(
+            path,
+            id.to_owned(),
+            crate::core::sha256_hex(oauth.as_bytes()),
+        )
+    }
 }
 
 /// In-memory cache of the most recently refreshed credentials, keyed by
@@ -281,7 +291,9 @@ fn load_from_macos_security_cli()
     Ok(None)
 }
 
-fn parse_credentials_json(content: &str) -> Result<ClaudeOAuthCredentials, ProviderError> {
+pub(super) fn parse_credentials_json(
+    content: &str,
+) -> Result<ClaudeOAuthCredentials, ProviderError> {
     if let Ok(file) = serde_json::from_str::<CredentialsFile>(content)
         && let Some(oauth) = file.claude_ai_oauth
     {
@@ -371,7 +383,8 @@ fn credentials_path() -> Result<PathBuf, ProviderError> {
 
 /// Persist refreshed tokens back to `~/.claude/.credentials.json`, updating
 /// only the `claudeAiOauth` token fields and leaving everything else (e.g.
-/// `mcpOAuth`) untouched. Written atomically via a temp file + rename.
+/// `mcpOAuth`) untouched. Written atomically through the shared staged-file
+/// replacement helper.
 pub(super) fn persist_refreshed_credentials(
     credentials: &ClaudeOAuthCredentials,
 ) -> Result<(), ProviderError> {
@@ -397,19 +410,8 @@ pub(super) fn persist_refreshed_credentials(
     let serialized = serde_json::to_string_pretty(&root)
         .map_err(|e| ProviderError::OAuth(format!("Failed to serialize credentials: {e}")))?;
 
-    let parent = path
-        .parent()
-        .ok_or_else(|| ProviderError::OAuth("Credentials path has no parent".to_string()))?;
-    let tmp = parent.join(format!(
-        ".credentials.json.codexbar-tmp.{}.{}",
-        std::process::id(),
-        PERSIST_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    std::fs::write(&tmp, serialized.as_bytes())
-        .map_err(|e| ProviderError::OAuth(format!("Failed to write credentials temp file: {e}")))?;
-    std::fs::rename(&tmp, &path)
-        .map_err(|e| ProviderError::OAuth(format!("Failed to replace credentials file: {e}")))?;
-    Ok(())
+    atomic_file::write_atomic(&path, serialized.as_bytes())
+        .map_err(|e| ProviderError::OAuth(format!("Failed to replace credentials file: {e}")))
 }
 
 /// Pure JSON merge used by [`persist_refreshed_credentials`]. Updates only
@@ -458,6 +460,28 @@ fn apply_refresh_to_credentials_json(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_new_saved_login_cannot_inherit_an_older_longer_lived_rotation() {
+        let path = std::path::PathBuf::from(format!("saved-cache-{}", uuid::Uuid::new_v4()));
+        let old_source =
+            super::CredentialSource::saved_account(path.clone(), "one:org", "old-login");
+        let new_source = super::CredentialSource::saved_account(path, "one:org", "new-login");
+        let fresh = super::ClaudeOAuthCredentials {
+            access_token: "rotated-old-login".into(),
+            refresh_token: Some("rotated-refresh".into()),
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(8)),
+            scopes: vec![],
+            rate_limit_tier: None,
+        };
+        let shorter_login = super::ClaudeOAuthCredentials {
+            access_token: "new-login".into(),
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            ..fresh.clone()
+        };
+        super::store_refreshed(&old_source, &fresh);
+        assert!(super::cached_refreshed_if_fresher(&old_source, &shorter_login).is_some());
+        assert!(super::cached_refreshed_if_fresher(&new_source, &shorter_login).is_none());
+    }
     use super::{
         CredentialSource, apply_refresh_to_credentials_json, cached_refreshed_if_fresher,
         parse_credentials_json, replacement_from_changed_fresh_keyring, store_refreshed,

@@ -9,14 +9,17 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
 
+mod pass;
+
 use crate::core::{
-    FetchContext, Provider, ProviderError, ProviderFetchResult, ProviderId, ProviderMetadata,
-    RateWindow, SourceMode, UsageSnapshot,
+    FetchContext, Provider, ProviderDisplayDetail, ProviderError, ProviderFetchResult, ProviderId,
+    ProviderMetadata, RateWindow, SourceMode, UsageSnapshot,
 };
 
 const TRPC_BASE: &str = "https://app.kilo.ai/api/trpc";
 const PROCEDURES: &str = "user.getCreditBlocks,kiloPass.getState,user.getAutoTopUpPaymentMethod";
 const KILO_CREDENTIAL_TARGET: &str = "codexbar-kilo";
+const AUTO_TOP_UP_DETAIL_ID: &str = "kilo-auto-top-up";
 
 #[derive(Debug, Deserialize)]
 struct CreditBlock {
@@ -38,13 +41,14 @@ impl KiloProvider {
                 id: ProviderId::Kilo,
                 display_name: "Kilo",
                 session_label: "Credits",
-                weekly_label: "Pass",
+                weekly_label: "Kilo Pass",
                 supports_opus: false,
                 supports_credits: true,
                 default_enabled: false,
                 is_primary: false,
                 dashboard_url: Some("https://app.kilo.ai/usage"),
                 status_page_url: None,
+                tertiary_label_key: None,
             },
             client: crate::core::credentialed_http_client_builder()
                 .timeout(std::time::Duration::from_secs(30))
@@ -110,8 +114,8 @@ impl KiloProvider {
                 has_blocks = !arr.is_empty();
                 for block in arr {
                     if let Ok(b) = serde_json::from_value::<CreditBlock>(block.clone()) {
-                        total += b.amount_m_usd.unwrap_or(0.0);
-                        remaining += b.balance_m_usd.unwrap_or(0.0);
+                        add_finite(&mut total, b.amount_m_usd);
+                        add_finite(&mut remaining, b.balance_m_usd);
                     }
                 }
             }
@@ -120,56 +124,48 @@ impl KiloProvider {
                 && let Some(balance_m_usd) =
                     payload.get("totalBalance_mUsd").and_then(|v| v.as_f64())
             {
-                total = balance_m_usd;
-                remaining = balance_m_usd;
+                total = finite_or_zero(Some(balance_m_usd));
+                remaining = total;
             }
         }
 
         let total_usd = total / 1_000_000.0;
         let remaining_usd = remaining / 1_000_000.0;
-        let used_usd = (total_usd - remaining_usd).max(0.0);
-        let percent = if total_usd > 0.0 {
-            ((used_usd / total_usd) * 100.0).clamp(0.0, 100.0)
+        let primary = if total_usd.is_finite() && remaining_usd.is_finite() {
+            let used_usd = (total_usd - remaining_usd).max(0.0);
+            let percent = if total_usd > 0.0 {
+                ((used_usd / total_usd) * 100.0).clamp(0.0, 100.0)
+            } else {
+                0.0
+            };
+            // Upstream `KiloUsageSnapshot.toUsageSnapshot`: "17.50/50 credits",
+            // shown as the window's detail line rather than a reset.
+            RateWindow::with_details(
+                percent,
+                None,
+                None,
+                Some(format!(
+                    "{}/{} credits",
+                    compact_number(used_usd),
+                    compact_number(total_usd)
+                )),
+            )
+            .with_description_as_detail()
         } else {
-            0.0
+            RateWindow::informational("Credit usage unavailable")
         };
-
-        let mut primary = RateWindow::new(percent);
-        primary.reset_description = Some(format!("${:.2}/${:.2}", used_usd, total_usd));
 
         let mut snap = UsageSnapshot::new(primary);
 
         // --- Kilo Pass (secondary window) ---
-        if let Some(pass) = kilo_pass_data {
-            let usage = pass
-                .get("currentPeriodUsageUsd")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
-            let base = pass
-                .get("currentPeriodBaseCreditsUsd")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
-            let bonus = pass
-                .get("currentPeriodBonusCreditsUsd")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
-            let pass_total = base + bonus;
-            if pass_total > 0.0 {
-                let pass_pct = ((usage / pass_total) * 100.0).clamp(0.0, 100.0);
-                let mut secondary = RateWindow::new(pass_pct);
-                secondary.reset_description = Some(format!("${:.2}/${:.2}", usage, pass_total));
-                snap = snap.with_secondary(secondary);
-            }
+        // `kiloPass.getState` nests the pass under `subscription`; the decoding
+        // (nested, flat and generic fallback shapes) lives in `pass.rs`.
+        if let Some(secondary) = pass::pass_window(kilo_pass_data) {
+            snap = snap.with_secondary(secondary);
+        }
 
-            if let Some(plan) = pass
-                .get("planName")
-                .or_else(|| pass.get("tier"))
-                .or_else(|| pass.get("status"))
-                .and_then(|v| v.as_str())
-                && !plan.is_empty()
-            {
-                snap = snap.with_login_method(plan.to_string());
-            }
+        if let Some(plan) = pass::plan_name(kilo_pass_data) {
+            snap = snap.with_login_method(plan);
         }
 
         Ok(snap)
@@ -188,7 +184,7 @@ impl KiloProvider {
         Some(data)
     }
 
-    async fn fetch_with_key(&self, api_key: &str) -> Result<UsageSnapshot, ProviderError> {
+    async fn fetch_with_key(&self, api_key: &str) -> Result<ProviderFetchResult, ProviderError> {
         let url = Self::build_url();
         let response = self
             .client
@@ -213,11 +209,47 @@ impl KiloProvider {
         let parsed: Value = serde_json::from_str(&body)
             .map_err(|e| ProviderError::Parse(format!("Failed to parse Kilo response: {}", e)))?;
 
-        let credit_blocks = Self::extract_data(&parsed, 0);
-        let kilo_pass = Self::extract_data(&parsed, 1);
-
-        Self::build_snapshot(credit_blocks, kilo_pass)
+        Self::result_from_batch(&parsed)
     }
+
+    fn snapshot_from_batch(batch: &Value) -> Result<UsageSnapshot, ProviderError> {
+        Self::build_snapshot(Self::extract_data(batch, 0), Self::extract_data(batch, 1))
+    }
+
+    /// The usage snapshot plus the auto top-up activity line. Upstream folds
+    /// the activity into `loginMethod` ("Pro · Auto top-up: visa") and its
+    /// identity presenter splits it back out under the bars; here it is a
+    /// section-less detail row so the plan slot keeps only the plan.
+    fn result_from_batch(batch: &Value) -> Result<ProviderFetchResult, ProviderError> {
+        let usage = Self::snapshot_from_batch(batch)?;
+        let auto_top_up =
+            pass::auto_top_up_label(Self::extract_data(batch, 0), Self::extract_data(batch, 2))
+                .and_then(|label| {
+                    ProviderDisplayDetail::new(AUTO_TOP_UP_DETAIL_ID, "Auto top-up", label)
+                });
+        Ok(ProviderFetchResult::new(usage, "api").with_display_detail(auto_top_up))
+    }
+}
+
+/// Upstream `KiloUsageSnapshot.compactNumber`: whole numbers without
+/// decimals, everything else with two.
+fn compact_number(value: f64) -> String {
+    if value.trunc() == value {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.2}")
+    }
+}
+
+fn finite_or_zero(value: Option<f64>) -> f64 {
+    value.filter(|value| value.is_finite()).unwrap_or(0.0)
+}
+
+fn add_finite(total: &mut f64, value: Option<f64>) {
+    let Some(value) = value.filter(|value| value.is_finite()) else {
+        return;
+    };
+    *total += value;
 }
 
 fn direct_kilo_api_key(api_key: Option<&str>) -> Option<String> {
@@ -280,8 +312,7 @@ impl Provider for KiloProvider {
         match ctx.source_mode {
             SourceMode::Auto | SourceMode::OAuth => {
                 let api_key = Self::get_api_key(ctx.api_key.as_deref())?;
-                let usage = self.fetch_with_key(&api_key).await?;
-                Ok(ProviderFetchResult::new(usage, "api"))
+                self.fetch_with_key(&api_key).await
             }
             SourceMode::Web | SourceMode::Cli => {
                 Err(ProviderError::UnsupportedSource(ctx.source_mode))
@@ -343,7 +374,96 @@ mod tests {
         let secondary = snap.secondary.expect("pass window");
         // 5/25 = 20%
         assert!((secondary.used_percent - 20.0).abs() < 0.001);
+        assert_eq!(
+            secondary.reset_description.as_deref(),
+            Some("$5.00 / $20.00 (+ $5.00 bonus)")
+        );
         assert_eq!(snap.login_method.as_deref(), Some("Kilo Pass"));
+    }
+
+    /// Batch body from the Mac-parity Kilo pack (routes.json), synthetic values.
+    fn parity_pack_batch() -> Value {
+        serde_json::json!([
+            {"result": {"data": {"json": {
+                "creditBlocks": [
+                    {"amount_mUsd": 25_000_000, "balance_mUsd": 12_500_000, "expiry_date": "2026-11-09T00:00:00Z"},
+                    {"amount_mUsd": 25_000_000, "balance_mUsd": 20_000_000, "expiry_date": "2027-01-08T00:00:00Z"}
+                ],
+                "totalBalance_mUsd": 32_500_000
+            }}}},
+            {"result": {"data": {"json": {
+                "subscription": {
+                    "tier": "tier_49",
+                    "currentPeriodUsageUsd": 12.4,
+                    "currentPeriodBaseCreditsUsd": 49.0,
+                    "currentPeriodBonusCreditsUsd": 10.0,
+                    "nextBillingAt": "2026-10-17T00:00:00Z"
+                }
+            }}}},
+            {"result": {"data": {"json": {"enabled": true, "paymentMethod": "visa"}}}}
+        ])
+    }
+
+    #[test]
+    fn parses_nested_subscription_from_parity_pack() {
+        let snap = KiloProvider::snapshot_from_batch(&parity_pack_batch()).unwrap();
+
+        // Credits: $50 total, $32.50 left, $17.50 used -> 35% used (65% left).
+        assert!((snap.primary.used_percent - 35.0).abs() < 0.001);
+
+        // Kilo Pass: $12.40 of $49 base + $10 bonus -> 21% used (79% left).
+        let pass = snap
+            .secondary
+            .expect("Kilo Pass window from nested subscription");
+        assert!((pass.used_percent - 12.4 / 59.0 * 100.0).abs() < 0.001);
+        assert_eq!(
+            pass.resets_at.map(|date| date.to_rfc3339()),
+            Some("2026-10-17T00:00:00+00:00".to_string())
+        );
+        // The base/bonus split survives as the upstream detail line.
+        assert_eq!(
+            pass.reset_description.as_deref(),
+            Some("$12.40 / $49.00 (+ $10.00 bonus)")
+        );
+        assert!(pass.description_is_detail);
+        assert_eq!(snap.login_method.as_deref(), Some("Pro"));
+
+        // Credits read as the Mac detail line, not a "Resets ..." text.
+        assert_eq!(
+            snap.primary.reset_description.as_deref(),
+            Some("17.50/50 credits")
+        );
+        assert!(snap.primary.description_is_detail);
+        assert!(snap.primary.resets_at.is_none());
+    }
+
+    #[test]
+    fn parity_pack_reports_auto_top_up_as_a_detail_row() {
+        let result = KiloProvider::result_from_batch(&parity_pack_batch()).unwrap();
+
+        let rows: Vec<_> = result
+            .display_details
+            .iter()
+            .map(|row| (row.id(), row.section_title(), row.title(), row.value()))
+            .collect();
+        assert_eq!(rows, [(AUTO_TOP_UP_DETAIL_ID, None, "Auto top-up", "visa")]);
+        // The plan slot keeps only the plan.
+        assert_eq!(result.usage.login_method.as_deref(), Some("Pro"));
+    }
+
+    #[test]
+    fn kilo_pass_label_matches_upstream() {
+        let metadata = KiloProvider::new().metadata;
+        assert_eq!(metadata.session_label, "Credits");
+        assert_eq!(metadata.weekly_label, "Kilo Pass");
+    }
+
+    #[test]
+    fn compact_number_drops_decimals_only_for_whole_values() {
+        assert_eq!(compact_number(50.0), "50");
+        assert_eq!(compact_number(17.5), "17.50");
+        assert_eq!(compact_number(0.0), "0");
+        assert_eq!(compact_number(1.06), "1.06");
     }
 
     #[test]
@@ -368,8 +488,32 @@ mod tests {
         assert!((snap.primary.used_percent - 0.0).abs() < f64::EPSILON);
         assert_eq!(
             snap.primary.reset_description.as_deref(),
-            Some("$0.00/$1.06")
+            Some("0/1.06 credits")
         );
+        assert!(snap.secondary.is_none());
+    }
+
+    #[test]
+    fn makes_overflowed_credit_totals_unavailable() {
+        let credit_blocks = serde_json::json!({
+            "creditBlocks": [
+                { "amount_mUsd": 1e308, "balance_mUsd": 1e308 },
+                { "amount_mUsd": 1e308, "balance_mUsd": 1e308 }
+            ]
+        });
+        let snap = KiloProvider::build_snapshot(Some(&credit_blocks), None).unwrap();
+        assert!(snap.primary.is_informational);
+        assert!(snap.primary.used_percent.is_finite());
+    }
+
+    #[test]
+    fn omits_pass_window_when_usage_arithmetic_overflows() {
+        let pass = serde_json::json!({
+            "currentPeriodUsageUsd": 1e308,
+            "currentPeriodBaseCreditsUsd": 1e308,
+            "currentPeriodBonusCreditsUsd": 1e308
+        });
+        let snap = KiloProvider::build_snapshot(None, Some(&pass)).unwrap();
         assert!(snap.secondary.is_none());
     }
 }

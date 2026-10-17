@@ -1,16 +1,31 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import type { ClaudeSwapAccountsState } from "../../../../../types/bridge";
+import type {
+  ClaudeSwapAccount,
+  ClaudeSwapAccountsState,
+  ClaudeSwapHistoricalUsage,
+  ClaudeSwapSpendWindow,
+  Language,
+} from "../../../../../types/bridge";
 import type { LocaleKey } from "../../../../../i18n/keys";
 import {
   claudeSwapAccountsList,
+  claudeSwapAccountReauthenticate,
   claudeSwapAccountSwitch,
-  getSettingsSnapshot,
-  updateSettings,
 } from "../../../../../lib/tauri";
+import {
+  localClaudeReconciliationOutcome,
+  useClaudeReconciliation,
+} from "../../../../../hooks/useClaudeReconciliation";
+import { useCurrency } from "../../../../../hooks/CurrencyProvider";
 
 interface Props {
   t: (key: LocaleKey) => string;
+  language?: Language;
+  /** Settings `claudeSwapEnabled`; the switch lives in Claude > Options. */
+  enabled: boolean;
+  /** Settings `claudeSwapExecutablePath`; the field sits under that switch. */
+  executablePath: string;
 }
 
 const EMPTY_STATE: ClaudeSwapAccountsState = {
@@ -29,47 +44,98 @@ function usageLabel(
   return `${t(key)} ${Math.round(window.usedPercent)}%`;
 }
 
+function spendLabel(
+  t: (key: LocaleKey) => string,
+  spend: ClaudeSwapSpendWindow | null,
+  locale: string,
+  formatCurrency: (amount: number | null | undefined, sourceCode: string) => string,
+): string | null {
+  if (!spend) return null;
+  const formatter = new Intl.NumberFormat(locale, {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+  const used = spend.currencyCode ? formatCurrency(spend.used, spend.currencyCode) : formatter.format(spend.used);
+  const limit = spend.currencyCode ? formatCurrency(spend.limit, spend.currencyCode) : formatter.format(spend.limit);
+  return `${t("ClaudeSwapSpend")} ${used} / ${limit} (${Math.round(spend.usedPercent)}%)`;
+}
+
+function historicalLabel(
+  t: (key: LocaleKey) => string,
+  history: ClaudeSwapHistoricalUsage | null,
+  locale: string,
+  formatCurrency: (amount: number | null | undefined, sourceCode: string) => string,
+): string | null {
+  if (!history) return null;
+  const windows = [
+    usageLabel(t, "ProviderSession", history.fiveHour),
+    usageLabel(t, "ProviderWeekly", history.sevenDay),
+    ...history.scoped.map((window) => `${window.name} ${Math.round(window.usedPercent)}%`),
+    spendLabel(t, history.spend, locale, formatCurrency),
+  ].filter(Boolean);
+  const captured = new Intl.DateTimeFormat(locale, {
+    dateStyle: "short",
+    timeStyle: "short",
+  }).format(new Date(history.fetchedAt));
+  return `${t("ClaudeSwapHistoricalUsage")}: ${windows.join(" · ")} (${t("ClaudeSwapHistoricalCapturedAt")} ${captured})`;
+}
+
+function languageLocale(language: Language): string {
+  return {
+    english: "en-US",
+    chinese: "zh-CN",
+    chinesetraditional: "zh-TW",
+    japanese: "ja-JP",
+    korean: "ko-KR",
+    spanish: "es-MX",
+    portuguesebrazil: "pt-BR",
+    russian: "ru-RU",
+    turkish: "tr-TR",
+    ukrainian: "uk-UA",
+  }[language];
+}
+
 /**
  * External Claude subscription accounts read from the claude-swap (`cswap`)
  * executable (issue #477, port of upstream claude-swap Phase 1-2).
  *
  * This list is deliberately separate from the built-in saved Claude Code
  * accounts above: it is display + explicit activation only, is hidden while the
- * integration is disabled or unconfigured, and CodexBar never reads or stores
- * cswap credentials.
+ * integration is disabled, and CodexBar never reads or stores cswap credentials.
+ * The opt-in switch and executable path are settings rows elsewhere in the
+ * pane; this list reloads whenever either changes.
  */
-export function ClaudeSwapAccountsSection({ t }: Props) {
-  const [enabled, setEnabled] = useState(false);
-  const [executablePath, setExecutablePath] = useState("");
-  const [pathDraft, setPathDraft] = useState("");
+export function ClaudeSwapAccountsSection({
+  t,
+  language = "english",
+  enabled,
+  executablePath,
+}: Props) {
   const [state, setState] = useState<ClaudeSwapAccountsState>(EMPTY_STATE);
+  const locale = languageLocale(language);
+  const { format: formatCurrency } = useCurrency();
   const [busy, setBusy] = useState(false);
+  const [operation, setOperation] = useState<{ generation: number; success: LocaleKey } | null>(null);
+  const { snapshot, accept, reconciling } = useClaudeReconciliation();
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const mounted = useRef(false);
 
   const reload = useCallback(async () => {
     const next = await claudeSwapAccountsList();
-    if (mounted.current) {
-      setState(next);
-      setEnabled(next.enabled);
-    }
+    if (mounted.current) setState(next);
   }, []);
 
   useEffect(() => {
     mounted.current = true;
-    void getSettingsSnapshot()
-      .then((settings) => {
-        if (!mounted.current) return;
-        setEnabled(settings.claudeSwapEnabled ?? false);
-        const path = settings.claudeSwapExecutablePath ?? "";
-        setExecutablePath(path);
-        setPathDraft(path);
-      })
-      .catch((e) => {
-        if (mounted.current) setError(String(e));
-      });
+    if (!enabled) {
+      setState(EMPTY_STATE);
+      return () => {
+        mounted.current = false;
+      };
+    }
     const load = () => {
+      setError(null);
       void reload().catch((e) => {
         if (mounted.current) setError(String(e));
       });
@@ -80,23 +146,38 @@ export function ClaudeSwapAccountsSection({ t }: Props) {
       mounted.current = false;
       void unlisten.then((fn) => fn()).catch(() => {});
     };
-  }, [reload]);
+  }, [enabled, executablePath, reload]);
 
-  const runSettings = async (
-    patch: { claudeSwapEnabled?: boolean; claudeSwapExecutablePath?: string },
-  ) => {
+  useEffect(() => {
+    const outcome = localClaudeReconciliationOutcome(snapshot, operation?.generation ?? null);
+    if (!outcome) return;
+    if (outcome.status === "failed") {
+      setMessage(null);
+      setError(outcome.detail);
+    } else if (operation) {
+      setMessage(t(operation.success));
+      setError(null);
+    }
+  }, [operation, snapshot, t]);
+
+  const runAccountAction = async (account: ClaudeSwapAccount) => {
     setBusy(true);
     setError(null);
     setMessage(null);
     try {
-      await updateSettings(patch);
-      // Persist the accepted path in local state so a later blur with the same
-      // value is a no-op, while a failed save leaves the draft untouched and
-      // remains retryable.
-      if (mounted.current && patch.claudeSwapExecutablePath !== undefined) {
-        setExecutablePath(patch.claudeSwapExecutablePath);
+      const success = account.action === "reauthenticate"
+        ? "ClaudeSwapReauthenticated"
+        : "ClaudeSwapSwitched";
+      let result;
+      if (account.action === "reauthenticate") {
+        result = await claudeSwapAccountReauthenticate(account.slot);
+      } else if (account.action === "switch") {
+        result = await claudeSwapAccountSwitch(account.slot);
+      } else {
+        throw new Error("This claude-swap account is not actionable.");
       }
-      await reload();
+      setOperation({ generation: result.generation, success });
+      accept(result);
     } catch (e) {
       if (mounted.current) setError(String(e));
     } finally {
@@ -104,66 +185,17 @@ export function ClaudeSwapAccountsSection({ t }: Props) {
     }
   };
 
-  const savePath = async () => {
-    const next = pathDraft.trim();
-    if (next === executablePath.trim()) return;
-    await runSettings({ claudeSwapExecutablePath: next });
-  };
+  if (!enabled) return null;
 
-  const switchAccount = async (slot: number) => {
-    setBusy(true);
-    setError(null);
-    setMessage(null);
-    try {
-      await claudeSwapAccountSwitch(slot);
-      // The backend emits `claude-accounts-updated` after invalidating usage;
-      // the listener above performs the single reload.
-      if (mounted.current) setMessage(t("ClaudeSwapSwitched"));
-    } catch (e) {
-      if (mounted.current) setError(String(e));
-    } finally {
-      if (mounted.current) setBusy(false);
-    }
-  };
-
-  const status = !enabled
-    ? t("ClaudeSwapStatusDisabled")
-    : !state.executableConfigured
-      ? t("ClaudeSwapStatusNoExecutable")
-      : t("ClaudeSwapStatusReady");
+  const status = !state.executableConfigured
+    ? t("ClaudeSwapStatusNoExecutable")
+    : t("ClaudeSwapStatusReady");
 
   return (
     <section className="provider-detail-section claude-swap-accounts">
       <h4>{t("ClaudeSwapTitle")}</h4>
-      <p className="settings-section__hint">{t("ClaudeSwapHint")}</p>
-      <label className="provider-detail-toggle">
-        <input
-          type="checkbox"
-          checked={enabled}
-          disabled={busy}
-          onChange={(e) => void runSettings({ claudeSwapEnabled: e.target.checked })}
-        />
-        <span>
-          <span className="provider-detail-toggle__label">{t("ClaudeSwapEnable")}</span>
-          <span className="provider-detail-toggle__helper">{t("ClaudeSwapEnableHelp")}</span>
-        </span>
-      </label>
-      <label className="provider-detail-field">
-        <span className="provider-detail-field__label">{t("ClaudeSwapExecutablePath")}</span>
-        <input
-          type="text"
-          className="provider-detail-field__input"
-          value={pathDraft}
-          disabled={busy}
-          placeholder={t("ClaudeSwapExecutablePathPlaceholder")}
-          onChange={(e) => setPathDraft(e.target.value)}
-          onBlur={() => void savePath()}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") void savePath();
-          }}
-        />
-      </label>
-      {enabled && <p className="provider-detail-helper">{status}</p>}
+      <p className="provider-detail-helper">{status}</p>
+      {reconciling && <p className="provider-detail-helper" role="status">{t("ClaudeSwapReconciling")}</p>}
       {error && (
         <div className="provider-detail-error" role="alert">
           {error}
@@ -179,7 +211,7 @@ export function ClaudeSwapAccountsSection({ t }: Props) {
           {message}
         </div>
       )}
-      {enabled && state.executableConfigured && state.accounts.length === 0 && !state.error && (
+      {state.executableConfigured && state.accounts.length === 0 && !state.error && (
         <p>{t("ClaudeSwapEmpty")}</p>
       )}
       <ul className="credential-list">
@@ -189,33 +221,43 @@ export function ClaudeSwapAccountsSection({ t }: Props) {
           const scoped = account.scoped
             .map((window) => `${window.name} ${Math.round(window.usedPercent)}%`)
             .join(" \u00b7 ");
+          const spend = spendLabel(t, account.spend, locale, formatCurrency);
+          const historical = historicalLabel(t, account.historicalUsage, locale, formatCurrency);
           return (
             <li className="credential-card" key={account.id}>
               <div className="credential-card__header">
                 <div className="credential-card__info">
                   <strong>{account.label}</strong>
                   <span className="credential-card__meta">
-                    {[session, weekly, scoped || null].filter(Boolean).join(" \u00b7 ") ||
+                    {[session, weekly, scoped || null, spend].filter(Boolean).join(" \u00b7 ") ||
                       (!account.error ? t("ClaudeSwapUsageUnavailable") : "")}
                   </span>
+                  {historical && <span className="credential-card__meta">{historical}</span>}
                   {account.isActive && (
                     <span className="credential-card__badge credential-card__badge--set">
                       {t("TokenAccountActive")}
                     </span>
                   )}
-                  {!account.isActive && account.error && (
+                  {account.isDisabled && (
+                    <span className="credential-card__meta">{t("ClaudeSwapDisabled")}</span>
+                  )}
+                  {account.error && (
                     <span className="credential-card__meta">{account.error}</span>
                   )}
                 </div>
                 <div className="credential-card__actions">
-                  {!account.isActive && account.canActivate && (
+                  {account.action && (
                     <button
                       type="button"
                       className="credential-btn credential-btn--primary"
-                      disabled={busy}
-                      onClick={() => void switchAccount(account.slot)}
+                      disabled={busy || reconciling}
+                      onClick={() => void runAccountAction(account)}
                     >
-                      {t("ClaudeSwapSwitchButton")}
+                      {t(
+                        account.action === "reauthenticate"
+                          ? "ClaudeSwapReauthenticateButton"
+                          : "ClaudeSwapSwitchButton",
+                      )}
                     </button>
                   )}
                 </div>

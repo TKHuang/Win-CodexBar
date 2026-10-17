@@ -2,16 +2,47 @@ use super::*;
 
 mod helpers;
 mod parser;
+pub(crate) mod priority;
+pub(crate) mod source_rows;
 
 use helpers::{
     BoundedJsonlLine, CODEX_JSONL_MAX_LINE_BYTES, nonempty_json_string, parse_rfc3339_timestamp,
     read_bounded_jsonl_line, read_bounded_jsonl_line_until, session_meta_field,
 };
-use parser::CodexParserState;
+use parser::{CodexParseMode, CodexParserState};
 
-/// Persisted Codex cache schema version. Version 0 is any pre-64-bit cache
-/// and must be rebuilt from source logs.
-pub(crate) const CODEX_CACHE_SCHEMA_VERSION: u32 = 1;
+/// Saved cursor and parser state of an unfinished parent-baseline fork parse.
+/// Restoring all of it accounts the remaining bytes exactly as one
+/// uninterrupted parse would.
+#[derive(Debug, Clone)]
+pub(crate) struct CodexForkParseResume {
+    pub start_offset: i64,
+    pub paginated_continuation: bool,
+    /// Effective inherited baseline, after any paginated-continuation raise.
+    pub inherited_totals: CodexTotals,
+    pub remaining_inherited_totals: Option<CodexTotals>,
+    pub last_model: Option<String>,
+    pub last_totals: CodexTotals,
+    pub last_token_timestamp: Option<String>,
+    pub first_token_timestamp: Option<String>,
+    pub token_timestamps_monotonic: Option<bool>,
+    pub state: CodexForkResumeState,
+}
+
+use crate::cost_reporting_period::cost_bucket_zone;
+
+/// Persisted Codex cache schema version. Version 0 predates 64-bit totals;
+/// version 1 can retain a terminal pause after treating a paginated v2
+/// subagent's independent counters as an inherited fork. Version 3 adds
+/// persisted paginated-fork accounting state. Version 4 reparses copied-prefix
+/// subagents with locally inferred component baselines. Version 5 records a
+/// fork's first token timestamp so direct-fork chains resolve through parents
+/// with no token snapshot at the descendant's fork time. Version 6 records the
+/// Codex turn id on source rows so Priority trace evidence can be matched.
+/// Version 7 keys ChatGPT-plan Auto-review requests apart (upstream #4452) so
+/// cached day aggregates from older parsers, which priced them as unpriced,
+/// are rebuilt. Rebuild older artifacts.
+pub(crate) const CODEX_CACHE_SCHEMA_VERSION: u32 = 7;
 
 /// Whether a persisted Codex cache artifact matches the current schema.
 /// A mismatched artifact (e.g. a pre-64-bit cache from an older release) is
@@ -20,7 +51,14 @@ pub(crate) fn codex_cache_schema_is_current(schema_version: u32) -> bool {
     schema_version == CODEX_CACHE_SCHEMA_VERSION
 }
 
-/// Apply the Codex cache schema version policy to a freshly decoded artifact.
+/// Whether a persisted Codex cache bucketed its days in the zone now in
+/// effect. Artifacts written before the zone was stamped are kept.
+pub(crate) fn codex_cache_zone_is_current(bucket_time_zone: Option<&str>) -> bool {
+    bucket_time_zone.is_none_or(|zone| zone == cost_bucket_zone().identifier())
+}
+
+/// Apply the Codex cache schema version and bucket zone policy to a freshly
+/// decoded artifact.
 ///
 /// A mismatched artifact is invalidated: a fresh, current-version cache is
 /// returned with the decoded baseline stamp retained so the caller stays
@@ -30,7 +68,9 @@ pub(crate) fn codex_cache_apply_load_policy(
     mut cache: CostUsageCache,
     stamp: CacheStamp,
 ) -> CostUsageCache {
-    if !codex_cache_schema_is_current(cache.codex_cache_schema_version) {
+    if !codex_cache_schema_is_current(cache.codex_cache_schema_version)
+        || !codex_cache_zone_is_current(cache.bucket_time_zone.as_deref())
+    {
         return CostUsageCache {
             codex_cache_schema_version: CODEX_CACHE_SCHEMA_VERSION,
             loaded_stamp: Some(Some(stamp)),
@@ -41,16 +81,18 @@ pub(crate) fn codex_cache_apply_load_policy(
     cache
 }
 
-/// Stamp the current schema version before a Codex cache is persisted.
+/// Stamp the current schema version and bucket zone before a Codex cache is
+/// persisted.
 pub(crate) fn codex_cache_stamp_schema_version(cache: &mut CostUsageCache) {
     cache.codex_cache_schema_version = CODEX_CACHE_SCHEMA_VERSION;
+    cache.bucket_time_zone = Some(cost_bucket_zone().identifier());
 }
 
 #[cfg(test)]
 use helpers::{
     CodexFastPayload, CodexFastTotals, bare_usage_totals, codex_timestamp_day_key,
-    codex_totals_from_fast, fast_totals_from_payload, last_usage_delta, parse_codex_timestamp,
-    read_token_totals,
+    codex_totals_from_fast, fast_totals_from_payload, is_candidate_codex_line, last_usage_delta,
+    parse_codex_timestamp, read_token_totals,
 };
 
 impl JsonlScanner {
@@ -131,6 +173,68 @@ impl JsonlScanner {
         files
     }
 
+    /// Session files kept directly in `dir` rather than in a `YYYY/MM/DD`
+    /// partition (upstream `listCodexSessionFilesFlat`): Codex's flat
+    /// `archived_sessions` folder and legacy rollouts in a sessions root.
+    /// A file whose name carries a date outside the scan keys is skipped; a
+    /// name without a date is kept, so its events decide. Hidden files and
+    /// directories are ignored.
+    pub(crate) fn list_codex_flat_session_files(
+        dir: &Path,
+        scan_since_key: &str,
+        scan_until_key: &str,
+    ) -> std::io::Result<Vec<PathBuf>> {
+        let mut files = Vec::new();
+        for entry in fs::read_dir(dir)?.flatten() {
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let path = entry.path();
+            if !path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
+            {
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with('.')
+                && Self::codex_flat_name_in_range(&name, scan_since_key, scan_until_key)
+            {
+                files.push(path);
+            }
+        }
+        Ok(files)
+    }
+
+    /// Whether a flat session file name stays in the scan keys: true when the
+    /// name carries no date.
+    pub(crate) fn codex_flat_name_in_range(
+        name: &str,
+        scan_since_key: &str,
+        scan_until_key: &str,
+    ) -> bool {
+        Self::codex_filename_day_key(name)
+            .is_none_or(|day| CostUsageDayRange::is_in_range(day, scan_since_key, scan_until_key))
+    }
+
+    /// The first `YYYY-MM-DD` run in a session file name (upstream
+    /// `dayKeyFromFilename`), e.g. `2025-10-03` in
+    /// `rollout-2025-10-03T10-00-00-<uuid>.jsonl`.
+    pub(crate) fn codex_filename_day_key(name: &str) -> Option<&str> {
+        let bytes = name.as_bytes();
+        (0..bytes.len().saturating_sub(9)).find_map(|start| {
+            let shaped = bytes[start..start + 10]
+                .iter()
+                .enumerate()
+                .all(|(offset, byte)| match offset {
+                    4 | 7 => *byte == b'-',
+                    _ => byte.is_ascii_digit(),
+                });
+            shaped.then(|| name.get(start..start + 10)).flatten()
+        })
+    }
+
     /// Read only a bounded prefix until the first authoritative `session_meta`
     /// row is found. Fork decisions must not require parsing the child usage
     /// stream before a safe parent baseline is selected.
@@ -171,21 +275,66 @@ impl JsonlScanner {
             }
 
             let payload = obj.get("payload").filter(|value| value.is_object());
+            // Desktop v2 subagents fetch inherited context through pagination,
+            // but their token counters start at zero. `forked_from_id` describes
+            // conversation ancestry, not an inherited billing baseline. Keep
+            // legacy/unknown fork formats conservative by requiring all markers.
+            let independent_subagent = payload.is_some_and(|value| {
+                value.get("history_mode").and_then(Value::as_str) == Some("paginated")
+                    && value.get("multi_agent_version").and_then(Value::as_str) == Some("v2")
+                    && (value.get("thread_source").and_then(Value::as_str) == Some("subagent")
+                        || value
+                            .pointer("/source/subagent/thread_spawn")
+                            .is_some_and(Value::is_object))
+            });
+            let is_subagent = payload.is_some_and(|value| {
+                value.get("thread_source").and_then(Value::as_str) == Some("subagent")
+                    || value
+                        .pointer("/source/subagent/thread_spawn")
+                        .is_some_and(Value::is_object)
+            });
+            let history_base_thread_id = payload
+                .and_then(|value| value.get("history_base"))
+                .filter(|value| value.is_object())
+                .and_then(|value| session_meta_field(value, None, &["thread_id", "threadId"]));
+            let forked_from_id = (!independent_subagent)
+                .then(|| {
+                    session_meta_field(
+                        &obj,
+                        payload,
+                        &[
+                            "forked_from_id",
+                            "forkedFromId",
+                            "parent_session_id",
+                            "parentSessionId",
+                            "parent_thread_id",
+                            "parentThreadId",
+                        ],
+                    )
+                })
+                .flatten();
             return Ok(CodexSessionMetadata {
                 session_id: session_meta_field(&obj, payload, &["id", "session_id", "sessionId"]),
-                forked_from_id: session_meta_field(
-                    &obj,
-                    payload,
-                    &[
-                        "forked_from_id",
-                        "forkedFromId",
-                        "parent_session_id",
-                        "parentSessionId",
-                    ],
-                ),
+                lineage: if independent_subagent {
+                    CodexSessionLineage::Independent
+                } else if forked_from_id.is_some() {
+                    CodexSessionLineage::Child
+                } else {
+                    CodexSessionLineage::Root
+                },
+                forked_from_id,
                 fork_timestamp: nonempty_json_string(obj.get("timestamp")).or_else(|| {
                     payload.and_then(|value| nonempty_json_string(value.get("timestamp")))
                 }),
+                history_base_thread_id,
+                is_subagent,
+                subagent_history_start_ordinal: payload
+                    .and_then(|value| value.get("subagent_history_start_ordinal"))
+                    .and_then(Value::as_i64),
+                has_creator_account: payload
+                    .and_then(|value| value.get("creator_account_id"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|creator| !creator.trim().is_empty()),
             });
         }
 
@@ -244,6 +393,18 @@ impl JsonlScanner {
             parse_rfc3339_timestamp(later),
         ) {
             (Some(earlier), Some(later)) => earlier <= later,
+            _ => false,
+        }
+    }
+
+    /// Strict counterpart of [`Self::codex_timestamp_at_or_before`]: `earlier`
+    /// is before `later`. Malformed timestamps fail closed.
+    pub(crate) fn codex_timestamp_before(earlier: &str, later: &str) -> bool {
+        match (
+            parse_rfc3339_timestamp(earlier),
+            parse_rfc3339_timestamp(later),
+        ) {
+            (Some(earlier), Some(later)) => earlier < later,
             _ => false,
         }
     }
@@ -319,15 +480,16 @@ impl JsonlScanner {
         Self::parse_codex_file_with_state_bounded_internal(
             file_path,
             range,
-            start_offset,
-            initial_model,
-            initial_totals,
-            previous_token_timestamp,
-            token_timestamps_monotonic,
             cancel,
-            false,
             None,
             max_bytes_to_read,
+            CodexParseMode::Standard {
+                start_offset,
+                initial_model,
+                initial_totals,
+                previous_token_timestamp,
+                token_timestamps_monotonic,
+            },
         )
     }
 
@@ -353,15 +515,16 @@ impl JsonlScanner {
         Self::parse_codex_file_with_state_bounded_internal(
             file_path,
             range,
-            start_offset,
-            initial_model,
-            initial_totals,
-            previous_token_timestamp,
-            token_timestamps_monotonic,
             cancel,
-            false,
             scan_target_size,
             max_bytes_to_read,
+            CodexParseMode::Standard {
+                start_offset,
+                initial_model,
+                initial_totals,
+                previous_token_timestamp,
+                token_timestamps_monotonic,
+            },
         )
     }
 
@@ -382,15 +545,14 @@ impl JsonlScanner {
         Self::parse_codex_file_with_state_bounded_internal(
             file_path,
             range,
-            0,
-            None,
-            Some(initial_totals),
-            None,
-            None,
             cancel,
-            true,
             None,
             max_bytes_to_read,
+            CodexParseMode::ParentBaseline {
+                baseline: initial_totals,
+                paginated_continuation: false,
+                remaining_inherited_totals: None,
+            },
         )
     }
 
@@ -407,37 +569,94 @@ impl JsonlScanner {
         scan_target_size: Option<i64>,
         max_bytes_to_read: Option<i64>,
     ) -> std::io::Result<CodexParseResult> {
-        Self::parse_codex_file_with_state_bounded_internal(
+        Self::parse_codex_file_with_state_bounded_fork_target_with_accounting(
             file_path,
             range,
-            0,
-            None,
-            Some(initial_totals),
-            None,
+            initial_totals,
+            false,
             None,
             cancel,
-            true,
             scan_target_size,
             max_bytes_to_read,
         )
     }
 
+    pub(crate) fn parse_codex_file_with_inferred_fork_baseline(
+        file_path: &Path,
+        range: &CostUsageDayRange,
+        subagent_history_start_ordinal: Option<i64>,
+        cancel: Option<&AtomicBool>,
+        scan_target_size: Option<i64>,
+        max_bytes_to_read: Option<i64>,
+    ) -> std::io::Result<CodexParseResult> {
+        Self::parse_codex_file_with_state_bounded_internal(
+            file_path,
+            range,
+            cancel,
+            scan_target_size,
+            max_bytes_to_read,
+            CodexParseMode::InferSubagent {
+                start_ordinal: subagent_history_start_ordinal,
+            },
+        )
+    }
+
+    /// Fork equivalent with persisted paginated-continuation accounting.
     #[allow(
         clippy::too_many_arguments,
-        reason = "resume state mirrors the persisted parser cache"
+        reason = "fork parse state mirrors the persisted parser cache"
     )]
+    pub(crate) fn parse_codex_file_with_state_bounded_fork_target_with_accounting(
+        file_path: &Path,
+        range: &CostUsageDayRange,
+        initial_totals: CodexTotals,
+        paginated_continuation: bool,
+        remaining_inherited_totals: Option<CodexTotals>,
+        cancel: Option<&AtomicBool>,
+        scan_target_size: Option<i64>,
+        max_bytes_to_read: Option<i64>,
+    ) -> std::io::Result<CodexParseResult> {
+        Self::parse_codex_file_with_state_bounded_internal(
+            file_path,
+            range,
+            cancel,
+            scan_target_size,
+            max_bytes_to_read,
+            CodexParseMode::ParentBaseline {
+                baseline: initial_totals,
+                paginated_continuation,
+                remaining_inherited_totals,
+            },
+        )
+    }
+
+    /// Continue an unfinished fork parse at its saved cursor. Upstream 0.67.0
+    /// resumes a resolved fork the same way instead of rereading its prefix.
+    pub(crate) fn parse_codex_fork_resume(
+        file_path: &Path,
+        range: &CostUsageDayRange,
+        resume: CodexForkParseResume,
+        cancel: Option<&AtomicBool>,
+        scan_target_size: Option<i64>,
+        max_bytes_to_read: Option<i64>,
+    ) -> std::io::Result<CodexParseResult> {
+        Self::parse_codex_file_with_state_bounded_internal(
+            file_path,
+            range,
+            cancel,
+            scan_target_size,
+            max_bytes_to_read,
+            CodexParseMode::ResumeParentBaseline(resume),
+        )
+    }
+
     fn parse_codex_file_with_state_bounded_internal(
         file_path: &Path,
         range: &CostUsageDayRange,
-        start_offset: i64,
-        initial_model: Option<String>,
-        initial_totals: Option<CodexTotals>,
-        previous_token_timestamp: Option<String>,
-        token_timestamps_monotonic: Option<bool>,
         cancel: Option<&AtomicBool>,
-        fork_baseline_mode: bool,
         scan_target_size: Option<i64>,
         max_bytes_to_read: Option<i64>,
+        mode: CodexParseMode,
     ) -> std::io::Result<CodexParseResult> {
         let file = File::open(file_path)?;
         // Session JSONL files are bounded by the cache budget; sizes fit i64.
@@ -447,7 +666,7 @@ impl JsonlScanner {
         )]
         let file_size = file.metadata()?.len() as i64;
 
-        let safe_start_offset = start_offset.clamp(0, file_size);
+        let safe_start_offset = mode.start_offset().clamp(0, file_size);
         let requested_target_size = scan_target_size
             .unwrap_or(file_size)
             .max(safe_start_offset)
@@ -458,13 +677,7 @@ impl JsonlScanner {
             reader.seek(SeekFrom::Start(safe_start_offset as u64))?;
         }
 
-        let mut parser = CodexParserState::with_timestamp_state_and_fork_mode(
-            initial_model,
-            initial_totals,
-            previous_token_timestamp,
-            token_timestamps_monotonic,
-            fork_baseline_mode,
-        );
+        let mut parser = CodexParserState::from_mode(mode);
         let mut parsed_bytes = safe_start_offset;
         let mut committed_bytes = safe_start_offset;
         let mut cancelled = false;
@@ -542,7 +755,7 @@ impl JsonlScanner {
                 parsed_bytes = committed_bytes;
                 break;
             }
-            parser.process_line(line, range);
+            parser.process_line_with_source_offset(line, range, parsed_bytes);
             committed_bytes = parsed_bytes;
         }
 
@@ -553,6 +766,12 @@ impl JsonlScanner {
         };
         let is_complete = !cancelled && !budget_exhausted && parsed_bytes >= effective_target_size;
         let bytes_read = parsed_bytes.saturating_sub(safe_start_offset).max(0);
+        let fork_baseline_locally_resolved = parser.fork_baseline_locally_resolved();
+        let fork_resume_state = if is_complete {
+            None
+        } else {
+            parser.fork_resume_state()
+        };
         Ok(CodexParseResult {
             records: parser.records,
             parsed_bytes,
@@ -565,10 +784,15 @@ impl JsonlScanner {
             last_totals: parser.previous_totals,
             token_timestamps_monotonic: parser.token_timestamps_monotonic,
             last_token_timestamp: parser.previous_token_timestamp,
+            first_token_timestamp: parser.first_token_timestamp,
             token_timestamp_comparisons: parser.token_timestamp_comparisons,
             bytes_read,
             is_complete,
             fork_baseline_ambiguous: parser.fork_baseline_ambiguous,
+            fork_baseline: parser.fork_baseline,
+            remaining_inherited_totals: parser.remaining_inherited_totals,
+            fork_baseline_locally_resolved,
+            fork_resume_state,
         })
     }
 

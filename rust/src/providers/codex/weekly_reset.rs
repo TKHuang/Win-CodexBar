@@ -15,6 +15,8 @@ const RESET_TOLERANCE_SECONDS: i64 = 2 * 60;
 const STABLE_BOUNDARY_TOLERANCE_SECONDS: i64 = 1;
 const CANDIDATE_MINIMUM_AGE_SECONDS: i64 = 60;
 const CANDIDATE_MAXIMUM_AGE_SECONDS: i64 = 30 * 60;
+const WEEKLY_WINDOW_MINUTES: u32 = 7 * 24 * 60;
+const WEEKLY_WINDOW_SECONDS: i64 = WEEKLY_WINDOW_MINUTES as i64 * 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -45,11 +47,47 @@ impl Default for AccountState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl AccountState {
+    /// Whether a delayed reset candidate waits for revalidation.
+    pub(super) fn has_delayed_candidate(&self) -> bool {
+        self.candidate.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct CreditInventory {
     available_count: u32,
     credits: Vec<CreditIdentity>,
+    /// When the credits endpoint answered. Inventories persisted before this
+    /// field existed decode as the epoch, which never counts as fresh.
+    #[serde(default)]
+    observed_at: DateTime<Utc>,
+}
+
+/// Available-credit identity without status, counted so duplicates matter
+/// while row order does not (upstream `AvailableCreditIdentity`).
+type CountedCredits<'a> = HashMap<(&'a str, &'a str, Option<DateTime<Utc>>), usize>;
+
+impl CreditInventory {
+    /// The counted available credits, or `None` unless the inventory is
+    /// positive and lists exactly `available_count` available credits.
+    fn positive_available_credits(&self) -> Option<CountedCredits<'_>> {
+        let mut counted = CountedCredits::new();
+        let mut available = 0_usize;
+        for credit in self
+            .credits
+            .iter()
+            .filter(|credit| credit_identity_is_available(credit))
+        {
+            available += 1;
+            *counted
+                .entry((&credit.id, &credit.reset_type, credit.expires_at))
+                .or_default() += 1;
+        }
+        (self.available_count > 0 && usize::try_from(self.available_count).ok() == Some(available))
+            .then_some(counted)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,6 +131,16 @@ pub(super) enum DelayedDecision {
     Discard,
 }
 
+impl DelayedDecision {
+    const fn diagnostic_code(self) -> &'static str {
+        match self {
+            Self::Publish => "publish",
+            Self::Retain => "retain",
+            Self::Discard => "discard",
+        }
+    }
+}
+
 mod diagnostics;
 use diagnostics::{ResetDiagnosticReason, log_reset_diagnostic};
 
@@ -100,7 +148,7 @@ use diagnostics::{ResetDiagnosticReason, log_reset_diagnostic};
 enum ResetCreditEvidence {
     None,
     Consumed,
-    NoAvailableCredits,
+    NoInventoryToPreserve,
 }
 
 pub(super) fn scope_key(account_id: Option<&str>, auth_path: &Path) -> String {
@@ -126,6 +174,11 @@ pub(super) fn load(scope: &str) -> AccountState {
     if file.version != STATE_VERSION {
         return AccountState::default();
     }
+    account_state(file, scope)
+}
+
+/// The stored state for one account scope. Other scopes never leak in.
+fn account_state(file: StateFile, scope: &str) -> AccountState {
     file.accounts.get(scope).cloned().unwrap_or_default()
 }
 
@@ -204,6 +257,7 @@ pub(super) fn inventory(
     Some(CreditInventory {
         available_count: reset.available_count,
         credits,
+        observed_at: reset.observed_at.unwrap_or(observed_at),
     })
 }
 
@@ -242,6 +296,13 @@ pub(super) fn initial_decision(
     exact_oauth: bool,
     observed_at: DateTime<Utc>,
 ) -> InitialDecision {
+    if exact_oauth && plan_changed(state, current) {
+        // A new subscription has its own quota baseline, not evidence of a
+        // reset on the previous plan: drop the stored weekly window, pending
+        // candidate, and credit inventory so the old plan cannot be pinned.
+        log_reset_diagnostic("planBaseline", "reset", ResetDiagnosticReason::PlanChanged);
+        *state = AccountState::default();
+    }
     if let Some(candidate) = state.candidate.clone() {
         match delayed_candidate_decision(
             state,
@@ -323,7 +384,12 @@ pub(super) fn confirmation_decision(
     if confirmation_weekly.used_percent > RESET_THRESHOLD {
         return ConfirmationDecision::Publish;
     }
-    if initial_weekly.used_percent > RESET_THRESHOLD {
+    // A near-zero reading is only trusted when both observations report the
+    // same plan; a plan flip between them is not a confirmation.
+    if initial_weekly.used_percent > RESET_THRESHOLD
+        || normalized_plan(initial.login_method.as_deref())
+            != normalized_plan(confirmation.login_method.as_deref())
+    {
         return ConfirmationDecision::Preserve;
     }
 
@@ -331,9 +397,12 @@ pub(super) fn confirmation_decision(
         return ConfirmationDecision::Publish;
     };
     let credit_evidence = reset_credit_evidence(
-        state.credit_inventory.as_ref(),
+        state,
+        initial,
         initial_inventory,
+        confirmation,
         confirmation_inventory,
+        exact_oauth,
         observed_at,
     );
     if let Some(previous_boundary) = previous_weekly.resets_at {
@@ -344,6 +413,7 @@ pub(super) fn confirmation_decision(
             maybe_store_delayed_candidate(
                 state,
                 initial,
+                initial_inventory,
                 confirmation,
                 confirmation_inventory,
                 exact_oauth,
@@ -362,6 +432,7 @@ pub(super) fn confirmation_decision(
                 maybe_store_delayed_candidate(
                     state,
                     initial,
+                    initial_inventory,
                     confirmation,
                     confirmation_inventory,
                     exact_oauth,
@@ -377,6 +448,7 @@ pub(super) fn confirmation_decision(
 fn maybe_store_delayed_candidate(
     state: &mut AccountState,
     initial: &UsageSnapshot,
+    initial_inventory: Option<&CreditInventory>,
     confirmation: &UsageSnapshot,
     confirmation_inventory: Option<&CreditInventory>,
     exact_oauth: bool,
@@ -422,30 +494,15 @@ fn maybe_store_delayed_candidate(
         );
         return;
     };
-    let Some(previous_inventory) = state.credit_inventory.as_ref() else {
-        log_reset_diagnostic(
-            "candidateCreation",
-            "rejected",
-            ResetDiagnosticReason::MissingCreditInventory,
-        );
-        return;
-    };
-    let Some(confirmation_inventory) = confirmation_inventory else {
-        log_reset_diagnostic(
-            "candidateCreation",
-            "rejected",
-            ResetDiagnosticReason::MissingCreditInventory,
-        );
-        return;
-    };
-    if previous_inventory.available_count == 0 || previous_inventory != confirmation_inventory {
-        log_reset_diagnostic(
-            "candidateCreation",
-            "rejected",
-            ResetDiagnosticReason::ChangedCreditInventory,
-        );
+    if let Some(reason) =
+        positive_inventory_rejection(state, initial_inventory, confirmation_inventory)
+    {
+        log_reset_diagnostic("candidateCreation", "rejected", reason);
         return;
     }
+    let Some(confirmation_inventory) = confirmation_inventory else {
+        return;
+    };
     if !supported_delayed_boundary(previous_weekly, initial_weekly)
         || !supported_delayed_boundary(previous_weekly, confirmation_weekly)
     {
@@ -490,133 +547,84 @@ fn delayed_candidate_decision(
     exact_oauth: bool,
     observed_at: DateTime<Utc>,
 ) -> DelayedDecision {
+    let (decision, reason) = delayed_candidate_evaluation(
+        state,
+        candidate,
+        current,
+        current_inventory,
+        exact_oauth,
+        observed_at,
+    );
+    log_reset_diagnostic("delayedCandidate", decision.diagnostic_code(), reason);
+    decision
+}
+
+/// Pure delayed-candidate revalidation: the decision plus the fixed reason
+/// code that `delayed_candidate_decision` logs (upstream `DelayedEvaluation`).
+fn delayed_candidate_evaluation(
+    state: &AccountState,
+    candidate: &DelayedCandidate,
+    current: &UsageSnapshot,
+    current_inventory: Option<&CreditInventory>,
+    exact_oauth: bool,
+    observed_at: DateTime<Utc>,
+) -> (DelayedDecision, ResetDiagnosticReason) {
+    use DelayedDecision::{Discard, Publish, Retain};
+    use ResetDiagnosticReason as Reason;
+
     let age = observed_at
         .signed_duration_since(candidate.created_at)
         .num_seconds();
     if candidate.evidence_version != EVIDENCE_VERSION {
-        log_reset_diagnostic(
-            "delayedCandidate",
-            "discard",
-            ResetDiagnosticReason::EvidenceVersionMismatch,
-        );
-        return DelayedDecision::Discard;
+        return (Discard, Reason::EvidenceVersionMismatch);
     }
     if age < 0 {
-        log_reset_diagnostic(
-            "delayedCandidate",
-            "discard",
-            ResetDiagnosticReason::FutureCandidate,
-        );
-        return DelayedDecision::Discard;
+        return (Discard, Reason::FutureCandidate);
     }
     if age > CANDIDATE_MAXIMUM_AGE_SECONDS {
-        log_reset_diagnostic(
-            "delayedCandidate",
-            "discard",
-            ResetDiagnosticReason::ExpiredCandidate,
-        );
-        return DelayedDecision::Discard;
+        return (Discard, Reason::ExpiredCandidate);
     }
     if !exact_oauth {
-        log_reset_diagnostic(
-            "delayedCandidate",
-            "discard",
-            ResetDiagnosticReason::SourceNotExactOAuth,
-        );
-        return DelayedDecision::Discard;
+        return (Discard, Reason::SourceNotExactOAuth);
     }
     let Some(previous_weekly) = state.published_weekly.as_ref() else {
-        log_reset_diagnostic(
-            "delayedCandidate",
-            "discard",
-            ResetDiagnosticReason::MissingPreviousSnapshot,
-        );
-        return DelayedDecision::Discard;
+        return (Discard, Reason::MissingPreviousSnapshot);
     };
     let Some(current_weekly) = weekly(current) else {
         // Credits-only refreshes do not carry the weekly window (or necessarily
         // the plan/inventory fields). Preserve the candidate and let the next
         // complete usage observation validate it.
-        log_reset_diagnostic(
-            "delayedCandidate",
-            "retain",
-            ResetDiagnosticReason::MissingWeeklyWindow,
-        );
-        return DelayedDecision::Retain;
+        return (Retain, Reason::MissingWeeklyWindow);
     };
     if !plans_match(state.plan.as_deref(), current, current) {
-        log_reset_diagnostic(
-            "delayedCandidate",
-            "discard",
-            ResetDiagnosticReason::PlanMismatch,
-        );
-        return DelayedDecision::Discard;
+        return (Discard, Reason::PlanMismatch);
     }
     if previous_weekly.used_percent <= RESET_THRESHOLD
         || current_weekly.used_percent > RESET_THRESHOLD
     {
-        log_reset_diagnostic(
-            "delayedCandidate",
-            "discard",
-            ResetDiagnosticReason::ResetThresholdMismatch,
-        );
-        return DelayedDecision::Discard;
+        return (Discard, Reason::ResetThresholdMismatch);
     }
     if current.updated_at <= candidate.snapshot_updated_at {
-        log_reset_diagnostic(
-            "delayedCandidate",
-            "discard",
-            ResetDiagnosticReason::StaleObservation,
-        );
-        return DelayedDecision::Discard;
+        return (Discard, Reason::StaleObservation);
     }
     if !is_valid_boundary(current_weekly, current.updated_at) {
-        log_reset_diagnostic(
-            "delayedCandidate",
-            "discard",
-            ResetDiagnosticReason::InvalidResetBoundary,
-        );
-        return DelayedDecision::Discard;
+        return (Discard, Reason::InvalidResetBoundary);
     }
-    if boundary_distance_seconds(&candidate.weekly, current_weekly).abs() >= RESET_TOLERANCE_SECONDS
-    {
-        log_reset_diagnostic(
-            "delayedCandidate",
-            "discard",
-            ResetDiagnosticReason::InconsistentResetBoundary,
-        );
-        return DelayedDecision::Discard;
+    if !delayed_boundaries_consistent(candidate, current_weekly, current.updated_at) {
+        return (Discard, Reason::InconsistentResetBoundary);
     }
     if !supported_delayed_boundary(previous_weekly, current_weekly) {
-        log_reset_diagnostic(
-            "delayedCandidate",
-            "discard",
-            ResetDiagnosticReason::UnsupportedResetBoundary,
-        );
-        return DelayedDecision::Discard;
+        return (Discard, Reason::UnsupportedResetBoundary);
     }
-    if current_inventory != Some(&candidate.inventory) {
-        log_reset_diagnostic(
-            "delayedCandidate",
-            "discard",
-            ResetDiagnosticReason::ChangedCreditInventory,
-        );
-        return DelayedDecision::Discard;
+    if let Some(reason) =
+        positive_inventory_rejection(state, Some(&candidate.inventory), current_inventory)
+    {
+        return (Discard, reason);
     }
     if age >= CANDIDATE_MINIMUM_AGE_SECONDS {
-        log_reset_diagnostic(
-            "delayedCandidate",
-            "publish",
-            ResetDiagnosticReason::ConfirmedObservation,
-        );
-        DelayedDecision::Publish
+        (Publish, Reason::ConfirmedObservation)
     } else {
-        log_reset_diagnostic(
-            "delayedCandidate",
-            "retain",
-            ResetDiagnosticReason::MinimumDelay,
-        );
-        DelayedDecision::Retain
+        (Retain, Reason::MinimumDelay)
     }
 }
 
@@ -628,7 +636,9 @@ pub(super) fn commit_publication(
     if let Some(weekly) = weekly(snapshot) {
         state.published_weekly = Some(weekly.clone());
         state.published_at = snapshot.updated_at;
-        state.plan = snapshot.login_method.clone();
+        if normalized_plan(snapshot.login_method.as_deref()).is_some() {
+            state.plan = snapshot.login_method.clone();
+        }
         state.credit_inventory = inventory;
         state.candidate = None;
     }
@@ -642,7 +652,10 @@ pub(super) fn preserve_weekly(state: &AccountState, mut current: UsageSnapshot) 
 }
 
 fn weekly(snapshot: &UsageSnapshot) -> Option<&RateWindow> {
-    snapshot.secondary.as_ref()
+    snapshot
+        .secondary
+        .as_ref()
+        .filter(|window| window.usage_known())
 }
 
 fn is_valid_boundary(window: &RateWindow, captured_at: DateTime<Utc>) -> bool {
@@ -662,36 +675,147 @@ fn boundary_moves_backward(previous: &RateWindow, current: &RateWindow) -> bool 
     boundary_distance_seconds(previous, current) < -RESET_TOLERANCE_SECONDS
 }
 
+/// Delayed confirmation accepts equivalent boundaries, or an unused rolling
+/// weekly window whose reset date advances with each zero-use observation.
+fn delayed_boundaries_consistent(
+    candidate: &DelayedCandidate,
+    current_weekly: &RateWindow,
+    current_updated_at: DateTime<Utc>,
+) -> bool {
+    if boundary_distance_seconds(&candidate.weekly, current_weekly).abs() < RESET_TOLERANCE_SECONDS
+    {
+        return true;
+    }
+    let (Some(candidate_boundary), Some(current_boundary)) =
+        (candidate.weekly.resets_at, current_weekly.resets_at)
+    else {
+        return false;
+    };
+    is_unused_rolling_weekly(&candidate.weekly, candidate.snapshot_updated_at)
+        && is_unused_rolling_weekly(current_weekly, current_updated_at)
+        && current_boundary >= candidate_boundary
+}
+
+/// Zero usage, a seven-day window, and a reset within two minutes of one full
+/// week after capture. Compared at full timestamp precision, like upstream's
+/// floating-point interval check, so sub-second capture skew cannot flip the
+/// two-minute edge.
+fn is_unused_rolling_weekly(window: &RateWindow, captured_at: DateTime<Utc>) -> bool {
+    window.used_percent == 0.0
+        && window.window_minutes == Some(WEEKLY_WINDOW_MINUTES)
+        && window.resets_at.is_some_and(|boundary| {
+            let offset = boundary.signed_duration_since(captured_at)
+                - chrono::TimeDelta::seconds(WEEKLY_WINDOW_SECONDS);
+            offset.abs() < chrono::TimeDelta::seconds(RESET_TOLERANCE_SECONDS)
+        })
+}
+
 fn supported_delayed_boundary(previous: &RateWindow, current: &RateWindow) -> bool {
     let distance = boundary_distance_seconds(previous, current);
     distance.abs() < STABLE_BOUNDARY_TOLERANCE_SECONDS || distance >= RESET_TOLERANCE_SECONDS
 }
 
+fn normalized_plan(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_lowercase)
+}
+
+/// True only when the stored and fresh plans are both known and differ;
+/// an unknown plan never resets the baseline.
+fn plan_changed(state: &AccountState, current: &UsageSnapshot) -> bool {
+    if current.updated_at <= state.published_at {
+        return false;
+    }
+    match (
+        normalized_plan(state.plan.as_deref()),
+        normalized_plan(current.login_method.as_deref()),
+    ) {
+        (Some(previous), Some(current)) => previous != current,
+        _ => false,
+    }
+}
+
 fn plans_match(previous: Option<&str>, left: &UsageSnapshot, right: &UsageSnapshot) -> bool {
-    let normalize = |value: Option<&str>| {
-        value
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_lowercase)
-    };
-    let previous = normalize(previous);
-    let left = normalize(left.login_method.as_deref());
-    let right = normalize(right.login_method.as_deref());
+    let previous = normalized_plan(previous);
+    let left = normalized_plan(left.login_method.as_deref());
+    let right = normalized_plan(right.login_method.as_deref());
     previous.is_some() && previous == left && left == right
 }
 
-fn reset_credit_evidence(
-    previous: Option<&CreditInventory>,
+/// Upstream `positiveCreditInventoryRejection`: the stored inventory (when
+/// known) and both fresh inventories are complete, positive, observed in
+/// order, and list the same available credits. Without a stored inventory the
+/// fresh ones must also be observed after the last published usage.
+fn positive_inventory_rejection(
+    state: &AccountState,
     initial: Option<&CreditInventory>,
     confirmation: Option<&CreditInventory>,
+) -> Option<ResetDiagnosticReason> {
+    let (Some(initial), Some(confirmation)) = (initial, confirmation) else {
+        return Some(ResetDiagnosticReason::MissingCreditInventory);
+    };
+    let inventories = match state.credit_inventory.as_ref() {
+        Some(previous) => vec![previous, initial, confirmation],
+        None if initial.observed_at > state.published_at
+            && confirmation.observed_at > state.published_at =>
+        {
+            vec![initial, confirmation]
+        }
+        None => return Some(ResetDiagnosticReason::NonMonotonicCreditObservationTime),
+    };
+    if inventories
+        .windows(2)
+        .any(|pair| pair[1].observed_at < pair[0].observed_at)
+    {
+        return Some(ResetDiagnosticReason::NonMonotonicCreditObservationTime);
+    }
+    let Some(counted) = inventories
+        .iter()
+        .map(|inventory| inventory.positive_available_credits())
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Some(ResetDiagnosticReason::InconsistentAvailableCreditCount);
+    };
+    (!counted.windows(2).all(|pair| pair[0] == pair[1]))
+        .then_some(ResetDiagnosticReason::ChangedCreditInventory)
+}
+
+fn reset_credit_evidence(
+    state: &AccountState,
+    initial: &UsageSnapshot,
+    initial_inventory: Option<&CreditInventory>,
+    confirmation: &UsageSnapshot,
+    confirmation_inventory: Option<&CreditInventory>,
+    exact_oauth: bool,
     observed_at: DateTime<Utc>,
 ) -> ResetCreditEvidence {
-    let (Some(previous), Some(initial), Some(confirmation)) = (previous, initial, confirmation)
-    else {
+    let Some(previous) = state.credit_inventory.as_ref() else {
+        // Missing history cannot prove consumption, but matching fresh
+        // inventories can corroborate an advanced reset. The state is
+        // account-scoped, so account compatibility is implied.
+        let corroborated = exact_oauth
+            && plans_match(state.plan.as_deref(), initial, confirmation)
+            && positive_inventory_rejection(state, initial_inventory, confirmation_inventory)
+                .is_none();
+        return if corroborated {
+            ResetCreditEvidence::NoInventoryToPreserve
+        } else {
+            ResetCreditEvidence::None
+        };
+    };
+    let (Some(initial), Some(confirmation)) = (initial_inventory, confirmation_inventory) else {
         return ResetCreditEvidence::None;
     };
+    if initial.observed_at < previous.observed_at || confirmation.observed_at < initial.observed_at
+    {
+        return ResetCreditEvidence::None;
+    }
+    // An observed zero-credit inventory had no manual reset credit to consume;
+    // the two consistent fresh observations are the only reset signal left.
     if previous.available_count == 0 {
-        return ResetCreditEvidence::NoAvailableCredits;
+        return ResetCreditEvidence::NoInventoryToPreserve;
     }
     for prior in &previous.credits {
         let consumed_in = |current: &CreditInventory| {

@@ -1,6 +1,91 @@
 use super::*;
 use chrono::TimeZone;
 
+pub(super) fn billing_response_with_percent(percent: f32) -> Vec<u8> {
+    let mut payload = vec![0x0a, 0x05, 0x0d];
+    payload.extend(percent.to_le_bytes());
+
+    let mut response = vec![0x00];
+    response.extend(
+        u32::try_from(payload.len())
+            .expect("test gRPC-web payload length fits u32")
+            .to_be_bytes(),
+    );
+    response.extend(payload);
+    response
+}
+
+#[tokio::test]
+async fn billing_request_encodes_explicit_false_in_a_nonempty_grpc_web_frame() {
+    let mut server = mockito::Server::new_async().await;
+    let endpoint = format!("{}/billing", server.url());
+    let request = server
+        .mock("POST", "/billing")
+        .match_body(BILLING_REQUEST_BODY.to_vec())
+        .with_status(200)
+        .with_body(billing_response_with_percent(37.0))
+        .create_async()
+        .await;
+    let provider = GrokProvider::new().with_billing_endpoint_for_tests(endpoint);
+
+    let snapshot = provider
+        .fetch_billing(Some("Bearer local-token".to_string()), None)
+        .await
+        .unwrap();
+
+    request.assert_async().await;
+    assert_eq!(BILLING_REQUEST_BODY, [0, 0, 0, 0, 2, 0x08, 0]);
+    assert_eq!(snapshot.used_percent, Some(37.0));
+}
+
+#[tokio::test]
+async fn oauth_billing_auth_failure_falls_back_to_configured_local_token() {
+    let mut server = mockito::Server::new_async().await;
+    let endpoint = format!("{}/billing", server.url());
+    let rejected = server
+        .mock("POST", "/billing")
+        .match_header("authorization", "Bearer expired-token")
+        .match_body(BILLING_REQUEST_BODY.to_vec())
+        .with_status(401)
+        .create_async()
+        .await;
+    let fallback = server
+        .mock("POST", "/billing")
+        .match_header("authorization", "Bearer local-token")
+        .match_body(BILLING_REQUEST_BODY.to_vec())
+        .with_status(200)
+        .with_body(billing_response_with_percent(42.0))
+        .create_async()
+        .await;
+    // The credits proxy is unavailable, so both tokens use the gRPC-web path.
+    let proxy = server
+        .mock("GET", "/credits")
+        .with_status(500)
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    let provider = GrokProvider::new()
+        .with_billing_endpoint_for_tests(endpoint)
+        .with_credits_proxy_endpoint_for_tests(format!("{}/credits", server.url()));
+    let credentials = GrokCredentials::from_bearer("expired-token");
+    let context = FetchContext {
+        include_credits: false,
+        api_key: Some("local-token".to_string()),
+        ..FetchContext::default()
+    };
+
+    let result = provider
+        .fetch_with_oauth_fallback(&credentials, &context)
+        .await
+        .unwrap();
+
+    proxy.assert_async().await;
+    rejected.assert_async().await;
+    fallback.assert_async().await;
+    assert_eq!(result.source_label, "grok-oauth");
+    assert_eq!(result.usage.primary.used_percent, 42.0);
+}
+
 #[test]
 fn grok_plan_prefers_subscription_tier_display_names() {
     assert_eq!(
@@ -52,10 +137,57 @@ fn cli_and_oauth_select_distinct_auth_entries() {
     );
 }
 #[test]
+fn auto_tries_switched_login_before_cookies() {
+    assert_eq!(
+        grok_auto_steps(true, true, true),
+        vec![
+            GrokAutoStep::AmbientOAuth,
+            GrokAutoStep::AmbientCli,
+            GrokAutoStep::ApiKey,
+            GrokAutoStep::ManualCookie,
+            GrokAutoStep::CookieRefresh,
+        ]
+    );
+    assert_eq!(
+        grok_auto_steps(false, false, true),
+        vec![
+            GrokAutoStep::AmbientOAuth,
+            GrokAutoStep::AmbientCli,
+            GrokAutoStep::CookieRefresh,
+        ]
+    );
+    assert_eq!(
+        grok_auto_steps(false, false, false),
+        vec![GrokAutoStep::AmbientOAuth, GrokAutoStep::AmbientCli]
+    );
+    assert_eq!(
+        grok_auto_steps(true, true, false),
+        vec![
+            GrokAutoStep::AmbientOAuth,
+            GrokAutoStep::AmbientCli,
+            GrokAutoStep::ApiKey,
+            GrokAutoStep::ManualCookie,
+        ]
+    );
+}
+
+#[test]
 fn cookie_refresh_uses_cache_when_present() {
     assert_eq!(
         cookie_refresh_action(true, None),
         CookieRefreshAction::UseCached
+    );
+}
+
+#[test]
+fn auto_uses_explicit_cookie_without_importing_browser_cookies() {
+    assert_eq!(
+        grok_auto_steps(false, true, false),
+        vec![
+            GrokAutoStep::AmbientOAuth,
+            GrokAutoStep::AmbientCli,
+            GrokAutoStep::ManualCookie,
+        ]
     );
 }
 
@@ -88,6 +220,22 @@ fn is_cookie_auth_failure_only_auth_required() {
 }
 
 #[test]
+fn include_credits_false_does_not_start_reset_lookup() {
+    let ctx = FetchContext {
+        include_credits: false,
+        ..FetchContext::default()
+    };
+
+    let lookup = GrokProvider::spawn_remaining_resets(
+        &ctx,
+        None,
+        None,
+        crate::providers::grok::GrokProvider::new().client_for_tests(),
+    );
+    assert!(lookup.task.is_none());
+}
+
+#[test]
 fn cookie_billing_stays_siloed_from_auth_file_identity() {
     let result = result_from_cookie_billing(GrokBillingSnapshot {
         used_percent: Some(23.0),
@@ -95,6 +243,7 @@ fn cookie_billing_stays_siloed_from_auth_file_identity() {
         used_percent_is_implicit_zero: false,
         resets_at: None,
         window_minutes: None,
+        product_usage: Vec::new(),
     });
     assert_eq!(result.source_label, "grok-browser");
     assert!(result.usage.account_email.is_none());
@@ -112,6 +261,7 @@ fn billing_snapshot_uses_full_weekly_cycle_for_pace() {
             used_percent_is_implicit_zero: false,
             resets_at: Some(resets),
             window_minutes: Some(crate::core::WEEKLY_WINDOW_MINUTES),
+            product_usage: Vec::new(),
         },
         "web",
         None,
@@ -127,6 +277,7 @@ fn billing_snapshot_uses_full_weekly_cycle_for_pace() {
         &result.usage.primary,
         Some(now),
         crate::core::WEEKLY_WINDOW_MINUTES,
+        None,
     );
     assert!(pace.is_some(), "weekly window + reset must yield pace");
 }
@@ -143,6 +294,7 @@ fn monthly_cycle_stays_monthly_with_six_days_remaining() {
             used_percent_is_implicit_zero: false,
             resets_at: Some(resets),
             window_minutes: Some(monthly_minutes),
+            product_usage: Vec::new(),
         },
         "cli",
         None,
@@ -163,6 +315,7 @@ fn reset_distance_alone_does_not_invent_a_cadence() {
             used_percent_is_implicit_zero: false,
             resets_at: Some(resets),
             window_minutes: None,
+            product_usage: Vec::new(),
         },
         "web",
         None,
@@ -183,6 +336,7 @@ fn period_only_billing_is_informational_not_zero_usage() {
             used_percent_is_implicit_zero: false,
             resets_at: Some(resets),
             window_minutes: None,
+            product_usage: Vec::new(),
         },
         "cli",
         Some("user@example.com".into()),
@@ -211,6 +365,7 @@ fn unpublished_zero_does_not_reach_the_usage_surface() {
             used_percent_is_implicit_zero: false,
             resets_at: Some(Utc.timestamp_opt(1_789_000_000, 0).single().unwrap()),
             window_minutes: None,
+            product_usage: Vec::new(),
         },
         "grok-web",
         None,
@@ -219,4 +374,26 @@ fn unpublished_zero_does_not_reach_the_usage_surface() {
     );
 
     assert!(result.usage.primary.is_informational);
+}
+
+#[test]
+fn account_usage_marks_informational_windows_unavailable() {
+    let result = result_from_billing(
+        GrokBillingSnapshot {
+            used_percent: None,
+            used_percent_is_wire_published: false,
+            used_percent_is_implicit_zero: false,
+            resets_at: None,
+            window_minutes: Some(crate::core::WEEKLY_WINDOW_MINUTES),
+            product_usage: Vec::new(),
+        },
+        "grok-cli",
+        None,
+        None,
+        Some("SuperGrok".into()),
+    );
+
+    let usage = account_usage_from_result(&result);
+    assert!(!usage.usage_available);
+    assert_eq!(usage.used_percent, None);
 }

@@ -10,9 +10,16 @@
 //! `GET /dashboard/v1/snapshot` serves the stable dashboard-v1 JSON contract
 //! behind the same bearer gate + `Cache-Control: no-store` (+ `WWW-Authenticate`
 //! on its 401s, per pinned upstream).
+//! Upstream `--request-timeout`: `/usage` and `/cost` answer within the
+//! configured seconds (timed-out providers become rows, then 504); see
+//! [`data`]. Off by default here, because this port has no response cache to
+//! serve a late result from.
 
+pub(crate) mod collection;
 pub mod dashboard;
 mod data;
+mod metrics;
+mod operations;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,6 +53,9 @@ const HEAD_READ_TIMEOUT: Duration = Duration::from_millis(10_000);
 /// immediately without a response. Upstream 0.48.0 `maximumConnections = 16`.
 const MAX_CONNECTIONS: usize = 16;
 
+/// Largest accepted `--request-timeout`, in seconds (upstream: one day).
+const MAX_REQUEST_TIMEOUT_SECS: f64 = 86_400.0;
+
 /// Why assembling a request head failed. Every variant maps to a single
 /// 400 Bad Request + close (upstream `.invalidRequest`); nothing is parsed,
 /// authenticated, or routed on a failed head.
@@ -74,9 +84,26 @@ pub struct ServeArgs {
     #[arg(long = "refresh-interval", default_value = "60")]
     pub refresh_interval: u64,
 
-    /// Bearer token for /usage and /cost (prefer CODEXBAR_DASHBOARD_TOKEN)
+    /// Seconds a /usage or /cost request may take. A provider still running
+    /// at 0.8 of it becomes a "timed out" row (its fetch carries on for the
+    /// next request); past the whole timeout the route answers 504. 0, the
+    /// default, waits for every provider. Capped at 86400.
+    #[arg(
+        long = "request-timeout",
+        default_value = "0",
+        value_name = "SECONDS",
+        allow_negative_numbers = true
+    )]
+    pub request_timeout: f64,
+
+    /// Bearer token for data, dashboard snapshot, and enabled metrics routes
+    /// (prefer CODEXBAR_DASHBOARD_TOKEN)
     #[arg(long = "dashboard-token", env = "CODEXBAR_DASHBOARD_TOKEN")]
     pub dashboard_token: Option<String>,
+
+    /// Enable the Prometheus text endpoint at /metrics
+    #[arg(long = "metrics", default_value_t = false)]
+    pub metrics: bool,
 
     /// Accept sending the dashboard token over cleartext HTTP on a non-loopback host
     #[arg(long = "allow-plain-http", default_value_t = false)]
@@ -95,6 +122,7 @@ struct ServeConfig {
     host: String,
     port: u16,
     token_digest: Option<[u8; 32]>,
+    metrics_enabled: bool,
     /// Overall budget for reading one request head. Production uses
     /// [`HEAD_READ_TIMEOUT`]; tests inject a short budget (upstream 0.48.0
     /// #2684 makes the deadline injectable for exactly this reason).
@@ -105,6 +133,12 @@ struct ServeConfig {
     /// Dashboard state (coordinator + producer). Always `Some` from `run`;
     /// `None` only in pure-transport tests, where dashboard routes answer 503.
     dashboard: Option<dashboard::DashboardState>,
+    /// `/usage` and `/cost` request budget (`--request-timeout`); `None`
+    /// waits for every provider. The dashboard snapshot keeps its own
+    /// coordinator and is not bounded by it.
+    request_timeout: Option<Duration>,
+    /// In-flight `/usage` fetches and `/cost` scans, shared by all requests.
+    operations: data::DataOperations,
 }
 
 pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
@@ -123,10 +157,13 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         "CodexBar server listening on http://{}:{}",
         config.host, config.port
     );
+    if config.metrics_enabled {
+        eprintln!("Prometheus metrics enabled at /metrics");
+    }
     if !is_loopback_host(&config.host) {
         eprintln!(
-            "Warning: plain HTTP on a non-loopback host; the bearer token gating \
-             /usage and /cost crosses the network in cleartext on every request."
+            "Warning: plain HTTP on a non-loopback host; the bearer token for \
+             protected data routes crosses the network in cleartext."
         );
     }
 
@@ -187,6 +224,8 @@ fn validate_serve_args(args: &ServeArgs) -> anyhow::Result<ServeConfig> {
         None => None,
     };
 
+    let request_timeout = request_timeout_from_secs(args.request_timeout)?;
+
     let token = resolve_dashboard_token(args.dashboard_token.as_deref())?;
     if let Some(err) = validate_serve_startup(&host, token.is_some(), args.allow_plain_http) {
         anyhow::bail!("{err}");
@@ -196,10 +235,24 @@ fn validate_serve_args(args: &ServeArgs) -> anyhow::Result<ServeConfig> {
         host,
         port: args.port,
         token_digest: token.as_ref().map(|t| sha256_digest(t.as_bytes())),
+        metrics_enabled: args.metrics,
         head_read_budget: HEAD_READ_TIMEOUT,
         identity,
         dashboard: None,
+        request_timeout,
+        operations: data::DataOperations::default(),
     })
+}
+
+/// `--request-timeout` (upstream `decodeServeRequestTimeout` and
+/// `clampedServeRequestTimeout`): finite and zero or greater, capped at one
+/// day. Zero turns the deadline off.
+fn request_timeout_from_secs(secs: f64) -> anyhow::Result<Option<Duration>> {
+    if !secs.is_finite() || secs < 0.0 {
+        anyhow::bail!("--request-timeout must be zero or greater.");
+    }
+    let secs = secs.min(MAX_REQUEST_TIMEOUT_SECS);
+    Ok((secs > 0.0).then(|| Duration::from_secs_f64(secs)))
 }
 
 fn resolve_dashboard_token(cli_token: Option<&str>) -> anyhow::Result<Option<String>> {
@@ -435,6 +488,8 @@ enum ServeRoute {
     Cost {
         provider: Option<String>,
     },
+    /// `GET /metrics` — optional Prometheus text exposition endpoint.
+    Metrics,
     /// `GET /dashboard/v1/snapshot` — stable dashboard-v1 JSON contract.
     DashboardSnapshot,
 }
@@ -446,6 +501,7 @@ fn resolve_route(request: &ServeRequest) -> Option<ServeRoute> {
         "/health" => Some(ServeRoute::Health),
         "/usage" => Some(ServeRoute::Usage { provider }),
         "/cost" => Some(ServeRoute::Cost { provider }),
+        "/metrics" => Some(ServeRoute::Metrics),
         "/dashboard/v1/snapshot" => Some(ServeRoute::DashboardSnapshot),
         path if path.starts_with("/icons/") && path.ends_with(".svg") => {
             let name = &path["/icons/".len()..path.len() - ".svg".len()];
@@ -463,6 +519,25 @@ fn resolve_route(request: &ServeRequest) -> Option<ServeRoute> {
 
 fn unauthorized_response() -> String {
     json_response(401, serde_json::json!({ "error": "unauthorized" }))
+}
+
+/// Run a data route, answering 504 once `deadline` passes (upstream
+/// `serveTimeoutResponse`). Provider work already started keeps running in
+/// the route's operations; with no deadline the route runs to completion.
+async fn within_request_deadline(
+    deadline: Option<tokio::time::Instant>,
+    response: impl Future<Output = String>,
+) -> String {
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, response)
+            .await
+            .unwrap_or_else(|_| request_timeout_response()),
+        None => response.await,
+    }
+}
+
+fn request_timeout_response() -> String {
+    json_response(504, serde_json::json!({ "error": "request timed out" }))
 }
 
 /// Upstream: dashboard-route 401s advertise the bearer scheme.
@@ -503,7 +578,12 @@ async fn route_request(request: &ServeRequest, config: &ServeConfig) -> String {
             ) {
                 return unauthorized_response();
             }
-            data::usage_response(provider.as_deref()).await
+            let budget = data::RequestBudget::start(config.request_timeout);
+            within_request_deadline(
+                budget.request_deadline(),
+                data::usage_response(provider.as_deref(), budget, &config.operations),
+            )
+            .await
         }
         ServeRoute::Cost { provider } => {
             if !authorize_request(
@@ -512,7 +592,33 @@ async fn route_request(request: &ServeRequest, config: &ServeConfig) -> String {
             ) {
                 return unauthorized_response();
             }
-            data::cost_response(provider.as_deref()).await
+            let budget = data::RequestBudget::start(config.request_timeout);
+            within_request_deadline(
+                budget.request_deadline(),
+                data::cost_response(provider.as_deref(), budget, &config.operations),
+            )
+            .await
+        }
+        ServeRoute::Metrics => {
+            if !config.metrics_enabled {
+                return json_response(404, serde_json::json!({ "error": "not found" }));
+            }
+            if !authorize_request(
+                request.authorization.as_deref(),
+                config.token_digest.as_ref(),
+            ) {
+                return unauthorized_dashboard_response();
+            }
+            match &config.dashboard {
+                Some(state) => {
+                    let snapshot = state.latest_metrics_snapshot();
+                    metrics::metrics_response(snapshot.as_deref())
+                }
+                None => json_response(
+                    500,
+                    serde_json::json!({ "error": "dashboard not configured" }),
+                ),
+            }
         }
         ServeRoute::DashboardSnapshot => {
             if !authorize_request(
@@ -693,6 +799,7 @@ fn http_response(
         405 => "Method Not Allowed",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
+        504 => "Gateway Timeout",
         _ => "Internal Server Error",
     };
     let extra = extra_headers

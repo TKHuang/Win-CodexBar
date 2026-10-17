@@ -5,44 +5,67 @@
     reason = "provider traits and helpers are shared across modules; not all are consumed in every build"
 )]
 
+use futures::{Stream, StreamExt};
+
 pub mod abacus;
+pub mod aerostack;
 pub mod aiand;
+pub mod aixy;
 pub mod alibaba;
 pub mod alibabatokenplan;
 pub mod amp;
 pub mod antigravity;
+pub mod atlascloud;
 pub mod augment;
 pub mod azureopenai;
 pub mod bedrock;
+pub mod bifrost;
+pub mod chart;
 pub mod chutes;
 pub mod claude;
+pub mod clawrouter;
 pub mod clinepass;
 pub mod codebuddy;
 pub mod codebuff;
+pub mod coderabbit;
 pub mod codex;
 pub mod commandcode;
 pub mod copilot;
-pub mod crof;
+pub mod cosmic;
 pub mod crossmodel;
 pub mod cursor;
 pub mod deepgram;
 pub mod deepinfra;
 pub mod deepseek;
 pub mod devin;
+pub mod devpass;
 pub mod doubao;
 pub mod elevenlabs;
+pub mod exa;
 pub mod factory;
+pub mod fal;
 pub mod fireworks;
+pub mod flora;
+pub(crate) mod format;
 pub mod gemini;
+pub mod gitkraken;
 pub mod grok;
 pub mod groq;
+pub mod helmcode;
+pub mod huggingface;
+pub mod hyper;
+pub mod ibmbob;
 pub mod infini;
 pub mod jetbrains;
 pub mod kilo;
 pub mod kimi;
 pub mod kimik2;
 pub mod kiro;
+pub mod langdock;
+pub mod linkup;
 pub mod litellm;
+pub mod lithosai;
+pub mod llmman;
 pub mod llmproxy;
 pub mod longcat;
 pub mod manus;
@@ -50,29 +73,47 @@ pub mod meta;
 pub mod mimo;
 pub mod minimax;
 pub mod mistral;
+pub mod muse;
+pub mod museai;
 pub mod nanogpt;
 pub mod neuralwatt;
 pub mod notion;
+pub mod nous;
 pub mod ollama;
 pub mod openai;
 pub mod openaiapi;
 pub mod opencode;
 pub mod opencodego;
 pub mod openrouter;
+pub mod parallel;
 pub mod perplexity;
+pub mod pi;
 pub mod poe;
 pub mod qoder;
 pub mod qwencloud;
+pub mod raycast;
+pub mod replicate;
+pub mod sailresearch;
 pub mod sakana;
+pub mod sofya;
 pub mod stepfun;
 pub mod sub2api;
+pub mod synthetic;
 pub mod t3chat;
+pub mod tavily;
+pub mod tinyapi;
+pub mod typesafe;
+pub mod v0;
 pub mod venice;
+pub mod vercel;
 pub mod vertexai;
 pub mod warp;
 pub mod wayfinder;
 pub mod windsurf;
+pub mod workbuddy;
 pub mod xai;
+pub mod xapi;
+pub mod xkiro;
 pub mod zai;
 pub mod zed;
 pub mod zenmux;
@@ -80,43 +121,62 @@ pub mod zoommate;
 
 // Re-export provider implementations
 pub use abacus::AbacusProvider;
+pub use aerostack::AerostackProvider;
 pub use aiand::AiAndProvider;
+pub use aixy::AixyProvider;
 pub use alibaba::{AlibabaProvider, AlibabaRegion};
 pub use alibabatokenplan::{AlibabaTokenPlanProvider, AlibabaTokenPlanRegion};
 pub use amp::AmpProvider;
 pub use antigravity::AntigravityProvider;
+pub use atlascloud::AtlasCloudProvider;
 pub use augment::AugmentProvider;
 pub use azureopenai::AzureOpenAIProvider;
 pub use bedrock::BedrockProvider;
+pub use bifrost::BifrostProvider;
 pub use chutes::ChutesProvider;
 pub use claude::ClaudeProvider;
+pub use clawrouter::ClawRouterProvider;
 pub use clinepass::ClinePassProvider;
 pub use codebuddy::CodeBuddyProvider;
 pub use codebuff::CodebuffProvider;
+pub use coderabbit::CodeRabbitProvider;
 pub use codex::CodexProvider;
 pub use commandcode::CommandCodeProvider;
 pub use copilot::CopilotProvider;
-pub use crof::CrofProvider;
+pub use cosmic::CosmicProvider;
 pub use crossmodel::CrossModelProvider;
 pub use cursor::CursorProvider;
 pub use deepgram::DeepgramProvider;
 pub use deepinfra::DeepInfraProvider;
 pub use deepseek::DeepSeekProvider;
 pub use devin::DevinProvider;
+pub use devpass::DevPassProvider;
 pub use doubao::DoubaoProvider;
 pub use elevenlabs::ElevenLabsProvider;
+pub use exa::ExaProvider;
 pub use factory::FactoryProvider;
+pub use fal::FalProvider;
 pub use fireworks::FireworksProvider;
+pub use flora::FloraProvider;
 pub use gemini::GeminiProvider;
+pub use gitkraken::GitKrakenProvider;
 pub use grok::GrokProvider;
 pub use groq::GroqProvider;
+pub use helmcode::HelmcodeProvider;
+pub use huggingface::HuggingFaceProvider;
+pub use hyper::HyperProvider;
+pub use ibmbob::IBMBobProvider;
 pub use infini::InfiniProvider;
 pub use jetbrains::JetBrainsProvider;
 pub use kilo::KiloProvider;
-pub use kimi::KimiProvider;
+pub use kimi::{KimiProvider, KimiRegion};
 pub use kimik2::KimiK2Provider;
 pub use kiro::KiroProvider;
+pub use langdock::LangdockProvider;
+pub use linkup::LinkupProvider;
 pub use litellm::LiteLLMProvider;
+pub use lithosai::LithosAIProvider;
+pub use llmman::LLMManProvider;
 pub use llmproxy::LLMProxyProvider;
 pub use longcat::LongCatProvider;
 pub use manus::ManusProvider;
@@ -124,56 +184,262 @@ pub use meta::MetaProvider;
 pub use mimo::MiMoProvider;
 pub use minimax::{MiniMaxProvider, MiniMaxRegion};
 pub use mistral::MistralProvider;
+pub use muse::MuseProvider;
+pub use museai::MuseAIProvider;
 pub use nanogpt::NanoGPTProvider;
 pub use neuralwatt::NeuralwattProvider;
 pub use notion::NotionProvider;
+pub use nous::NousProvider;
 pub use ollama::OllamaProvider;
 pub use openaiapi::OpenAIApiProvider;
 pub use opencode::OpenCodeProvider;
 pub use opencodego::OpenCodeGoProvider;
 pub use openrouter::OpenRouterProvider;
+pub use parallel::ParallelProvider;
 pub use perplexity::PerplexityProvider;
+pub use pi::PiProvider;
 pub use poe::PoeProvider;
 pub use qoder::QoderProvider;
 pub use qwencloud::QwenCloudProvider;
+pub use raycast::RaycastProvider;
+pub use replicate::ReplicateProvider;
+pub use sailresearch::SailResearchProvider;
 pub use sakana::SakanaProvider;
+pub use sofya::SofyaProvider;
 pub use stepfun::StepFunProvider;
 pub use sub2api::Sub2ApiProvider;
+pub use synthetic::SyntheticProvider;
 pub use t3chat::T3ChatProvider;
+pub use tavily::TavilyProvider;
+pub use tinyapi::TinyApiProvider;
+pub use typesafe::TypeSafeProvider;
+pub use v0::V0Provider;
 pub use venice::VeniceProvider;
+pub use vercel::VercelProvider;
 pub use vertexai::VertexAIProvider;
 pub use warp::WarpProvider;
 pub use wayfinder::WayfinderProvider;
 pub use windsurf::WindsurfProvider;
+pub use workbuddy::WorkBuddyProvider;
 pub use xai::XaiProvider;
+pub use xapi::XapiProvider;
+pub use xkiro::XKiroProvider;
 pub use zai::ZaiProvider;
 pub use zed::ZedProvider;
 pub use zenmux::ZenMuxProvider;
 pub use zoommate::ZoomMateProvider;
 
-/// Cookie header fallback for a provider fetch.
-///
-/// Always runs as [`ScanTrigger::AutomaticRefresh`], so it never reads a browser
-/// cookie store — it resolves to `NoCookies` unless the user imported cookies,
-/// in which case the shell passes them in and this fallback is not reached.
+/// True for hosts where plain HTTP is acceptable for a self-hosted gateway:
+/// `localhost`, `*.localhost`, and loopback, private or link-local IP literals.
+pub(crate) fn is_private_network_host(host: &str) -> bool {
+    use std::net::IpAddr;
+
+    if host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost") {
+        return true;
+    }
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let Ok(ip) = host.parse::<IpAddr>() else {
+        return false;
+    };
+    match ip {
+        IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
+        IpAddr::V6(ip) => {
+            ip.is_loopback() || ip.is_unique_local() || (ip.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum BoundedBodyError<E> {
+    TooLarge,
+    Read(E),
+}
+
+pub(crate) async fn read_bounded_response(
+    response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, BoundedBodyError<reqwest::Error>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(BoundedBodyError::TooLarge);
+    }
+    read_bounded_stream(response.bytes_stream(), max_bytes).await
+}
+
+async fn read_bounded_stream<S, B, E>(
+    stream: S,
+    max_bytes: usize,
+) -> Result<Vec<u8>, BoundedBodyError<E>>
+where
+    S: Stream<Item = Result<B, E>>,
+    B: AsRef<[u8]>,
+{
+    let mut stream = Box::pin(stream);
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(BoundedBodyError::Read)?;
+        let chunk = chunk.as_ref();
+        if chunk.len() > max_bytes.saturating_sub(body.len()) {
+            return Err(BoundedBodyError::TooLarge);
+        }
+        body.extend_from_slice(chunk);
+    }
+    Ok(body)
+}
+
 pub(crate) fn browser_cookie_header(
     domains: &[&str],
 ) -> Result<String, crate::core::ProviderError> {
-    crate::browser::cookies::get_cookie_header_for_domains(
+    crate::browser::cookies::get_cookie_header_for_domains(domains)
+        .map_err(map_browser_cookie_error)
+}
+
+/// Browser `Cookie` headers for `domains`, read one browser at a time.
+///
+/// A provider tries each header and asks for the next one only after the site
+/// rejects the previous session, so a browser holding stale cookies no longer
+/// hides a later browser's valid login, and browsers after an accepted session
+/// are never read. Yields nothing when the cookie source forbids browser
+/// import (`FetchContext::manual_cookie_missing`: an empty Manual source or
+/// Off). Callers handle a pasted `manual_cookie_header` themselves first.
+pub(crate) fn browser_cookie_sessions(
+    ctx: &crate::core::FetchContext,
+    domains: &[&str],
+) -> BrowserCookieSessions {
+    browser_cookie_sessions_from(
+        crate::browser::session_scan::SystemCookieStore,
+        ctx,
         domains,
-        crate::browser::cookies::ScanTrigger::AutomaticRefresh,
     )
-    .map_err(map_browser_cookie_error)
+}
+
+/// [`browser_cookie_sessions`] for a path that has no `FetchContext` because
+/// its caller already decided that browser import is allowed.
+pub(crate) fn unscoped_browser_cookie_sessions(domains: &[&str]) -> BrowserCookieSessions {
+    BrowserCookieSessions {
+        scan: Some(crate::browser::session_scan::BrowserCookieScan::new(domains).browser_major()),
+    }
+}
+
+pub(crate) fn browser_cookie_sessions_from<S: crate::browser::session_scan::BrowserCookieStore>(
+    store: S,
+    ctx: &crate::core::FetchContext,
+    domains: &[&str],
+) -> BrowserCookieSessions<S> {
+    BrowserCookieSessions {
+        scan: (!ctx.manual_cookie_missing).then(|| {
+            crate::browser::session_scan::BrowserCookieScan::with_store(store, domains)
+                .browser_major()
+        }),
+    }
+}
+
+pub(crate) struct BrowserCookieSessions<
+    S: crate::browser::session_scan::BrowserCookieStore =
+        crate::browser::session_scan::SystemCookieStore,
+> {
+    scan: Option<crate::browser::session_scan::BrowserCookieScan<S>>,
+}
+
+impl<S: crate::browser::session_scan::BrowserCookieStore> BrowserCookieSessions<S> {
+    /// Why no (further) browser session is available: `NoCookies` when no
+    /// browser holds cookies or import is disabled, otherwise a read error
+    /// such as App-Bound Encryption.
+    pub(crate) fn exhaustion_error(&self) -> crate::core::ProviderError {
+        self.scan
+            .as_ref()
+            .map_or(crate::core::ProviderError::NoCookies, |scan| {
+                map_browser_cookie_error(scan.exhaustion_error())
+            })
+    }
+}
+
+impl<S: crate::browser::session_scan::BrowserCookieStore> Iterator for BrowserCookieSessions<S> {
+    type Item = String;
+
+    fn next(&mut self) -> Option<String> {
+        self.scan
+            .as_mut()?
+            .next()
+            .map(|candidate| candidate.header())
+    }
+}
+
+pub(crate) fn browser_cookie_headers_for_domain(
+    domain: &str,
+) -> Result<Vec<(String, String)>, crate::core::ProviderError> {
+    crate::browser::cookies::get_cookie_headers_for_domain(domain)
+        .map(|candidates| {
+            candidates
+                .into_iter()
+                .map(|(browser, header)| (browser.display_name().to_string(), header))
+                .collect()
+        })
+        .map_err(map_browser_cookie_error)
+}
+
+pub(crate) fn browser_cookie_candidates_for_domain(
+    domain: &str,
+) -> Result<
+    Vec<(
+        crate::browser::detection::BrowserType,
+        Vec<crate::browser::cookies::Cookie>,
+    )>,
+    crate::core::ProviderError,
+> {
+    crate::browser::cookies::get_cookies_by_browser_for_domain(domain)
+        .map_err(map_browser_cookie_error)
+}
+
+/// All non-empty values for one cookie name in a `Cookie:` header, in order.
+/// Returns every value so callers can reject duplicates instead of silently
+/// picking the first.
+pub(crate) fn cookie_values<'a>(cookie_header: &'a str, name: &str) -> Vec<&'a str> {
+    cookie_header
+        .split(';')
+        .filter_map(|part| {
+            let (key, value) = part.trim().split_once('=')?;
+            (key.trim() == name)
+                .then_some(value.trim())
+                .filter(|value| !value.is_empty())
+        })
+        .collect()
+}
+
+/// Normalize a user-supplied `Cookie` header value at the shared provider boundary.
+///
+/// Accepts either the raw header value or a full, case-insensitive `Cookie:` line.
+/// Empty values and control characters are rejected before the value reaches an
+/// HTTP client.
+pub(crate) fn normalize_cookie_header(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let value = trimmed
+        .get(.."cookie:".len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case("cookie:"))
+        .map_or(trimmed, |_| &trimmed["cookie:".len()..])
+        .trim();
+
+    (!value.is_empty() && !value.chars().any(char::is_control)).then(|| value.to_string())
 }
 
 pub(crate) fn browser_cookies_for_domain(
     domain: &str,
 ) -> Result<Vec<crate::browser::cookies::Cookie>, crate::core::ProviderError> {
-    crate::browser::cookies::get_cookies_for_domain(
-        domain,
-        crate::browser::cookies::ScanTrigger::AutomaticRefresh,
-    )
-    .map_err(map_browser_cookie_error)
+    crate::browser::cookies::get_cookies_for_domain(domain).map_err(map_browser_cookie_error)
+}
+
+/// Cookies for `domain` from one browser only, so a provider can avoid
+/// touching unrelated browsers (and their credential prompts).
+pub(crate) fn browser_cookies_from_browser(
+    browser_type: crate::browser::detection::BrowserType,
+    domain: &str,
+) -> Result<Vec<crate::browser::cookies::Cookie>, crate::core::ProviderError> {
+    let browser = crate::browser::detection::BrowserDetector::detect(browser_type)
+        .ok_or(crate::core::ProviderError::NoCookies)?;
+    crate::browser::cookies::CookieExtractor::extract_for_domain(&browser, domain)
+        .map_err(map_browser_cookie_error)
 }
 
 fn map_browser_cookie_error(
@@ -181,8 +447,7 @@ fn map_browser_cookie_error(
 ) -> crate::core::ProviderError {
     match error {
         crate::browser::cookies::CookieError::BrowserNotInstalled
-        | crate::browser::cookies::CookieError::NotFound(_)
-        | crate::browser::cookies::CookieError::ManualImportRequired => {
+        | crate::browser::cookies::CookieError::NotFound(_) => {
             crate::core::ProviderError::NoCookies
         }
         _ => crate::core::ProviderError::Other(format!("Failed to read browser cookies: {error}")),
@@ -222,6 +487,54 @@ pub(crate) fn validated_https_url(
     raw: &str,
     label: &str,
 ) -> Result<reqwest::Url, crate::core::ProviderError> {
+    validated_endpoint_url(raw, label, false)
+}
+
+/// Like [`validated_https_url`], but plain HTTP is also accepted for loopback,
+/// private-network (RFC1918, unique-local), link-local and `.local` hosts
+/// (upstream `https-or-private-network-http` endpoint policy).
+pub(crate) fn validated_https_or_private_http_url(
+    raw: &str,
+    label: &str,
+) -> Result<reqwest::Url, crate::core::ProviderError> {
+    validated_endpoint_url(raw, label, true)
+}
+
+/// Endpoint-policy host check for [`validated_https_or_private_http_url`].
+/// Stricter than [`is_private_network_host`] about `localhost` (no
+/// `*.localhost`) and also accepts `<label>.local` mDNS names.
+fn is_private_http_endpoint_host(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    // Upstream `isPrivateNetworkHost`: `localhost` exactly, or a non-empty
+    // label before `.local` once one trailing dot is dropped.
+    let hostname = host.strip_suffix('.').unwrap_or(&host);
+    if host == "localhost"
+        || hostname
+            .strip_suffix(".local")
+            .is_some_and(|label| !label.is_empty())
+    {
+        return true;
+    }
+    let ip_candidate = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(&host);
+    match ip_candidate.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+        Ok(std::net::IpAddr::V6(ip)) => {
+            ip.is_loopback()
+                || (ip.segments()[0] & 0xfe00) == 0xfc00
+                || (ip.segments()[0] & 0xffc0) == 0xfe80
+        }
+        Err(_) => false,
+    }
+}
+
+fn validated_endpoint_url(
+    raw: &str,
+    label: &str,
+    allow_private_http: bool,
+) -> Result<reqwest::Url, crate::core::ProviderError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(crate::core::ProviderError::Other(format!(
@@ -247,14 +560,21 @@ pub(crate) fn validated_https_url(
     let host = url.host_str().ok_or_else(|| {
         crate::core::ProviderError::Other(format!("{label} URL must include a host"))
     })?;
-    if url.scheme() != "https"
+    let scheme_ok = url.scheme() == "https"
+        || (allow_private_http && url.scheme() == "http" && is_private_http_endpoint_host(host));
+    if !scheme_ok
         || !url.username().is_empty()
         || url.password().is_some()
         || host.contains('%')
         || host.chars().any(|c| c.is_control() || c.is_whitespace())
     {
+        let scheme_rule = if allow_private_http {
+            "HTTPS (or plain HTTP for loopback, private-network and .local hosts)"
+        } else {
+            "HTTPS"
+        };
         return Err(crate::core::ProviderError::Other(format!(
-            "{label} URL must use HTTPS without user info or encoded host tricks"
+            "{label} URL must use {scheme_rule} without user info or encoded host tricks"
         )));
     }
     Ok(url)
@@ -305,4 +625,117 @@ pub(crate) fn extract_renewal(text: &str) -> Option<chrono::DateTime<chrono::Utc
     chrono::DateTime::parse_from_rfc3339(raw)
         .ok()
         .map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BoundedBodyError, browser_cookie_sessions_from, normalize_cookie_header,
+        read_bounded_stream,
+    };
+    use crate::browser::detection::BrowserType;
+    use crate::browser::session_scan::test_support::FakeCookieStore;
+    use crate::core::{FetchContext, ProviderError};
+    use futures::stream;
+
+    #[test]
+    fn browser_sessions_never_read_a_browser_when_import_is_disabled() {
+        let store =
+            FakeCookieStore::default().cookies(BrowserType::Chrome, "a.test", &[("s", "1")]);
+        let ctx = FetchContext {
+            manual_cookie_missing: true,
+            ..FetchContext::default()
+        };
+        let mut sessions = browser_cookie_sessions_from(&store, &ctx, &["a.test"]);
+        assert_eq!(sessions.next(), None);
+        assert!(matches!(
+            sessions.exhaustion_error(),
+            ProviderError::NoCookies
+        ));
+        assert!(store.reads().is_empty());
+    }
+
+    #[test]
+    fn browser_sessions_yield_headers_lazily_in_browser_order() {
+        let store = FakeCookieStore::default()
+            .cookies(BrowserType::Edge, "a.test", &[("s", "stale")])
+            .cookies(BrowserType::Firefox, "a.test", &[("s", "valid")]);
+        let ctx = FetchContext::default();
+        let mut sessions = browser_cookie_sessions_from(&store, &ctx, &["a.test"]);
+        assert_eq!(sessions.next().as_deref(), Some("s=stale"));
+        assert_eq!(store.reads().len(), 1);
+        assert_eq!(sessions.next().as_deref(), Some("s=valid"));
+        assert_eq!(sessions.next(), None);
+        assert!(matches!(
+            sessions.exhaustion_error(),
+            ProviderError::NoCookies
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_stream_rejects_oversized_body_without_content_length() {
+        const MAX_BYTES: usize = 8;
+        let body = stream::iter([Ok::<_, ()>(vec![0_u8; MAX_BYTES - 1]), Ok(vec![1_u8; 2])]);
+
+        assert_eq!(
+            read_bounded_stream(body, MAX_BYTES).await,
+            Err(BoundedBodyError::TooLarge)
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_stream_accepts_body_below_limit() {
+        let body = stream::iter([Ok::<_, ()>(vec![1_u8, 2, 3]), Ok(vec![4_u8])]);
+
+        assert_eq!(read_bounded_stream(body, 8).await, Ok(vec![1, 2, 3, 4]));
+    }
+
+    #[tokio::test]
+    async fn bounded_stream_accepts_body_at_limit() {
+        let body = stream::iter([Ok::<_, ()>(vec![1_u8; 4]), Ok(vec![2_u8; 4])]);
+
+        assert_eq!(
+            read_bounded_stream(body, 8).await,
+            Ok(vec![1, 1, 1, 1, 2, 2, 2, 2])
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_stream_reports_read_failure() {
+        let body = stream::iter([
+            Ok::<_, &'static str>(vec![1_u8]),
+            Err("network read failed"),
+        ]);
+
+        assert_eq!(
+            read_bounded_stream(body, 8).await,
+            Err(BoundedBodyError::Read("network read failed"))
+        );
+    }
+
+    #[test]
+    fn normalizes_raw_and_prefixed_cookie_headers() {
+        assert_eq!(
+            normalize_cookie_header("  session=abc; user=42  ").as_deref(),
+            Some("session=abc; user=42")
+        );
+        assert_eq!(
+            normalize_cookie_header(" Cookie: session=abc ").as_deref(),
+            Some("session=abc")
+        );
+        assert_eq!(
+            normalize_cookie_header("cOoKiE: session=abc").as_deref(),
+            Some("session=abc")
+        );
+    }
+
+    #[test]
+    fn rejects_empty_and_control_character_cookie_headers() {
+        assert_eq!(normalize_cookie_header("  "), None);
+        assert_eq!(normalize_cookie_header("Cookie:  "), None);
+        assert_eq!(
+            normalize_cookie_header("session=abc\r\nInjected: true"),
+            None
+        );
+    }
 }

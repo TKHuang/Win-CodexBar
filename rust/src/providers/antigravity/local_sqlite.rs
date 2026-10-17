@@ -6,13 +6,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration as StdDuration, Instant};
 
-use chrono::{DateTime, Duration, Local, TimeZone, Utc};
+use chrono::{DateTime, Duration, TimeZone, Utc};
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, types::ValueRef};
 
 use self::local_bot_id::{ExactStepTimestamp, embedded_timestamps_agree, record_exact_bot_id};
+use super::cost::estimate_cost_usd;
 use super::local_proto::{ParsedTurn, parse_step_metadata, parse_turn};
-use super::local_sessions::{LocalHistoryCoverage, LocalSessionSummary};
 use super::local_step_resolver::{StepOccurrence, resolve_step_timestamps};
+#[cfg(test)]
+use crate::spend_contract::LocalTokenHistorySummary as LocalSessionSummary;
+use crate::spend_contract::{LocalHistoryCoverage, LocalTokenHistorySummary};
 
 const MAX_DATABASES: usize = 500;
 const MAX_DIRECTORY_ENTRIES: usize = 10_000;
@@ -29,7 +32,25 @@ const MAX_SCAN_DURATION: StdDuration = StdDuration::from_secs(5);
 #[derive(Debug)]
 pub(super) enum SQLiteScan {
     NoDatabases,
-    Summary(LocalSessionSummary),
+    /// Discovered SQLite files were present, but none had an Antigravity schema.
+    ///
+    /// This is non-authoritative: callers may continue with another local
+    /// history source instead of treating the scan as known-empty history.
+    Unsupported,
+    Summary(LocalTokenHistorySummary),
+}
+
+#[derive(Debug)]
+enum DatabaseScan {
+    Supported { events: Vec<Event>, complete: bool },
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchemaInspection {
+    Supported,
+    Unsupported,
+    Incomplete,
 }
 
 struct Budget {
@@ -39,6 +60,9 @@ struct Budget {
     bytes: usize,
     schema_bytes: usize,
     deadline: Instant,
+    /// A hard scan limit (databases, rows, bytes, duration) stopped the read.
+    /// A truncated read is withheld rather than published as a lower bound.
+    exhausted: bool,
 }
 
 impl Budget {
@@ -54,6 +78,7 @@ impl Budget {
             bytes: 0,
             schema_bytes: 0,
             deadline,
+            exhausted: false,
         }
     }
 
@@ -113,51 +138,118 @@ pub(super) fn database_roots(gemini_base: &Path) -> [PathBuf; 3] {
     ]
 }
 
+/// How the reader keys one conversation across database files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SessionIdentity {
+    /// Full canonical database path. Same-named databases in different roots
+    /// are different sessions (the single Gemini home default).
+    Path,
+    /// Database file stem. A conversation copied into another selected Gemini
+    /// home is the same conversation, so its rows and responses count once.
+    FileStem,
+}
+
 pub(super) fn summarize(roots: &[PathBuf], now: DateTime<Utc>, days: u32) -> SQLiteScan {
+    summarize_with_identity(roots, now, days, SessionIdentity::Path)
+}
+
+pub(super) fn summarize_with_identity(
+    roots: &[PathBuf],
+    now: DateTime<Utc>,
+    days: u32,
+    identity: SessionIdentity,
+) -> SQLiteScan {
     let mut budget = Budget::new();
     let (paths, discovery_complete) = discover_databases(roots, &mut budget);
     if paths.is_empty() && discovery_complete {
         return SQLiteScan::NoDatabases;
     }
 
-    let first_day = now.with_timezone(&Local).date_naive()
-        - Duration::days(i64::from(days.clamp(1, 365).saturating_sub(1)));
+    let zone = crate::cost_reporting_period::cost_bucket_zone();
+    let first_day = zone.date(now)
+        - Duration::days(i64::from(
+            crate::cost_reporting_period::clamp_window_days(days).saturating_sub(1),
+        ));
     let mut complete = discovery_complete && budget.check();
     let mut events = Vec::new();
+    let mut authoritative_database = false;
+    let mut unsupported_database = false;
 
-    for path in &paths {
+    for database in &paths {
         if !budget.check() {
             complete = false;
+            budget.exhausted = true;
             break;
         }
         budget.databases += 1;
         if budget.databases > MAX_DATABASES {
             complete = false;
+            budget.exhausted = true;
             break;
         }
-        match read_database(path, &mut budget) {
-            Ok((mut rows, is_complete)) => {
-                events.append(&mut rows);
-                complete &= is_complete;
+        match read_database(database, identity, &mut budget) {
+            Ok(DatabaseScan::Supported {
+                events: mut database_events,
+                complete: database_complete,
+            }) => {
+                authoritative_database = true;
+                events.append(&mut database_events);
+                complete &= database_complete;
             }
-            Err(_) => complete = false,
+            Ok(DatabaseScan::Unsupported) => unsupported_database = true,
+            Err(_) => {
+                // Preserve existing source-specific read failures as partial
+                // native history rather than treating them as foreign files.
+                authoritative_database = true;
+                complete = false;
+            }
         }
+        complete &= budget.check();
         if budget.rows >= MAX_ROWS || budget.bytes >= MAX_TOTAL_BYTES {
             complete = false;
+            budget.exhausted = true;
             break;
         }
     }
 
+    if unsupported_database && !authoritative_database && complete {
+        return SQLiteScan::Unsupported;
+    }
+
+    // A truncated read or two sources disagreeing about one request means the
+    // surviving rows may be wrong, not merely incomplete: withhold them.
+    if budget.exhausted || !budget.check() {
+        return SQLiteScan::Summary(LocalTokenHistorySummary::withheld());
+    }
+
+    let mut contradicted = false;
     let mut total_tokens = 0_u64;
+    let mut cost_estimate = crate::spend_contract::LocalCostEstimate::default();
     let mut sessions = HashSet::new();
     let mut rows: HashMap<(String, i64), Event> = HashMap::new();
     let mut responses: HashMap<(String, String), Event> = HashMap::new();
+
+    let mut label_models = HashMap::<(String, String), String>::new();
+    let mut conflicting_labels = HashSet::<(String, String)>::new();
+    for event in &events {
+        let (Some(label), Some(model)) = (event.turn.label.as_ref(), event.turn.model.as_ref())
+        else {
+            continue;
+        };
+        let key = (event.session.clone(), label.clone());
+        if label_models.get(&key).is_some_and(|prior| prior != model) {
+            conflicting_labels.insert(key);
+        } else {
+            label_models.insert(key, model.clone());
+        }
+    }
 
     for event in events {
         let row_key = (event.session.clone(), event.row);
         if let Some(prior) = rows.get(&row_key) {
             if prior != &event {
                 complete = false;
+                contradicted = true;
             }
             continue;
         }
@@ -172,6 +264,7 @@ pub(super) fn summarize(roots: &[PathBuf], now: DateTime<Utc>, days: u32) -> SQL
             if let Some(prior) = responses.get(&response_key) {
                 if prior.turn != event.turn {
                     complete = false;
+                    contradicted = true;
                 } else {
                     rows.insert(row_key, event);
                 }
@@ -189,7 +282,7 @@ pub(super) fn summarize(roots: &[PathBuf], now: DateTime<Utc>, days: u32) -> SQL
             continue;
         };
         rows.insert(row_key, event.clone());
-        if at > now || at.with_timezone(&Local).date_naive() < first_day {
+        if at > now || zone.date(at) < first_day {
             continue;
         }
         match total_tokens.checked_add(event.total) {
@@ -199,28 +292,86 @@ pub(super) fn summarize(roots: &[PathBuf], now: DateTime<Utc>, days: u32) -> SQL
                 continue;
             }
         }
+        if event.total > 0 {
+            let inherited_model = event.turn.label.as_ref().and_then(|label| {
+                let key = (event.session.clone(), label.clone());
+                (!conflicting_labels.contains(&key))
+                    .then(|| label_models.get(&key))
+                    .flatten()
+                    .map(String::as_str)
+            });
+            let model = event.turn.model.as_deref().or(inherited_model);
+            let estimated_cost = event.turn.usage.as_ref().and_then(|usage| {
+                let input = usage.system_prompt.checked_add(usage.new_input);
+                let output = usage.output.checked_add(usage.reasoning);
+                if let (Some(input), Some(output)) = (input, output) {
+                    estimate_cost_usd(model, input, usage.cache_read, 0, output)
+                } else {
+                    None
+                }
+            });
+            cost_estimate.record_list_price(model, estimated_cost);
+        }
         sessions.insert(event.session);
     }
 
-    SQLiteScan::Summary(LocalSessionSummary {
-        total_tokens,
-        session_count: sessions.len(),
-        coverage: if complete {
-            LocalHistoryCoverage::Complete
-        } else {
-            LocalHistoryCoverage::Partial
-        },
-    })
+    if contradicted {
+        return SQLiteScan::Summary(LocalTokenHistorySummary::withheld());
+    }
+
+    SQLiteScan::Summary(
+        LocalTokenHistorySummary {
+            total_tokens,
+            session_count: sessions.len(),
+            coverage: if complete {
+                LocalHistoryCoverage::Complete
+            } else {
+                LocalHistoryCoverage::Partial
+            },
+            cost_estimate,
+            lower_bound: false,
+        }
+        .with_lower_bound_if_partial(),
+    )
 }
 
-fn discover_databases(roots: &[PathBuf], budget: &mut Budget) -> (Vec<PathBuf>, bool) {
+/// One discovered database file. `root_label` is the root's relative position
+/// inside its Gemini home, so the same stem in another root stays distinct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiscoveredDatabase {
+    path: PathBuf,
+    root_label: String,
+}
+
+/// The three roots from `database_roots`, relative to a Gemini home.
+const RELATIVE_ROOTS: [&str; 3] = [
+    "antigravity-cli/conversations",
+    "antigravity",
+    "antigravity/conversations",
+];
+
+/// Matches a root on its trailing components, so the label is the same for
+/// every home. Unrecognized roots fall back to their own path.
+fn relative_root_label(root: &Path) -> String {
+    RELATIVE_ROOTS
+        .iter()
+        .find(|relative| root.ends_with(relative))
+        .map_or_else(
+            || root.to_string_lossy().into_owned(),
+            |label| label.to_string(),
+        )
+}
+
+fn discover_databases(roots: &[PathBuf], budget: &mut Budget) -> (Vec<DiscoveredDatabase>, bool) {
     let mut paths = Vec::new();
     let mut complete = true;
 
     for root in roots {
         if !budget.check() {
+            budget.exhausted = true;
             return (paths, false);
         }
+        let root_label = relative_root_label(root);
         let resolved_root = match fs::canonicalize(root) {
             Ok(path) => path,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -245,10 +396,12 @@ fn discover_databases(roots: &[PathBuf], budget: &mut Budget) -> (Vec<PathBuf>, 
         };
         for entry in entries {
             if !budget.check() {
+                budget.exhausted = true;
                 return (paths, false);
             }
             budget.directory_entries += 1;
             if budget.directory_entries > MAX_DIRECTORY_ENTRIES {
+                budget.exhausted = true;
                 return (paths, false);
             }
             let entry = match entry {
@@ -288,44 +441,89 @@ fn discover_databases(roots: &[PathBuf], budget: &mut Budget) -> (Vec<PathBuf>, 
                 }
             }
             if paths.len() >= MAX_DATABASES {
+                budget.exhausted = true;
                 return (paths, false);
             }
-            paths.push(resolved);
+            paths.push(DiscoveredDatabase {
+                path: resolved,
+                root_label: root_label.clone(),
+            });
         }
     }
-    paths.sort();
-    paths.dedup();
+    // The same file reached through two roots is one database.
+    paths.sort_by(|left, right| left.path.cmp(&right.path));
+    paths.dedup_by(|later, kept| later.path == kept.path);
     (paths, complete)
 }
 
-fn read_database(path: &Path, budget: &mut Budget) -> rusqlite::Result<(Vec<Event>, bool)> {
+fn session_key(path: &Path, root_label: &str, identity: SessionIdentity) -> String {
+    match identity {
+        SessionIdentity::Path => path
+            .canonicalize()
+            .unwrap_or_else(|_| path.to_path_buf())
+            .to_string_lossy()
+            .into_owned(),
+        // NUL cannot appear in a path, so the label and stem cannot collide.
+        SessionIdentity::FileStem => {
+            let stem = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map_or_else(|| path.to_string_lossy().into_owned(), str::to_owned);
+            format!("{root_label}\0{stem}")
+        }
+    }
+}
+
+fn read_database(
+    database: &DiscoveredDatabase,
+    identity: SessionIdentity,
+    budget: &mut Budget,
+) -> rusqlite::Result<DatabaseScan> {
+    let path = database.path.as_path();
     if !budget.check() {
-        return Ok((Vec::new(), false));
+        return Ok(DatabaseScan::Supported {
+            events: Vec::new(),
+            complete: false,
+        });
     }
     let mut conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
-    if !supported_schema(&tx, budget)? {
-        return Ok((Vec::new(), false));
+    match supported_schema(&tx, budget)? {
+        SchemaInspection::Supported => {}
+        SchemaInspection::Unsupported => return Ok(DatabaseScan::Unsupported),
+        SchemaInspection::Incomplete => {
+            return Ok(DatabaseScan::Supported {
+                events: Vec::new(),
+                complete: false,
+            });
+        }
     }
 
-    let session = path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("unknown")
-        .to_string();
+    let session = session_key(path, &database.root_label, identity);
     let mut rows = read_generation_rows(&tx, &session, budget)?;
     if rows.pending.is_empty() {
-        return Ok((rows.events, rows.complete));
+        return Ok(DatabaseScan::Supported {
+            events: rows.events,
+            complete: rows.complete,
+        });
     }
 
     // Never realign step timestamps after a malformed or truncated primary scan.
     if !rows.complete {
-        return Ok((rows.events, false));
+        return Ok(DatabaseScan::Supported {
+            events: rows.events,
+            complete: false,
+        });
     }
 
-    let has_steps = supported_steps_schema(&tx, budget).unwrap_or_default();
-    if !has_steps {
-        return Ok((rows.events, false));
+    if !matches!(
+        supported_steps_schema(&tx, budget),
+        Ok(SchemaInspection::Supported)
+    ) {
+        return Ok(DatabaseScan::Supported {
+            events: rows.events,
+            complete: false,
+        });
     }
 
     let needed_occurrences = rows
@@ -346,14 +544,25 @@ fn read_database(path: &Path, budget: &mut Budget) -> rusqlite::Result<(Vec<Even
     let step_scan =
         match read_step_timestamps(&tx, &needed_occurrences, budget, &mut rows.database_bytes) {
             Ok(scan) => scan,
-            Err(_) => return Ok((rows.events, false)),
+            Err(_) => {
+                return Ok(DatabaseScan::Supported {
+                    events: rows.events,
+                    complete: false,
+                });
+            }
         };
     if !step_scan.complete {
-        return Ok((rows.events, false));
+        return Ok(DatabaseScan::Supported {
+            events: rows.events,
+            complete: false,
+        });
     }
 
     if !embedded_timestamps_agree(&rows.occurrences, &step_scan, &rows.bot_id_uses) {
-        return Ok((rows.events, false));
+        return Ok(DatabaseScan::Supported {
+            events: rows.events,
+            complete: false,
+        });
     }
 
     let resolved = resolve_step_timestamps(
@@ -374,7 +583,10 @@ fn read_database(path: &Path, budget: &mut Budget) -> rusqlite::Result<(Vec<Even
     if recovered < rows.pending.len() {
         rows.complete = false;
     }
-    Ok((rows.events, rows.complete))
+    Ok(DatabaseScan::Supported {
+        events: rows.events,
+        complete: rows.complete,
+    })
 }
 
 fn read_generation_rows(
@@ -399,12 +611,14 @@ fn read_generation_rows(
     while let Some(row) = query.next()? {
         if !budget.check() {
             complete = false;
+            budget.exhausted = true;
             break;
         }
         database_rows += 1;
         budget.rows += 1;
         if database_rows > MAX_ROWS_PER_DATABASE || budget.rows > MAX_ROWS {
             complete = false;
+            budget.exhausted = true;
             break;
         }
 
@@ -424,6 +638,7 @@ fn read_generation_rows(
             Some(value) if value <= MAX_DATABASE_BYTES => value,
             _ => {
                 complete = false;
+                budget.exhausted = true;
                 break;
             }
         };
@@ -431,6 +646,7 @@ fn read_generation_rows(
             Some(value) if value <= MAX_TOTAL_BYTES => value,
             _ => {
                 complete = false;
+                budget.exhausted = true;
                 break;
             }
         };
@@ -529,11 +745,13 @@ fn read_step_timestamps(
     while let Some(row) = query.next()? {
         if !budget.check() {
             complete = false;
+            budget.exhausted = true;
             break;
         }
         budget.rows += 1;
         if budget.rows > MAX_ROWS {
             complete = false;
+            budget.exhausted = true;
             break;
         }
 
@@ -553,6 +771,7 @@ fn read_step_timestamps(
             Some(value) if value <= MAX_DATABASE_BYTES => value,
             _ => {
                 complete = false;
+                budget.exhausted = true;
                 break;
             }
         };
@@ -560,6 +779,7 @@ fn read_step_timestamps(
             Some(value) if value <= MAX_TOTAL_BYTES => value,
             _ => {
                 complete = false;
+                budget.exhausted = true;
                 break;
             }
         };
@@ -614,7 +834,7 @@ fn read_step_timestamps(
     })
 }
 
-fn supported_schema(conn: &Connection, budget: &mut Budget) -> rusqlite::Result<bool> {
+fn supported_schema(conn: &Connection, budget: &mut Budget) -> rusqlite::Result<SchemaInspection> {
     let mut statement =
         conn.prepare("SELECT name, type, rootpage FROM main.sqlite_master LIMIT ?1")?;
     let mut rows = statement.query([i64::try_from(MAX_SCHEMA_ENTRIES + 1).unwrap_or(i64::MAX)])?;
@@ -622,34 +842,37 @@ fn supported_schema(conn: &Connection, budget: &mut Budget) -> rusqlite::Result<
     let mut schema_entries = 0usize;
     while let Some(row) = rows.next()? {
         if !budget.check() {
-            return Ok(false);
+            return Ok(SchemaInspection::Incomplete);
         }
         schema_entries += 1;
         if schema_entries > MAX_SCHEMA_ENTRIES {
-            return Ok(false);
+            return Ok(SchemaInspection::Incomplete);
         }
         let name: String = row.get(0)?;
         let kind: String = row.get(1)?;
         if !budget.charge_schema_text(&name) || !budget.charge_schema_text(&kind) {
-            return Ok(false);
+            return Ok(SchemaInspection::Incomplete);
         }
         if !name.eq_ignore_ascii_case("gen_metadata") {
             continue;
         }
         let rootpage: i64 = row.get(2)?;
         if kind != "table" || rootpage <= 0 || found {
-            return Ok(false);
+            return Ok(SchemaInspection::Unsupported);
         }
         found = true;
     }
     if !found {
-        return Ok(false);
+        return Ok(SchemaInspection::Unsupported);
     }
 
     has_stored_columns(conn, "gen_metadata", &["idx", "data"], budget)
 }
 
-fn supported_steps_schema(conn: &Connection, budget: &mut Budget) -> rusqlite::Result<bool> {
+fn supported_steps_schema(
+    conn: &Connection,
+    budget: &mut Budget,
+) -> rusqlite::Result<SchemaInspection> {
     let mut statement =
         conn.prepare("SELECT name, type, rootpage FROM main.sqlite_master LIMIT ?1")?;
     let mut rows = statement.query([i64::try_from(MAX_SCHEMA_ENTRIES + 1).unwrap_or(i64::MAX)])?;
@@ -657,28 +880,28 @@ fn supported_steps_schema(conn: &Connection, budget: &mut Budget) -> rusqlite::R
     let mut schema_entries = 0usize;
     while let Some(row) = rows.next()? {
         if !budget.check() {
-            return Ok(false);
+            return Ok(SchemaInspection::Incomplete);
         }
         schema_entries += 1;
         if schema_entries > MAX_SCHEMA_ENTRIES {
-            return Ok(false);
+            return Ok(SchemaInspection::Incomplete);
         }
         let name: String = row.get(0)?;
         let kind: String = row.get(1)?;
         if !budget.charge_schema_text(&name) || !budget.charge_schema_text(&kind) {
-            return Ok(false);
+            return Ok(SchemaInspection::Incomplete);
         }
         if !name.eq_ignore_ascii_case("steps") {
             continue;
         }
         let rootpage: i64 = row.get(2)?;
         if kind != "table" || rootpage <= 0 || found {
-            return Ok(false);
+            return Ok(SchemaInspection::Unsupported);
         }
         found = true;
     }
     if !found {
-        return Ok(false);
+        return Ok(SchemaInspection::Unsupported);
     }
 
     has_stored_columns(conn, "steps", &["idx", "metadata"], budget)
@@ -689,10 +912,10 @@ fn has_stored_columns(
     table: &str,
     required: &[&str],
     budget: &mut Budget,
-) -> rusqlite::Result<bool> {
+) -> rusqlite::Result<SchemaInspection> {
     let table = match table {
         "gen_metadata" | "steps" => table,
-        _ => return Ok(false),
+        _ => return Ok(SchemaInspection::Unsupported),
     };
 
     let mut columns = HashSet::new();
@@ -702,30 +925,34 @@ fn has_stored_columns(
     let mut rows = info.query([])?;
     while let Some(row) = rows.next()? {
         if !budget.check() {
-            return Ok(false);
+            return Ok(SchemaInspection::Incomplete);
         }
         schema_columns += 1;
         if schema_columns > MAX_SCHEMA_COLUMNS {
-            return Ok(false);
+            return Ok(SchemaInspection::Incomplete);
         }
         let hidden: i64 = row.get(6)?;
         if hidden != 0 {
-            return Ok(false);
+            return Ok(SchemaInspection::Unsupported);
         }
         let name: String = row.get(1)?;
         let column_type: String = row.get(2).unwrap_or_default();
         let default_value: Option<String> = row.get(4).ok();
         if !budget.charge_schema_text(&name) || !budget.charge_schema_text(&column_type) {
-            return Ok(false);
+            return Ok(SchemaInspection::Incomplete);
         }
         if let Some(default_value) = default_value.as_deref()
             && !budget.charge_schema_text(default_value)
         {
-            return Ok(false);
+            return Ok(SchemaInspection::Incomplete);
         }
         columns.insert(name.to_ascii_lowercase());
     }
-    Ok(required.iter().all(|column| columns.contains(*column)))
+    Ok(if required.iter().all(|column| columns.contains(*column)) {
+        SchemaInspection::Supported
+    } else {
+        SchemaInspection::Unsupported
+    })
 }
 
 #[cfg(test)]
@@ -733,129 +960,9 @@ fn has_stored_columns(
 mod synthetic_tests;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use rusqlite::params;
+#[path = "local_sqlite_tests.rs"]
+mod tests;
 
-    #[test]
-    fn missing_databases_falls_through() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(matches!(
-            summarize(&database_roots(&dir.path().join(".gemini")), Utc::now(), 30),
-            SQLiteScan::NoDatabases
-        ));
-    }
-
-    #[test]
-    fn unsupported_database_is_partial_not_zero() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join(".gemini/antigravity-cli/conversations");
-        fs::create_dir_all(&root).unwrap();
-        let conn = Connection::open(root.join("one.db")).unwrap();
-        conn.execute("CREATE TABLE wrong(idx INTEGER, data BLOB)", [])
-            .unwrap();
-        drop(conn);
-        let SQLiteScan::Summary(summary) =
-            summarize(&database_roots(&dir.path().join(".gemini")), Utc::now(), 30)
-        else {
-            panic!("database should be attempted");
-        };
-        assert_eq!(summary.coverage, LocalHistoryCoverage::Partial);
-        assert_eq!(summary.total_tokens, 0);
-    }
-
-    #[test]
-    fn empty_supported_database_is_confirmed_zero() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join(".gemini/antigravity-cli/conversations");
-        fs::create_dir_all(&root).unwrap();
-        let conn = Connection::open(root.join("one.db")).unwrap();
-        conn.execute("CREATE TABLE gen_metadata(idx INTEGER, data BLOB)", [])
-            .unwrap();
-        drop(conn);
-        let SQLiteScan::Summary(summary) =
-            summarize(&database_roots(&dir.path().join(".gemini")), Utc::now(), 30)
-        else {
-            panic!("supported database should produce coverage");
-        };
-        assert_eq!(summary.coverage, LocalHistoryCoverage::Complete);
-        assert_eq!(summary.total_tokens, 0);
-        assert_eq!(summary.session_count, 0);
-    }
-
-    #[test]
-    fn non_blob_rows_make_coverage_partial() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join(".gemini/antigravity-cli/conversations");
-        fs::create_dir_all(&root).unwrap();
-        let conn = Connection::open(root.join("one.db")).unwrap();
-        conn.execute("CREATE TABLE gen_metadata(idx INTEGER, data BLOB)", [])
-            .unwrap();
-        conn.execute(
-            "INSERT INTO gen_metadata(idx,data) VALUES(?1,?2)",
-            params![1_i64, "not-a-blob"],
-        )
-        .unwrap();
-        drop(conn);
-        let SQLiteScan::Summary(summary) =
-            summarize(&database_roots(&dir.path().join(".gemini")), Utc::now(), 30)
-        else {
-            panic!("supported database should produce coverage");
-        };
-        assert_eq!(summary.coverage, LocalHistoryCoverage::Partial);
-    }
-    #[test]
-    fn discovery_allows_exactly_500_databases_but_marks_501_partial() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("dbs");
-        fs::create_dir_all(&root).unwrap();
-        for index in 0..MAX_DATABASES {
-            fs::write(root.join(format!("{index:03}.db")), b"").unwrap();
-        }
-        let mut budget = Budget::new();
-        let (paths, complete) = discover_databases(std::slice::from_ref(&root), &mut budget);
-        assert_eq!(paths.len(), MAX_DATABASES);
-        assert!(complete);
-
-        fs::write(root.join("overflow.db"), b"").unwrap();
-        let mut budget = Budget::new();
-        let (paths, complete) = discover_databases(std::slice::from_ref(&root), &mut budget);
-        assert_eq!(paths.len(), MAX_DATABASES);
-        assert!(!complete);
-    }
-
-    #[test]
-    fn expired_budget_marks_discovery_incomplete() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("dbs");
-        fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("one.db"), b"").unwrap();
-        let mut budget = Budget::with_deadline(Instant::now());
-        let (_, complete) = discover_databases(std::slice::from_ref(&root), &mut budget);
-        assert!(!complete);
-    }
-
-    #[test]
-    fn extra_columns_and_without_rowid_schema_is_supported() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute(
-            "CREATE TABLE gen_metadata(idx INTEGER PRIMARY KEY, data BLOB, extra TEXT) WITHOUT ROWID",
-            [],
-        )
-        .unwrap();
-        let mut budget = Budget::new();
-        assert!(supported_schema(&conn, &mut budget).unwrap());
-    }
-
-    #[test]
-    fn generated_columns_are_rejected() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute(
-            "CREATE TABLE gen_metadata(idx INTEGER, data BLOB, derived TEXT GENERATED ALWAYS AS (idx || 'x') VIRTUAL)",
-            [],
-        )
-        .unwrap();
-        let mut budget = Budget::new();
-        assert!(!supported_schema(&conn, &mut budget).unwrap());
-    }
-}
+#[cfg(test)]
+#[path = "local_sqlite_profile_homes_tests.rs"]
+mod profile_homes_tests;
