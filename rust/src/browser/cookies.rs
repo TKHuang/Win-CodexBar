@@ -55,6 +55,34 @@ pub enum CookieError {
              Paste the Cookie header manually, or use Firefox if that browser has the same login."
     )]
     AppBoundEncryption,
+
+    /// A background refresh asked for browser cookies. Stores are read only
+    /// inside [`with_user_import`].
+    #[error("Browser cookies are read only when you import them in Settings.")]
+    ImportRequired,
+}
+
+thread_local! {
+    static USER_IMPORT_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `read` as the user's explicit cookie import.
+///
+/// Reading Chromium's DPAPI-wrapped `Local State` key and decrypting its
+/// cookie database is, step for step, what an infostealer does; doing it on
+/// every background refresh got the app flagged and killed by endpoint
+/// security (Kaspersky `PDM:Trojan.Win32.Generic`). Every browser read funnels
+/// through [`CookieExtractor::extract_for_domain`], which refuses outside this
+/// scope, so automatic refreshes only use cookies imported earlier.
+pub fn with_user_import<T>(read: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            USER_IMPORT_ACTIVE.with(|active| active.set(self.0));
+        }
+    }
+    let _restore = Restore(USER_IMPORT_ACTIVE.with(|active| active.replace(true)));
+    read()
 }
 
 impl CookieError {
@@ -101,6 +129,9 @@ impl CookieExtractor {
         browser: &DetectedBrowser,
         domain: &str,
     ) -> Result<Vec<Cookie>, CookieError> {
+        if !USER_IMPORT_ACTIVE.with(std::cell::Cell::get) {
+            return Err(CookieError::ImportRequired);
+        }
         let mut all_cookies = Vec::new();
         // Preserve the first ABE error seen so it can be surfaced when no cookies
         // were recovered from any profile of this browser.
@@ -741,6 +772,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn background_reads_are_refused_outside_a_user_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let browser = DetectedBrowser {
+            browser_type: BrowserType::Chrome,
+            user_data_dir: dir.path().to_path_buf(),
+            profiles: Vec::new(),
+        };
+        let read = || CookieExtractor::extract_for_domain(&browser, "claude.ai");
+        assert!(matches!(read(), Err(CookieError::ImportRequired)));
+        assert!(with_user_import(read).unwrap().is_empty());
+        // The allowance ends with the import.
+        assert!(matches!(read(), Err(CookieError::ImportRequired)));
+    }
+
+    #[test]
     fn domain_matching_requires_boundary() {
         assert!(domain_matches("chatgpt.com", "chatgpt.com"));
         assert!(domain_matches(".chatgpt.com", "chatgpt.com"));
@@ -761,7 +807,7 @@ mod tests {
             eprintln!("skipping: set CODEXBAR_LIVE_COOKIE_TEST=1 to run the live cookie check");
             return;
         }
-        match get_cookies_for_domain("claude.ai") {
+        match with_user_import(|| get_cookies_for_domain("claude.ai")) {
             Ok(cookies) => {
                 println!("Found {} cookies for claude.ai", cookies.len());
                 for cookie in &cookies {

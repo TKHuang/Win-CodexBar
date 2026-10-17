@@ -447,7 +447,8 @@ fn map_browser_cookie_error(
 ) -> crate::core::ProviderError {
     match error {
         crate::browser::cookies::CookieError::BrowserNotInstalled
-        | crate::browser::cookies::CookieError::NotFound(_) => {
+        | crate::browser::cookies::CookieError::NotFound(_)
+        | crate::browser::cookies::CookieError::ImportRequired => {
             crate::core::ProviderError::NoCookies
         }
         _ => crate::core::ProviderError::Other(format!("Failed to read browser cookies: {error}")),
