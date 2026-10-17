@@ -92,12 +92,42 @@ impl CodexAccountManager {
         // Keep credential replacement exclusive with provider reads and
         // refreshes, just like an account switch.
         let _credentials = super::CREDENTIAL_OPERATIONS.blocking_write();
-        self.authenticate_account(
+        let is_active = self.live_codex_home(account) != account.codex_home_path;
+        let authenticated = self.authenticate_account(
             &account.codex_home_path,
             account.source,
             Some(account),
             handle,
-        )
+        )?;
+        if is_active {
+            // The active account's live copy is the ambient file: publish the
+            // fresh login there too, or Codex keeps the revoked session.
+            copy_private_file(
+                &account.codex_home_path.join("auth.json"),
+                &ambient_codex_home().join("auth.json"),
+            )?;
+        }
+        Ok(authenticated)
+    }
+
+    /// Home whose `auth.json` is the live copy of `account`'s credentials.
+    ///
+    /// A switch copies a managed home's `auth.json` into the ambient home, so
+    /// while that account is active both files hold the same single-use refresh
+    /// token. Renewing the managed copy would revoke the one Codex itself uses
+    /// (and vice versa), forcing a fresh sign-in. Reads and renewals therefore
+    /// go through the ambient home until the account is switched away;
+    /// `materialize_as_managed` then carries the fresher file back.
+    pub fn live_codex_home(&self, account: &CodexAccount) -> PathBuf {
+        let is_active = account.source.owns_files()
+            && self
+                .discover_ambient_account(&[])
+                .is_some_and(|ambient| ambient.matches(account));
+        if is_active {
+            ambient_codex_home()
+        } else {
+            account.codex_home_path.clone()
+        }
     }
 
     /// Remove app-owned managed homes matching this account.

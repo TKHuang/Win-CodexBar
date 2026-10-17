@@ -127,7 +127,7 @@ pub(crate) async fn refresh_codex_account_lanes(
                 return None;
             };
             let api = CodexAccountApi::new();
-            let home_path = account.codex_home_path.clone();
+            let home_path = CodexAccountManager::new().live_codex_home(&account);
             let email_hint = account.email_hint.clone();
             let workspace_account_id = account.effective_workspace_account_id();
             let result = tokio::time::timeout(
@@ -477,7 +477,7 @@ pub async fn codex_account_fetch(
         .clone();
 
     let api = CodexAccountApi::new();
-    let home_path = target.codex_home_path.clone();
+    let home_path = CodexAccountManager::new().live_codex_home(&target);
     let email_hint = target.email_hint.clone();
     let workspace_account_id = target.effective_workspace_account_id();
     let state = app.state::<Mutex<AppState>>();

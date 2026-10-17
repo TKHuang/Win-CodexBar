@@ -82,6 +82,8 @@ describe("CodexAccountsSection", () => {
     expect(screen.getByText("CodexAccountsSourceManaged")).toBeDefined();
     expect(screen.getByText("CodexAccountsSourceAmbient")).toBeDefined();
     expect(screen.queryByText("CodexAccountsReauthenticateButton")).toBeNull();
+    // Only the managed row can be removed; ~/.codex would just reappear.
+    expect(screen.getAllByText("CodexAccountsRemoveButton")).toHaveLength(1);
   });
 
   it("redacts every row (ambient + managed) when privacy is on", async () => {

@@ -583,4 +583,31 @@ mod tests {
         super::super::file_locations::clear_ambient_codex_home_override();
         super::super::file_locations::clear_codex_desktop_session_root_override();
     }
+
+    #[test]
+    fn active_managed_account_reads_and_renews_through_the_ambient_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let ambient = dir.path().join("ambient");
+        let active = dir.path().join("managed-homes/active");
+        let other = dir.path().join("managed-homes/other");
+        for path in [&ambient, &active, &other] {
+            fs::create_dir_all(path).unwrap();
+        }
+        write_auth(&ambient, "me@example.com", "me-id");
+        write_auth(&active, "me@example.com", "me-id");
+        write_auth(&other, "other@example.com", "other-id");
+        super::super::file_locations::with_app_support_directory(dir.path().to_path_buf());
+        super::super::file_locations::with_ambient_codex_home(ambient.clone());
+        let manager = CodexAccountManager::new();
+
+        // Same identity as ~/.codex: one shared refresh token, so use that copy.
+        let active_account = make_account(active, "me@example.com", "me-id");
+        assert_eq!(manager.live_codex_home(&active_account), ambient);
+        // Any other managed account keeps its own home.
+        let other_account = make_account(other.clone(), "other@example.com", "other-id");
+        assert_eq!(manager.live_codex_home(&other_account), other);
+
+        super::super::file_locations::clear_app_support_directory_override();
+        super::super::file_locations::clear_ambient_codex_home_override();
+    }
 }

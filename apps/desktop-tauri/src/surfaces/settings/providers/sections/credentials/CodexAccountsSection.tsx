@@ -280,14 +280,18 @@ export function CodexAccountsSection({ t, hidePersonalInfo = false }: Props) {
                       >
                         {t("CodexAccountsSwitchButton")}
                       </button>
-                      <button
-                        type="button"
-                        className="credential-btn credential-btn--danger"
-                        disabled={busy}
-                        onClick={() => void handleRemove(account.id)}
-                      >
-                        {t("CodexAccountsRemoveButton")}
-                      </button>
+                      {/* The ambient account is Codex's own ~/.codex login and is
+                          rediscovered on every load, so Remove could never stick. */}
+                      {account.source !== "ambient" && (
+                        <button
+                          type="button"
+                          className="credential-btn credential-btn--danger"
+                          disabled={busy}
+                          onClick={() => void handleRemove(account.id)}
+                        >
+                          {t("CodexAccountsRemoveButton")}
+                        </button>
+                      )}
                     </div>
                   </div>
                 </li>
