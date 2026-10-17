@@ -7,8 +7,11 @@
 use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, TimeZone, Timelike, Utc};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use super::tokens::{RowTokens, TokenSums};
 use crate::core::{ProviderError, ProviderFetchResult, RateWindow, UsageSnapshot};
+use scan_cache::ScanCache;
 
 const FIVE_HOURS_MS: i64 = 5 * 60 * 60 * 1000;
 const WEEK_MS: i64 = 7 * 24 * 60 * 60 * 1000;
@@ -22,7 +25,9 @@ SELECT
   CAST(COALESCE(json_extract(data, '$.time.created'), time_created) AS INTEGER) AS createdMs,
   CAST(json_extract(data, '$.cost') AS REAL) AS cost,
   1 AS requestCount,
-  COALESCE(json_extract(data, '$.modelID'), '') AS modelID
+  COALESCE(json_extract(data, '$.modelID'), '') AS modelID,
+  CASE WHEN json_type(data, '$.tokens') = 'object'
+    THEN json_extract(data, '$.tokens') END AS tokens
 FROM message
 WHERE json_valid(data)
   AND json_extract(data, '$.providerID') = 'opencode-go'
@@ -37,7 +42,9 @@ WITH provider_messages AS (
     CAST(COALESCE(json_extract(data, '$.time.created'), time_created) AS INTEGER) AS createdMs,
     CAST(json_extract(data, '$.cost') AS REAL) AS cost,
     json_type(data, '$.cost') IN ('integer', 'real') AS hasCost,
-    COALESCE(json_extract(data, '$.modelID'), '') AS modelID
+    COALESCE(json_extract(data, '$.modelID'), '') AS modelID,
+    CASE WHEN json_type(data, '$.tokens') = 'object'
+      THEN json_extract(data, '$.tokens') END AS tokens
   FROM message
   WHERE json_valid(data)
     AND json_extract(data, '$.providerID') = 'opencode-go'
@@ -48,14 +55,16 @@ SELECT
     AS createdMs,
   CAST(json_extract(p.data, '$.cost') AS REAL) AS cost,
   1 AS requestCount,
-  m.modelID AS modelID
+  m.modelID AS modelID,
+  CASE WHEN json_type(p.data, '$.tokens') = 'object'
+    THEN json_extract(p.data, '$.tokens') END AS tokens
 FROM part p
 JOIN provider_messages m ON m.messageID = p.message_id
 WHERE json_valid(p.data)
   AND json_extract(p.data, '$.type') = 'step-finish'
   AND json_type(p.data, '$.cost') IN ('integer', 'real')
 UNION ALL
-SELECT createdMs, cost, 1 AS requestCount, modelID
+SELECT createdMs, cost, 1 AS requestCount, modelID, tokens
 FROM provider_messages m
 WHERE hasCost
   AND NOT EXISTS (
@@ -76,6 +85,8 @@ pub(crate) struct UsageRow {
     request_count: u32,
     /// The underlying model behind the `opencode-go` Zen proxy; empty when unattributed.
     model: String,
+    /// Recorded token counts; `None` when absent or unusable (never zero).
+    tokens: Option<RowTokens>,
 }
 
 #[derive(Debug, Clone)]
@@ -150,7 +161,7 @@ pub fn candidate_paths() -> Vec<(PathBuf, PathBuf)> {
 pub fn fetch_local_usage(now: DateTime<Utc>) -> Result<LocalUsageSnapshot, ProviderError> {
     let mut last_err: Option<ProviderError> = None;
     for (auth, db) in candidate_paths() {
-        match fetch_from_paths(&auth, &db, now) {
+        match fetch_from_paths_with_cache(&auth, &db, now, ScanCache::shared()) {
             Ok(snap) => return Ok(snap),
             Err(e) => last_err = Some(e),
         }
@@ -162,10 +173,21 @@ pub fn fetch_local_usage(now: DateTime<Utc>) -> Result<LocalUsageSnapshot, Provi
     }))
 }
 
+/// Explicit-path reads (tests, diagnostics) get a private cache so they never
+/// observe or populate the process-wide scan cache.
 pub fn fetch_from_paths(
     auth_path: &Path,
     db_path: &Path,
     now: DateTime<Utc>,
+) -> Result<LocalUsageSnapshot, ProviderError> {
+    fetch_from_paths_with_cache(auth_path, db_path, now, &ScanCache::new())
+}
+
+fn fetch_from_paths_with_cache(
+    auth_path: &Path,
+    db_path: &Path,
+    now: DateTime<Utc>,
+    cache: &ScanCache,
 ) -> Result<LocalUsageSnapshot, ProviderError> {
     let has_auth = has_auth_key(auth_path);
     if !db_path.exists() {
@@ -180,7 +202,7 @@ pub fn fetch_from_paths(
         });
     }
 
-    let rows = read_rows(db_path)?;
+    let rows = cache.read(db_path, || read_rows(db_path))?;
     if !has_auth && rows.is_empty() {
         return Err(ProviderError::NotInstalled(
             "OpenCode Go not detected. Log in with OpenCode Go or use it locally first.".into(),
@@ -237,6 +259,11 @@ fn read_rows(db_path: &Path) -> Result<Vec<UsageRow>, ProviderError> {
                     .map(|n| u32::try_from(n.max(1)).unwrap_or(u32::MAX))
                     .unwrap_or(1),
                 model: row.get::<_, String>(3).unwrap_or_default(),
+                tokens: row
+                    .get::<_, Option<String>>(4)
+                    .ok()
+                    .flatten()
+                    .and_then(|json| RowTokens::parse(&json)),
             })
         })
         .map_err(|e| {
@@ -339,6 +366,8 @@ pub struct DailyModelCost {
     pub cost: f64,
     /// Number of provider invocations (step-finish parts, or one per message).
     pub request_count: u32,
+    /// Recorded token sums for this bucket; incomplete when any row lacked usable tokens.
+    pub tokens: TokenSums,
 }
 
 /// Provider-local cost summary reusing the shared `CostSummary` fields the chart
@@ -349,6 +378,10 @@ pub struct ModelCostSummary {
     pub total_cost_usd: f64,
     pub by_model: std::collections::HashMap<String, f64>,
     pub request_count: u32,
+    /// Recorded token sums across the window (costs never derive from these).
+    pub tokens: TokenSums,
+    /// Recorded token sums per trimmed model id, keyed like `by_model`.
+    pub by_model_tokens: std::collections::HashMap<String, TokenSums>,
     pub period_start: Option<NaiveDate>,
     pub period_end: Option<NaiveDate>,
 }
@@ -378,7 +411,7 @@ pub fn daily_model_costs(
     now: DateTime<Utc>,
     history_days: u32,
 ) -> Vec<DailyModelCost> {
-    let clamped = history_days.clamp(1, 365);
+    let clamped = crate::cost_reporting_period::clamp_window_days(history_days);
     let today = local_today_from_utc(now);
     let since = today - Duration::days(clamped as i64 - 1);
     let since_ms = Local
@@ -390,7 +423,7 @@ pub fn daily_model_costs(
 
     let mut by_day_model: std::collections::BTreeMap<
         String,
-        std::collections::BTreeMap<String, (f64, u32)>,
+        std::collections::BTreeMap<String, (f64, u32, TokenSums)>,
     > = std::collections::BTreeMap::new();
     for row in rows {
         if row.created_ms < since_ms || row.created_ms > now_ms {
@@ -406,19 +439,21 @@ pub fn daily_model_costs(
             trimmed
         };
         let entry = by_day_model.entry(key).or_default();
-        let bucket = entry.entry(model.to_string()).or_insert((0.0, 0));
+        let bucket = entry.entry(model.to_string()).or_default();
         bucket.0 += row.cost;
         bucket.1 = bucket.1.saturating_add(row.request_count);
+        bucket.2.add(row.tokens.as_ref());
     }
 
     let mut out = Vec::new();
     for (day_key, models) in by_day_model {
-        for (model, (cost, request_count)) in models {
+        for (model, (cost, request_count, tokens)) in models {
             out.push(DailyModelCost {
                 day_key: day_key.clone(),
                 model,
                 cost,
                 request_count,
+                tokens,
             });
         }
     }
@@ -431,7 +466,7 @@ pub fn model_cost_summary_from_rows(
     now: DateTime<Utc>,
     days: u32,
 ) -> ModelCostSummary {
-    let clamped = days.clamp(1, 365);
+    let clamped = crate::cost_reporting_period::clamp_window_days(days);
     let today = local_today_from_utc(now);
     let since = today - Duration::days(clamped as i64 - 1);
     let since_ms = Local
@@ -444,6 +479,9 @@ pub fn model_cost_summary_from_rows(
     let mut total = 0.0;
     let mut request_count = 0u32;
     let mut by_model: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    let mut tokens = TokenSums::default();
+    let mut by_model_tokens: std::collections::HashMap<String, TokenSums> =
+        std::collections::HashMap::new();
     let mut earliest: Option<NaiveDate> = None;
     let mut latest: Option<NaiveDate> = None;
     for row in rows {
@@ -459,6 +497,11 @@ pub fn model_cost_summary_from_rows(
             trimmed
         };
         *by_model.entry(model.to_string()).or_insert(0.0) += row.cost;
+        tokens.add(row.tokens.as_ref());
+        by_model_tokens
+            .entry(model.to_string())
+            .or_default()
+            .add(row.tokens.as_ref());
         if let Some(day) = day_key_local(row.created_ms)
             .and_then(|k| NaiveDate::parse_from_str(&k, "%Y-%m-%d").ok())
         {
@@ -470,6 +513,8 @@ pub fn model_cost_summary_from_rows(
         total_cost_usd: total,
         by_model,
         request_count,
+        tokens,
+        by_model_tokens,
         period_start: earliest,
         period_end: latest,
     }
@@ -500,12 +545,12 @@ pub fn model_cost_summary_scan(now: DateTime<Utc>, days: u32) -> Option<ModelCos
 /// Read usage rows from the first candidate install that yields any. Returns
 /// `None` when no install is reachable (auth+db both absent) rather than
 /// propagating `NotInstalled`, since the cost surfaces treat "no data" as empty.
-fn read_available_rows() -> Option<Vec<UsageRow>> {
+fn read_available_rows() -> Option<Arc<Vec<UsageRow>>> {
     for (auth, db) in candidate_paths() {
         if !db.exists() {
             continue;
         }
-        match read_rows(&db) {
+        match ScanCache::shared().read(&db, || read_rows(&db)) {
             Ok(rows) if !rows.is_empty() || has_auth_key(&auth) => return Some(rows),
             Ok(_) => continue,
             Err(_) => continue,
@@ -599,6 +644,11 @@ fn anchored_month(year: i32, month: u32, anchor: &DateTime<Utc>) -> DateTime<Utc
         .unwrap_or_default();
     Utc.from_utc_datetime(&ndt)
 }
+
+mod scan_cache;
+
+#[cfg(test)]
+mod tokens_tests;
 
 #[cfg(test)]
 mod tests {
@@ -916,6 +966,43 @@ mod tests {
         assert!(
             !wal.exists() && !shm.exists(),
             "reader must not create -wal/-shm sidecars"
+        );
+    }
+
+    #[test]
+    fn cached_scan_tracks_live_wal_commits() {
+        let db = temp_db_path("wal-cache");
+        let auth = db.with_extension("auth.json");
+        std::fs::write(&auth, r#"{"opencode-go":{"key":"k"}}"#).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 3, 18, 12, 0, 0).unwrap();
+        let created = now.timestamp_millis() - 60_000;
+
+        // The writer stays open so commits land in the -wal sidecar, not the main file.
+        let writer = Connection::open(&db).unwrap();
+        writer.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+        writer
+            .execute_batch(
+                "CREATE TABLE message (id TEXT PRIMARY KEY, data TEXT, time_created INTEGER);",
+            )
+            .unwrap();
+        insert_message(&writer, "m1", created, Some(3.0), None);
+
+        let cache = ScanCache::new();
+        let first = fetch_from_paths_with_cache(&auth, &db, now, &cache).unwrap();
+        assert!(
+            (first.rolling_usage_percent - 25.0).abs() < 0.05,
+            "{first:?}"
+        );
+        let cached = cache.read(&db, || -> Result<Vec<UsageRow>, ProviderError> {
+            panic!("unchanged database must not be rescanned")
+        });
+        assert_eq!(cached.unwrap().len(), 1);
+
+        insert_message(&writer, "m2", created, Some(3.0), None);
+        let second = fetch_from_paths_with_cache(&auth, &db, now, &cache).unwrap();
+        assert!(
+            (second.rolling_usage_percent - 50.0).abs() < 0.05,
+            "a WAL commit must invalidate the cached scan: {second:?}"
         );
     }
 

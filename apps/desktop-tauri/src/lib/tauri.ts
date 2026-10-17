@@ -1,6 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  HooksConfigSave,
+  HooksConfigSnapshot,
   ClaudeAccount,
+  ClaudeReconciliationSnapshot,
+  GrokAccount,
+  GrokAccountUsage,
   ClaudeSwapAccountsState,
   ApiKeyInfoBridge,
   ApiKeyProviderInfoBridge,
@@ -13,6 +18,7 @@ import type {
   LocaleStrings,
   NotificationSoundEvent,
   ProviderCatalogEntry,
+  ProviderStatusEntry,
   ProviderChartData,
   ProviderDetail,
   ProviderLocalUsageSummary,
@@ -42,18 +48,36 @@ import type {
   CodexAccountsStateBridge,
   CodexSwitchResult,
   DeepSeekPricingStatus,
+  CurrencyRatesSnapshot,
+  OrgRateLimitsSnapshot,
+  ProviderThroughputSnapshot,
 } from "../types/bridge";
 
-export const claudeAccountsList = () => invoke<ClaudeAccount[]>("claude_accounts_list");
+export const claudeAccountsList = () => invoke<ClaudeAccount[]>("get_claude_accounts_state");
+export const claudeReconciliationState = () =>
+  invoke<ClaudeReconciliationSnapshot | null>("claude_reconciliation_state");
 export const claudeAccountAdd = () => invoke<void>("claude_account_add");
+export const claudeAccountReauthenticate = (id: string) => invoke<void>("claude_account_add", { id });
 export const claudeAccountCancelLogin = () => invoke<void>("claude_account_cancel_login");
 export const claudeAccountSaveCurrent = () => invoke<void>("claude_account_save_current");
 export const claudeAccountRemove = (id: string) => invoke<void>("claude_account_remove", { id });
-export const claudeAccountSwitch = (id: string) => invoke<void>("claude_account_switch", { id });
+export const claudeAccountSwitch = (id: string) =>
+  invoke<ClaudeReconciliationSnapshot>("claude_account_switch", { id });
+export const grokAccountsList = () => invoke<GrokAccount[]>("grok_accounts_list");
+export const grokAccountAdd = () => invoke<void>("grok_account_add");
+export const grokAccountReauthenticate = (id: string) => invoke<void>("grok_account_reauthenticate", { id });
+export const grokAccountCancelLogin = () => invoke<void>("grok_account_cancel_login");
+export const grokAccountSaveCurrent = () => invoke<void>("grok_account_save_current");
+export const grokAccountRemove = (id: string) => invoke<void>("grok_account_remove", { id });
+export const grokAccountSwitch = (id: string) => invoke<void>("grok_account_switch", { id });
+export const grokAccountFetch = (id: string) =>
+  invoke<GrokAccountUsage>("grok_account_fetch", { id });
 export const claudeSwapAccountsList = () =>
   invoke<ClaudeSwapAccountsState>("claude_swap_accounts_list");
 export const claudeSwapAccountSwitch = (slot: number) =>
-  invoke<void>("claude_swap_account_switch", { slot });
+  invoke<ClaudeReconciliationSnapshot>("claude_swap_account_switch", { slot });
+export const claudeSwapAccountReauthenticate = (slot: number) =>
+  invoke<ClaudeReconciliationSnapshot>("claude_swap_account_reauthenticate", { slot });
 
 export function getBootstrapState(): Promise<BootstrapState> {
   return invoke<BootstrapState>("get_bootstrap_state");
@@ -63,12 +87,42 @@ export function getProviderCatalog(): Promise<ProviderCatalogEntry[]> {
   return invoke<ProviderCatalogEntry[]>("get_provider_catalog");
 }
 
+export function getProviderStatuses(): Promise<ProviderStatusEntry[]> {
+  return invoke<ProviderStatusEntry[]>("get_provider_statuses");
+}
+
 export function reorderProviders(ids: string[]): Promise<ProviderSummary[]> {
   return invoke<ProviderSummary[]>("reorder_providers", { ids });
 }
 
+/** Settings sidebar reorder: `ids` is the full listed order; hidden providers keep their slots. */
+export function reorderVisibleProviders(ids: string[]): Promise<ProviderSummary[]> {
+  return invoke<ProviderSummary[]>("reorder_visible_providers", { ids });
+}
+
+/** Restore the built-in order for the providers the Settings sidebar lists. */
+export function restoreDefaultProviderOrder(): Promise<ProviderSummary[]> {
+  return invoke<ProviderSummary[]>("restore_default_provider_order");
+}
+
 export function getSettingsSnapshot(): Promise<SettingsSnapshot> {
   return invoke<SettingsSnapshot>("get_settings_snapshot");
+}
+
+export function getCurrencyRates(preferredCurrencyCode: string): Promise<CurrencyRatesSnapshot> {
+  return invoke<CurrencyRatesSnapshot>("get_currency_rates", { preferredCurrencyCode });
+}
+
+export function getStayAwakeStatus(): Promise<boolean> {
+  return invoke<boolean>("get_stay_awake_status");
+}
+
+export function getHooksConfig(): Promise<HooksConfigSnapshot> {
+  return invoke<HooksConfigSnapshot>("get_hooks_config");
+}
+
+export function saveHooksConfig(request: HooksConfigSave): Promise<HooksConfigSnapshot> {
+  return invoke<HooksConfigSnapshot>("save_hooks_config", { request });
 }
 
 export function updateSettings(
@@ -268,9 +322,10 @@ export function getProviderLocalUsageSummary(
   return invoke<ProviderLocalUsageSummary | null>("get_provider_local_usage_summary", { providerId });
 }
 
-export function getUsageSpendSummary(options?: { historyDays?: number; forceRefresh?: boolean }): Promise<UsageSpendSummary> {
+/** `period` is a raw reporting period; omitted means the saved `costReportingPeriod`. */
+export function getUsageSpendSummary(options?: { period?: string; forceRefresh?: boolean }): Promise<UsageSpendSummary> {
   return invoke<UsageSpendSummary>("get_usage_spend_summary", {
-    historyDays: options?.historyDays ?? null,
+    period: options?.period ?? null,
     forceRefresh: options?.forceRefresh ?? null,
   });
 }
@@ -279,13 +334,23 @@ export function writeUsageSpendExport(path: string, payload: string): Promise<vo
   return invoke<void>("write_usage_spend_export", { path, payload });
 }
 
+/** Write portable preferences to `path`; resolves with how many were exported. */
+export function exportPreferences(path: string): Promise<number> {
+  return invoke<number>("export_preferences", { path });
+}
+
+/** Apply the preferences file at `path`; the shell validates before saving anything. */
+export function importPreferences(path: string): Promise<SettingsSnapshot> {
+  return invoke<SettingsSnapshot>("import_preferences", { path });
+}
+
 export function getSpendContract(
   providerId: string,
-  options?: { historyDays?: number; includeOpenCodex?: boolean },
+  options?: { period?: string; includeOpenCodex?: boolean },
 ): Promise<SpendContract> {
   return invoke<SpendContract>("get_spend_contract", {
     providerId,
-    historyDays: options?.historyDays ?? null,
+    period: options?.period ?? null,
     includeOpenCodex: options?.includeOpenCodex ?? null,
   });
 }
@@ -398,6 +463,33 @@ export function setProviderUsageSource(providerId: string, source: string): Prom
   return invoke<void>("set_provider_usage_source", { providerId, source });
 }
 
+export function setProviderOptionalDetails(
+  providerId: string,
+  enabled: boolean,
+): Promise<void> {
+  return invoke<void>("set_provider_optional_details", { providerId, enabled });
+}
+
+/** On-demand Tokens/min window for OpenAI API Live Usage; 15, 60 or 360 minutes. */
+export function getOpenAiLiveUsage(windowMinutes: 15 | 60 | 360): Promise<ProviderThroughputSnapshot> {
+  return invoke<ProviderThroughputSnapshot>("get_openai_live_usage", { windowMinutes });
+}
+
+/** Organization project caps; the caller skips this when a project scope is saved. */
+export function getOpenAiOrgRateLimits(): Promise<OrgRateLimitsSnapshot> {
+  return invoke<OrgRateLimitsSnapshot>("get_openai_org_rate_limits");
+}
+
+export function setProviderAutoResumeAfterQuotaReset(
+  providerId: string,
+  enabled: boolean,
+): Promise<void> {
+  return invoke<void>("set_provider_auto_resume_after_quota_reset", {
+    providerId,
+    enabled,
+  });
+}
+
 export function setProviderCookieSource(providerId: string, source: string): Promise<void> {
   return invoke<void>("set_provider_cookie_source", { providerId, source });
 }
@@ -422,6 +514,21 @@ export function setProviderGatewayUrl(
   gatewayUrl: string,
 ): Promise<void> {
   return invoke<void>("set_provider_gateway_url", { providerId, gatewayUrl });
+}
+
+export function getProviderGatewayUrl(providerId: string): Promise<string> {
+  return invoke<string>("get_provider_gateway_url", { providerId });
+}
+
+export function getProviderAzureApiVersion(providerId: string): Promise<string | null> {
+  return invoke<string | null>("get_provider_azure_api_version", { providerId });
+}
+
+export function setProviderAzureApiVersion(
+  providerId: string,
+  apiVersion: string,
+): Promise<void> {
+  return invoke<void>("set_provider_azure_api_version", { providerId, apiVersion });
 }
 
 // ── Phase 6d — credential detection ──────────────────────────────────
@@ -480,14 +587,8 @@ export function revealTrayPanelWindow(): Promise<void> {
   return invoke<void>("reveal_tray_panel_window");
 }
 
-/** Persist the user's manually-chosen flyout (Pop Out Dashboard) size. */
-export function setFlyoutSize(width: number, height: number): Promise<void> {
-  return invoke<void>("set_flyout_size", { width, height });
-}
-
-/** The remembered flyout size ([w, h]) if the user has resized it, else null. */
-export function flyoutStoredSize(): Promise<[number, number] | null> {
-  return invoke<[number, number] | null>("flyout_stored_size");
+export function getSystemAccentColor(): Promise<string | null> {
+  return invoke<string | null>("get_system_accent_color");
 }
 
 export function quitApp(): Promise<void> {
@@ -504,8 +605,8 @@ export function codexAccountAdd(): Promise<CodexAccount> {
   return invoke<CodexAccount>("codex_account_add");
 }
 
-export function codexAccountReauthenticate(): Promise<CodexAccount> {
-  return invoke<CodexAccount>("codex_account_reauthenticate");
+export function codexAccountReauthenticate(id?: string): Promise<CodexAccount> {
+  return invoke<CodexAccount>("codex_account_reauthenticate", id ? { id } : undefined);
 }
 
 export function codexAccountRemove(id: string): Promise<void> {

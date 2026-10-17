@@ -106,6 +106,34 @@ bad line
     }
 
     #[test]
+    fn ssh_username_case_is_preserved_while_host_case_dedupes() {
+        let hosts = RemoteSessionFetcher::sanitized_hosts(&[
+            "Alice@HOST".to_string(),
+            "Alice@host".to_string(),
+            "alice@host".to_string(),
+            "alice@HOST".to_string(),
+            "HOST".to_string(),
+            "host".to_string(),
+        ]);
+
+        assert_eq!(
+            hosts,
+            vec![
+                "Alice@HOST".to_string(),
+                "alice@host".to_string(),
+                "HOST".to_string()
+            ]
+        );
+        assert_eq!(
+        RemoteSessionFetcher::merge_hosts(
+            &["Alice@HOST".to_string()],
+            &["alice@host".to_string()]
+        ),
+        vec!["Alice@HOST".to_string(), "alice@host".to_string()]
+    );
+}
+
+    #[test]
     fn tailscale_parser_returns_online_peer_dns_names() {
         let json = r#"{
             "Self": {"DNSName": "this-pc.tailnet.ts.net."},
@@ -517,6 +545,14 @@ bad line
         assert!(matches!(
             focus_session(&file_only),
             SessionFocusResult::Unsupported { .. }
+        ));
+        assert!(matches!(
+            request_session_attention(&remote),
+            Err(SessionFocusResult::Unsupported { .. })
+        ));
+        assert!(matches!(
+            request_session_attention(&file_only),
+            Err(SessionFocusResult::Unsupported { .. })
         ));
     }
 

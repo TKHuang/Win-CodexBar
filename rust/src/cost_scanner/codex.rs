@@ -1,13 +1,68 @@
 use super::*;
+use crate::core::codex_included_pricing::mark_included_records;
+use crate::core::{CodexForkAccountingState, CodexSessionLineage, CodexSessionMetadata};
 
 mod cache_days;
+mod flat_sources;
+mod fork_resume;
 mod logical_target;
 mod pending_range;
+mod priority_trace;
 mod reconciliation;
+mod scan;
 use cache_days::rebuild_cache_days;
+use flat_sources::{
+    CodexFlatListing, earliest_flat_codex_day, is_flat_codex_path_in_scan_window,
+    relocate_moved_codex_rollouts,
+};
+use fork_resume::CodexForkResume;
 use logical_target::*;
-use pending_range::{CodexPendingScanContext, codex_cache_has_validated_state};
+use pending_range::{
+    CodexPendingScanContext, CodexPendingScanDisposition, codex_cache_has_validated_state,
+};
 use reconciliation::*;
+
+#[derive(Debug)]
+enum CodexAccountingMode {
+    Standard,
+    Baseline {
+        baseline: crate::core::CodexTotals,
+        paginated_continuation: bool,
+        provenance: CodexBaselineProvenance,
+    },
+    InferSubagent {
+        start_ordinal: Option<i64>,
+    },
+    Unresolved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexBaselineProvenance {
+    ValidatedParent { replaces_cached_state: bool },
+    CachedValidatedParent,
+}
+
+impl CodexAccountingMode {
+    fn is_unresolved(&self) -> bool {
+        matches!(self, Self::Unresolved)
+    }
+
+    fn infers_subagent_baseline(&self) -> bool {
+        matches!(self, Self::InferSubagent { .. })
+    }
+
+    fn requires_cached_reparse(&self) -> bool {
+        matches!(
+            self,
+            Self::Baseline {
+                provenance: CodexBaselineProvenance::ValidatedParent {
+                    replaces_cached_state: true
+                },
+                ..
+            }
+        )
+    }
+}
 
 fn summary_from_cached_report(
     report: &CachedCostReport,
@@ -37,61 +92,59 @@ fn summary_from_cached_report(
     }
 }
 
-fn codex_fork_parent_is_safe(cache: &CostUsageCache, usage: &CostUsageFileUsage) -> bool {
-    usage.codex_forked_from_id.as_deref().is_none()
-        || codex_parent_baseline(
-            cache,
-            usage.codex_forked_from_id.as_deref().unwrap_or_default(),
-            usage.codex_fork_timestamp.as_deref(),
-        )
-        .is_some()
+fn codex_usage_uses_parent(usage: &CostUsageFileUsage) -> bool {
+    usage.codex_lineage.uses_parent_baseline()
+        || (matches!(usage.codex_lineage, CodexSessionLineage::Root)
+            && usage.codex_forked_from_id.is_some())
 }
 
-/// Return a parent cumulative baseline only when exactly one cached session
-/// identity is current, complete, timestamp-ordered, and safe to trust.
-fn codex_parent_baseline(
-    cache: &CostUsageCache,
-    parent_session_id: &str,
-    child_fork_timestamp: Option<&str>,
-) -> Option<crate::core::CodexTotals> {
-    let mut baseline = None;
-    for (path_key, usage) in &cache.files {
-        if usage.codex_session_id.as_deref() != Some(parent_session_id) {
-            continue;
-        }
-        if usage.codex_unresolved_fork_parent
-            || usage.codex_token_timestamps_monotonic != Some(true)
-        {
-            return None;
-        }
-        let metadata = fs::metadata(path_key).ok()?;
-        if let (Some(expected), Some(actual)) = (
-            usage.codex_file_identity.as_ref(),
-            JsonlScanner::codex_file_identity(Path::new(path_key), &metadata),
-        ) && expected != &actual
-        {
-            return None;
-        }
-        #[allow(clippy::cast_possible_wrap, reason = "session file sizes fit i64")]
-        let size = metadata.len().min(i64::MAX as u64) as i64;
-        if usage.mtime_unix_ms != system_time_to_unix_ms(metadata.modified().ok())
-            || usage.size != size
-            || usage.parsed_bytes.unwrap_or(0) < size
-        {
-            return None;
-        }
-        let last_totals = usage.last_totals.clone()?;
-        let last_token_timestamp = usage.codex_last_token_timestamp.as_deref()?;
-        let child_fork_timestamp = child_fork_timestamp?;
-        if !JsonlScanner::codex_timestamp_at_or_before(last_token_timestamp, child_fork_timestamp) {
-            return None;
-        }
-        if baseline.replace(last_totals).is_some() {
-            // Duplicate identities make the dependency ambiguous.
-            return None;
-        }
-    }
-    baseline
+fn codex_fork_uses_local_inference(usage: &CostUsageFileUsage) -> bool {
+    usage
+        .codex_fork_accounting_state
+        .as_ref()
+        .is_some_and(|state| state.locally_resolved)
+}
+
+/// `<CODEX_HOME>/logs_2.sqlite`, else `~/.codex/logs_2.sqlite`.
+///
+/// Deliberate Windows deviation: upstream pins the trace database to
+/// `~/.codex` and ignores `CODEX_HOME`. Here the scanned session roots come
+/// from `CODEX_HOME`, and the Priority overlay only prices session files under
+/// the database's own home, so both must resolve the same home or a
+/// `CODEX_HOME` user would never see Priority pricing.
+fn ambient_codex_trace_database_path(
+    codex_home: Option<String>,
+    home_dir: Option<PathBuf>,
+) -> Option<PathBuf> {
+    let home = codex_home
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home_dir.map(|home| home.join(".codex")))?;
+    Some(home.join(priority_trace::CODEX_TRACE_DATABASE_FILE))
+}
+
+/// First day that can hold a Codex date partition: January 1 of the earliest
+/// `YYYY` directory under any sessions root (upstream `firstPartitionDate`).
+///
+/// An all-available window starts here so the `YYYY/MM/DD` walk never probes
+/// empty history. Years before 1970 are stray directories, not sessions.
+pub(super) fn first_codex_partition_date(sessions_dirs: &[PathBuf]) -> Option<NaiveDate> {
+    sessions_dirs
+        .iter()
+        .filter_map(|root| fs::read_dir(root).ok())
+        .flat_map(|entries| entries.flatten())
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            (name.len() == 4 && name.bytes().all(|byte| byte.is_ascii_digit()))
+                .then(|| name.parse::<i32>().ok())
+                .flatten()
+        })
+        .filter(|year| *year >= 1970)
+        .min()
+        .and_then(|year| NaiveDate::from_ymd_opt(year, 1, 1))
 }
 
 fn is_codex_path_in_scan_window(
@@ -99,6 +152,9 @@ fn is_codex_path_in_scan_window(
     sessions_dirs: &[PathBuf],
     range: &CostUsageDayRange,
 ) -> bool {
+    if is_flat_codex_path_in_scan_window(path, sessions_dirs, range) {
+        return true;
+    }
     sessions_dirs.iter().any(|sessions_dir| {
         codex_scan_dates(range).into_iter().any(|date| {
             let date_dir = sessions_dir
@@ -119,6 +175,13 @@ fn is_codex_path_in_scan_window(
 struct CodexScanCandidate {
     path: PathBuf,
     mtime_unix_ms: i64,
+}
+
+struct CodexPreparedCandidate {
+    path: PathBuf,
+    session_metadata: CodexSessionMetadata,
+    lineage_gate: CodexLineageGate,
+    parent_owner_expected: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -154,356 +217,7 @@ impl CostScanner {
         &self,
         cancel: Option<&AtomicBool>,
     ) -> (CostSummary, CostScanStats, CostUsageCache) {
-        let mut summary = CostSummary::default();
-        let mut stats = CostScanStats::default();
-        let today = Local::now().date_naive();
-        let start_date = codex_period_start(today, self.days);
-        let range = CostUsageDayRange::new(start_date, today);
-        let now_ms = unix_now_ms();
-
-        summary.period_start = Some(start_date);
-        summary.period_end = Some(today);
-
-        let cache_root = self.cache_root.as_deref();
-        let mut cache = JsonlScanner::load_cache(ProviderId::Codex, cache_root);
-        let sessions_dirs = self.get_codex_sessions_dirs();
-        let pending_scan = CodexPendingScanContext::new(
-            &cache,
-            &range,
-            &sessions_dirs,
-            self.options.is_app_driven(),
-        );
-
-        // A no-progress or source-error catch-up is terminal for background
-        // synchronization. Keep the resumable queue and last validated report
-        // intact until the user explicitly requests an app-driven refresh.
-        if pending_scan.should_preserve_pause(&cache, self.options.is_app_driven()) {
-            return (
-                paused_codex_summary(&cache, start_date, today),
-                stats,
-                cache,
-            );
-        }
-        if self.options.is_app_driven() || pending_scan.is_incompatible {
-            cache.codex_scan_pause_reason = None;
-        }
-
-        let scan_range = &pending_scan.scan_range;
-
-        // Debounce: rebuild from disk cache without re-walking session files.
-        if JsonlScanner::should_skip_cached_scan(&cache, self.options, now_ms)
-            && !cache.codex_scan_incomplete
-            && JsonlScanner::cache_covers_range(&cache, &range)
-            && (!cache.days.is_empty() || !cache.files.is_empty())
-        {
-            stats.used_cache_debounce = true;
-            // A16 (upstream 0.48.0): cache hit within debounce = coverage established
-            // when the cache has data and no catch-up is pending. Final publication
-            // also waits for the cancellable Pi/OMP scan below.
-            let cached_history_coverage_established = !cache.codex_scan_incomplete
-                && cache.previous_report.is_none()
-                && JsonlScanner::cache_covers_range(&cache, &range);
-            let (cost, _) = add_codex_days_map_to_summary(&mut summary, &cache.days, &range);
-            summary.total_cost_usd += cost;
-            // Session count is a display field; the cache holds far fewer files than u32::MAX.
-            #[allow(clippy::cast_possible_truncation, reason = "cache file counts fit u32")]
-            let sessions_count = cache
-                .files
-                .values()
-                .filter(|usage| {
-                    usage.days.keys().any(|day| {
-                        CostUsageDayRange::is_in_range(day, &range.since_key, &range.until_key)
-                    })
-                })
-                .count() as u32;
-            summary.sessions_count = sessions_count;
-
-            // Pi-compatible sessions are outside the Codex JSONL cache.
-            // Skip when tests inject sessions roots — avoid scanning the real home tree.
-            if self.sessions_dirs_override.is_none() {
-                let mut seen_pi = HashSet::new();
-                crate::pi_session_cost::scan_pi_compatible_into(
-                    &mut summary,
-                    crate::pi_session_cost::PiMappedProvider::Codex,
-                    self.days,
-                    cancel,
-                    &mut seen_pi,
-                );
-            }
-            summary.history_coverage_established =
-                cached_history_coverage_established && !is_cancelled(cancel);
-            // Upstream 0.50.1 #2932: debounce cache hit with coverage
-            // established but zero sessions in-range is a known-zero.
-            summary.known_zero =
-                summary.history_coverage_established && summary.sessions_count == 0;
-            return (summary, stats, cache);
-        }
-
-        let established_report_before_scan = (!cache.codex_scan_incomplete
-            && cache.previous_report.is_none()
-            && (cache.scan_since_key.is_some()
-                || !cache.days.is_empty()
-                || !cache.files.is_empty()))
-        .then(|| JsonlScanner::cached_cost_report_from_days(&cache));
-
-        // Persist the source-bound work range before doing bounded work.
-        cache.codex_pending_scan_since_key = Some(scan_range.scan_since_key.clone());
-        cache.codex_pending_scan_until_key = Some(scan_range.scan_until_key.clone());
-        cache.codex_pending_scan_root_paths = pending_scan.root_paths.clone();
-        cache.codex_pending_scan_timezone = Some(pending_scan.timezone.clone());
-
-        let (mut candidates, discovery_complete) =
-            self.collect_codex_candidates(&sessions_dirs, scan_range, &cache, cancel, &mut stats);
-        let candidate_limit = if self.options.codex_candidate_limit == 0 {
-            usize::MAX
-        } else {
-            self.options.codex_candidate_limit
-        };
-        let refresh_byte_limit = if self.options.codex_max_scan_bytes_per_refresh <= 0 {
-            i64::MAX
-        } else {
-            self.options.codex_max_scan_bytes_per_refresh
-        };
-        let per_file_limit = if self.options.codex_max_session_file_bytes <= 0 {
-            i64::MAX
-        } else {
-            self.options.codex_max_session_file_bytes
-        };
-        let mut bytes_read_this_refresh = 0_i64;
-        let mut pending_next = cache.codex_pending_paths.clone();
-        let pending_paths_before_pass = cache.codex_pending_paths.clone();
-        prioritize_codex_pending_candidates(&mut candidates, &pending_paths_before_pass);
-        if discovery_complete && !is_cancelled(cancel) {
-            pending_next
-                .retain(|path| !cached_codex_file_is_complete_for_range(&cache, path, scan_range));
-        }
-
-        let mut incomplete_processed = Vec::new();
-        for (index, candidate) in candidates.iter().enumerate() {
-            if is_cancelled(cancel)
-                || index >= candidate_limit
-                || bytes_read_this_refresh >= refresh_byte_limit
-            {
-                for deferred in &candidates[index..] {
-                    let key = deferred.path.to_string_lossy().to_string();
-                    if !pending_next.contains(&key) {
-                        pending_next.push(key);
-                    }
-                }
-                stats.files_deferred = stats.files_deferred.saturating_add(
-                    u32::try_from((candidates.len() - index).min(u32::MAX as usize))
-                        .unwrap_or(u32::MAX),
-                );
-                break;
-            }
-
-            let refresh_remaining = refresh_byte_limit.saturating_sub(bytes_read_this_refresh);
-            let allowance = per_file_limit.min(refresh_remaining);
-            if allowance <= 0 {
-                for deferred in &candidates[index..] {
-                    let key = deferred.path.to_string_lossy().to_string();
-                    if !pending_next.contains(&key) {
-                        pending_next.push(key);
-                    }
-                }
-                stats.files_deferred = stats.files_deferred.saturating_add(
-                    u32::try_from((candidates.len() - index).min(u32::MAX as usize))
-                        .unwrap_or(u32::MAX),
-                );
-                break;
-            }
-
-            let outcome = self.parse_codex_file_bounded(
-                &candidate.path,
-                scan_range,
-                &mut summary,
-                &mut cache,
-                cancel,
-                &mut stats,
-                Some(allowance),
-            );
-            bytes_read_this_refresh =
-                bytes_read_this_refresh.saturating_add(outcome.bytes_read.max(0));
-            stats.codex_bytes_read = stats
-                .codex_bytes_read
-                .saturating_add(u64::try_from(outcome.bytes_read.max(0)).unwrap_or(u64::MAX));
-            let key = candidate.path.to_string_lossy().to_string();
-            pending_next.retain(|pending| pending != &key);
-            let observed_size = fs::metadata(&candidate.path)
-                .ok()
-                .map(|metadata| {
-                    #[allow(
-                        clippy::cast_possible_wrap,
-                        reason = "file sizes are clamped to i64::MAX"
-                    )]
-                    let size = metadata.len().min(i64::MAX as u64) as i64;
-                    size
-                })
-                .unwrap_or(0);
-            let has_unconsumed_tail = cache.files.get(&key).is_some_and(|usage| {
-                codex_logical_target_has_unconsumed_tail(observed_size, usage)
-            });
-            if !outcome.is_complete || has_unconsumed_tail {
-                incomplete_processed.push(key);
-                stats.files_deferred = stats.files_deferred.saturating_add(1);
-            }
-        }
-        pending_next.extend(incomplete_processed);
-
-        let mut pruned_paths_pending = Vec::new();
-        if discovery_complete && !is_cancelled(cancel) {
-            pruned_paths_pending = missing_codex_cache_paths(&cache, &sessions_dirs, scan_range);
-            if self.options.is_app_driven() {
-                reconcile_missing_codex_cache_files(&mut cache, &sessions_dirs, scan_range);
-                for path in &pending_paths_before_pass {
-                    if !Path::new(path).exists() {
-                        cache.files.remove(path);
-                    }
-                }
-            } else {
-                for path in &pruned_paths_pending {
-                    if !pending_next.contains(path) {
-                        pending_next.push(path.clone());
-                    }
-                }
-            }
-        }
-        pending_next.retain(|path| {
-            // An incomplete discovery is a source failure, not proof that a
-            // queued path was pruned. Preserve the priority cursor verbatim so
-            // the next explicit refresh can validate the source and resume it.
-            if !discovery_complete
-                || is_cancelled(cancel)
-                || (!self.options.is_app_driven()
-                    && pruned_paths_pending.iter().any(|pending| pending == path))
-            {
-                return true;
-            }
-            Path::new(path).exists()
-                && is_codex_path_in_scan_window(Path::new(path), &sessions_dirs, scan_range)
-        });
-        if discovery_complete
-            && !is_cancelled(cancel)
-            && (pruned_paths_pending.is_empty() || self.options.is_app_driven())
-        {
-            pending_next.sort();
-            pending_next.dedup();
-        } else {
-            // Preserve queue order while the source is unavailable or the
-            // pass is cancelled; this is the durable priority cursor.
-            let mut seen_pending = HashSet::new();
-            pending_next.retain(|path| seen_pending.insert(path.clone()));
-        }
-        cache.codex_pending_paths = pending_next;
-        cache.codex_scan_incomplete =
-            !discovery_complete || is_cancelled(cancel) || !cache.codex_pending_paths.is_empty();
-        rebuild_cache_days(&mut cache);
-        cache.last_scan_unix_ms = now_ms;
-        if cache.codex_scan_incomplete {
-            if cache.previous_report.is_none() {
-                cache.previous_report = established_report_before_scan;
-            }
-            if !is_cancelled(cancel) {
-                cache.codex_scan_pause_reason = if !discovery_complete {
-                    Some(CodexScanPauseReason::Error(
-                        "Codex session source unavailable".to_string(),
-                    ))
-                } else if !pruned_paths_pending.is_empty()
-                    || (bytes_read_this_refresh == 0 && !cache.codex_pending_paths.is_empty())
-                {
-                    Some(CodexScanPauseReason::NoProgress)
-                } else {
-                    None
-                };
-            }
-        } else {
-            cache.scan_since_key = Some(scan_range.scan_since_key.clone());
-            cache.scan_until_key = Some(scan_range.scan_until_key.clone());
-            cache.codex_pending_scan_since_key = None;
-            cache.codex_pending_scan_until_key = None;
-            cache.codex_pending_scan_root_paths.clear();
-            cache.codex_pending_scan_timezone = None;
-            cache.previous_report = None;
-            cache.codex_scan_pause_reason = None;
-        }
-        JsonlScanner::save_cache(ProviderId::Codex, &mut cache, cache_root);
-
-        // Build the current native summary from the complete decoded cache view,
-        // including prior cached files that were not reread in this bounded pass.
-        // A cancelled pass retains missing rows on disk for deletion
-        // reconciliation, but must not publish those stale rows in its summary.
-        let mut summary_cache = cache.clone();
-        if is_cancelled(cancel) {
-            summary_cache
-                .files
-                .retain(|path, _| Path::new(path).exists());
-            rebuild_cache_days(&mut summary_cache);
-        }
-        let mut rebuilt = CostSummary {
-            period_start: Some(start_date),
-            period_end: Some(today),
-            ..CostSummary::default()
-        };
-        let (native_cost, _) =
-            add_codex_days_map_to_summary(&mut rebuilt, &summary_cache.days, &range);
-        rebuilt.total_cost_usd += native_cost;
-        #[allow(clippy::cast_possible_truncation, reason = "cache file counts fit u32")]
-        {
-            rebuilt.sessions_count = summary_cache
-                .files
-                .values()
-                .filter(|usage| {
-                    usage.days.keys().any(|day| {
-                        CostUsageDayRange::is_in_range(day, &range.since_key, &range.until_key)
-                    })
-                })
-                .count() as u32;
-        }
-        let cancelled_with_missing_cache_rows =
-            is_cancelled(cancel) && cache.files.keys().any(|path| !Path::new(path).exists());
-        let preserving_previous_report = cache.codex_scan_incomplete
-            && cache.previous_report.is_some()
-            && !cancelled_with_missing_cache_rows;
-        summary = if preserving_previous_report {
-            cache
-                .previous_report
-                .as_ref()
-                .map(|report| summary_from_cached_report(report, start_date, today))
-                .unwrap_or(rebuilt)
-        } else {
-            rebuilt
-        };
-
-        // OMP / pi-compatible agent sessions (upstream #2269). Dedup by entry id.
-        // Skip when tests inject sessions roots — avoid scanning the real home tree.
-        // A16 --provider-native-only: skip pi/OMP mirrors when disabled.
-        if !preserving_previous_report
-            && self.sessions_dirs_override.is_none()
-            && self.options.include_pi_sessions
-        {
-            let mut seen_pi = HashSet::new();
-            crate::pi_session_cost::scan_pi_compatible_into(
-                &mut summary,
-                crate::pi_session_cost::PiMappedProvider::Codex,
-                self.days,
-                cancel,
-                &mut seen_pi,
-            );
-        }
-
-        // v0.56.1 #3279: only publish authoritative coverage after all
-        // cancellable scan work, including Pi/OMP, has completed. Persistence
-        // pruning may retain `previous_report`, but that must not make a
-        // completed in-memory scan stale or make a cancelled partial scan look
-        // complete.
-        summary.history_coverage_established =
-            !is_cancelled(cancel) && !cache.codex_scan_incomplete;
-        // Upstream 0.50.1 #2932: a completed scan with zero results is a
-        // *known* zero. Only set when coverage is established; an incomplete
-        // scan must NOT fabricate a zero.
-        summary.known_zero = summary.history_coverage_established && summary.sessions_count == 0;
-
-        (summary, stats, cache)
+        scan::scan_codex_detailed_with_cache(self, cancel)
     }
 
     /// Scan Claude local logs
@@ -521,11 +235,32 @@ impl CostScanner {
         )
     }
 
+    /// The Codex trace database that supplies Priority evidence.
+    ///
+    /// An explicit fixture is authoritative. Like upstream's test isolation,
+    /// unit tests and injected sessions roots never fall back to the ambient
+    /// user database, so no test reads (or caches a cursor for) real traces.
+    pub(super) fn codex_trace_database_path(&self) -> Option<PathBuf> {
+        if let Some(path) = &self.codex_trace_database_override {
+            return Some(path.clone());
+        }
+        if self.sessions_dirs_override.is_some() || cfg!(test) {
+            return None;
+        }
+        ambient_codex_trace_database_path(std::env::var("CODEX_HOME").ok(), dirs::home_dir())
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "candidate discovery carries the shared scan state"
+    )]
     fn collect_codex_candidates(
         &self,
         sessions_dirs: &[PathBuf],
         range: &CostUsageDayRange,
         cache: &CostUsageCache,
+        planner: &CodexLineagePlanner,
+        flat_listing: &CodexFlatListing,
         cancel: Option<&AtomicBool>,
         stats: &mut CostScanStats,
     ) -> (Vec<CodexScanCandidate>, bool) {
@@ -587,7 +322,7 @@ impl CostScanner {
                     };
                     let mtime_unix_ms = system_time_to_unix_ms(metadata.modified().ok());
                     let unchanged_complete =
-                        cached_codex_file_is_complete_for_range(cache, &path_key, range);
+                        cached_codex_file_is_complete_for_range(cache, planner, &path_key, range);
                     if unchanged_complete {
                         stats.files_seen = stats.files_seen.saturating_add(1);
                         stats.files_skipped = stats.files_skipped.saturating_add(1);
@@ -599,6 +334,27 @@ impl CostScanner {
                     });
                 }
             }
+        }
+
+        // Archived and legacy flat rollouts, listed once per pass.
+        discovery_complete &= flat_listing.complete;
+        for (path, mtime_unix_ms) in &flat_listing.files {
+            if is_cancelled(cancel) {
+                return (candidates, false);
+            }
+            let path_key = path.to_string_lossy().to_string();
+            if !seen.insert(path_key.clone()) {
+                continue;
+            }
+            if cached_codex_file_is_complete_for_range(cache, planner, &path_key, range) {
+                stats.files_seen = stats.files_seen.saturating_add(1);
+                stats.files_skipped = stats.files_skipped.saturating_add(1);
+                continue;
+            }
+            candidates.push(CodexScanCandidate {
+                path: path.clone(),
+                mtime_unix_ms: *mtime_unix_ms,
+            });
         }
 
         // Persisted paths are retried even if their directory partition was not
@@ -647,7 +403,10 @@ impl CostScanner {
         cancel: Option<&AtomicBool>,
         stats: &mut CostScanStats,
     ) {
-        let _ = self.parse_codex_file_bounded(path, range, summary, cache, cancel, stats, None);
+        let planner = CodexLineagePlanner::new(cache);
+        let _ = self.parse_codex_file_bounded(
+            path, range, summary, cache, cancel, stats, None, None, &planner,
+        );
     }
 
     #[allow(
@@ -663,11 +422,15 @@ impl CostScanner {
         cancel: Option<&AtomicBool>,
         stats: &mut CostScanStats,
         max_bytes_to_read: Option<i64>,
+        prepared_candidate: Option<&CodexPreparedCandidate>,
+        planner: &CodexLineagePlanner,
     ) -> CodexFileScanOutcome {
         if is_cancelled(cancel) {
             return CodexFileScanOutcome::default();
         }
-        stats.files_seen = stats.files_seen.saturating_add(1);
+        if prepared_candidate.is_none() {
+            stats.files_seen = stats.files_seen.saturating_add(1);
+        }
 
         let metadata = match fs::metadata(path) {
             Ok(metadata) => metadata,
@@ -697,20 +460,21 @@ impl CostScanner {
             };
         }
         let cache_entry_is_fresh = |entry: &CostUsageFileUsage| {
-            cached_codex_file_is_fresh(cache, entry, cache_covers_range, mtime_ms, size)
+            cached_codex_file_is_fresh(cache, planner, entry, cache_covers_range, mtime_ms, size)
         };
-        let identity_matches_cached = |entry: &CostUsageFileUsage| match (
-            entry.codex_file_identity.as_ref(),
-            file_identity.as_ref(),
-        ) {
-            (Some(expected), Some(actual)) => expected == actual,
-            _ => false,
+        let identity_matches_cached = |entry: &CostUsageFileUsage| {
+            codex_file_identity_matches(
+                entry.codex_file_identity.as_deref(),
+                file_identity.as_deref(),
+            )
         };
 
         // The compact cache is authoritative for an unchanged file. Do this
         // before reading even the bounded metadata prefix; raw token history
         // is only needed after freshness fails or a fork needs reconciliation.
         if let Some(entry) = cached.as_ref()
+            && prepared_candidate
+                .is_none_or(|candidate| candidate.lineage_gate == CodexLineageGate::Eligible)
             && cache_entry_is_fresh(entry)
             && identity_matches_cached(entry)
         {
@@ -727,28 +491,61 @@ impl CostScanner {
             };
         }
 
-        stats.codex_metadata_read_paths.push(path_key.clone());
-        stats.codex_read_receipt.metadata_reads =
-            stats.codex_read_receipt.metadata_reads.saturating_add(1);
-        let session_metadata = JsonlScanner::read_codex_session_metadata(path).unwrap_or_default();
-        let cached_identity_matches = cached
-            .as_ref()
-            .is_some_and(|entry| entry.mtime_unix_ms == mtime_ms && entry.size == size);
+        let session_metadata = if let Some(prepared) = prepared_candidate {
+            prepared.session_metadata.clone()
+        } else {
+            stats.codex_metadata_read_paths.push(path_key.clone());
+            stats.codex_read_receipt.metadata_reads =
+                stats.codex_read_receipt.metadata_reads.saturating_add(1);
+            JsonlScanner::read_codex_session_metadata(path).unwrap_or_default()
+        };
+        // Upstream #4452: a ChatGPT-created rollout's Auto-review requests are
+        // keyed apart so their day aggregates price at $0 (see codex_included_pricing).
+        let has_creator_account = session_metadata.has_creator_account;
+        // Cached lineage metadata belongs to a physical file, not merely a
+        // path/size/mtime tuple. Missing identity evidence fails closed.
+        let cached_identity_matches = cached.as_ref().is_some_and(identity_matches_cached);
         let codex_session_id = session_metadata.session_id.clone().or_else(|| {
             cached_identity_matches
                 .then(|| cached.as_ref()?.codex_session_id.clone())
                 .flatten()
         });
         let codex_forked_from_id = session_metadata.forked_from_id.clone().or_else(|| {
-            cached_identity_matches
+            // A parsed identity makes the metadata authoritative: an absent
+            // billing parent must clear any dependency cached by older parsers.
+            (cached_identity_matches && session_metadata.session_id.is_none())
                 .then(|| cached.as_ref()?.codex_forked_from_id.clone())
                 .flatten()
         });
+        let cached_fork_accounting_state = cached
+            .as_ref()
+            .and_then(|entry| entry.codex_fork_accounting_state.clone());
         let codex_fork_timestamp = session_metadata.fork_timestamp.clone().or_else(|| {
             cached_identity_matches
                 .then(|| cached.as_ref()?.codex_fork_timestamp.clone())
                 .flatten()
         });
+        let history_base_thread_id =
+            session_metadata.history_base_thread_id.clone().or_else(|| {
+                cached_identity_matches
+                    .then(|| {
+                        cached_fork_accounting_state
+                            .as_ref()?
+                            .history_base_thread_id
+                            .clone()
+                    })
+                    .flatten()
+            });
+        let codex_lineage = if session_metadata.session_id.is_some() {
+            session_metadata.lineage
+        } else if cached_identity_matches {
+            cached
+                .as_ref()
+                .map(|entry| entry.codex_lineage)
+                .unwrap_or_default()
+        } else {
+            CodexSessionLineage::Root
+        };
         let cached_identity_changed = cached.as_ref().is_some_and(|entry| {
             session_metadata
                 .session_id
@@ -760,13 +557,55 @@ impl CostScanner {
                     .as_ref()
                     .zip(entry.codex_forked_from_id.as_ref())
                     .is_some_and(|(current, previous)| current != previous)
+                || (session_metadata.session_id.is_some()
+                    && session_metadata.forked_from_id.is_none()
+                    && entry.codex_forked_from_id.is_some())
+                || (session_metadata.session_id.is_some()
+                    && session_metadata.lineage != entry.codex_lineage)
+                || (session_metadata.session_id.is_some()
+                    && cached_fork_accounting_state.as_ref().is_some_and(|state| {
+                        state.history_base_thread_id != session_metadata.history_base_thread_id
+                    }))
         });
-        let is_fork = codex_forked_from_id.is_some();
-        let fork_baseline = codex_forked_from_id.as_deref().and_then(|parent_id| {
-            codex_parent_baseline(cache, parent_id, codex_fork_timestamp.as_deref())
-        });
+        let is_fork = codex_lineage.uses_parent_baseline();
+        let cached_fork_state_matches =
+            cached_fork_accounting_state.as_ref().is_some_and(|state| {
+                state.session_id == codex_session_id
+                    && state.forked_from_id == codex_forked_from_id
+                    && state.history_base_thread_id == history_base_thread_id
+                    && state.fork_timestamp == codex_fork_timestamp
+            });
+        let matching_cached_fork_state = cached_fork_accounting_state
+            .as_ref()
+            .filter(|_| cached_fork_state_matches);
+        let paginated_continuation = is_fork
+            && codex_forked_from_id.is_some()
+            && history_base_thread_id
+                .as_deref()
+                .is_some_and(|history_base| Some(history_base) != codex_forked_from_id.as_deref());
+        let lineage_gate = prepared_candidate
+            .map(|candidate| candidate.lineage_gate)
+            .unwrap_or_default();
+        let parent_owner_expected =
+            prepared_candidate.is_some_and(|candidate| candidate.parent_owner_expected);
+        let lineage_decision = planner.decision_for_scan(
+            cache,
+            is_fork,
+            lineage_gate,
+            codex_forked_from_id.as_deref(),
+            codex_fork_timestamp.as_deref(),
+            parent_owner_expected,
+        );
+        let accounting_mode = lineage_decision.accounting_mode(
+            matching_cached_fork_state,
+            &session_metadata,
+            paginated_continuation,
+        );
 
-        if is_fork && fork_baseline.is_none() {
+        if accounting_mode.is_unresolved() {
+            // Priority evidence lives in `codex_fork_rows`; a fork that could
+            // not resolve its parent baseline must not keep stale rows.
+            cache.codex_fork_rows.remove(&path_key);
             cache.files.insert(
                 path_key,
                 CostUsageFileUsage {
@@ -782,6 +621,8 @@ impl CostScanner {
                     codex_last_token_timestamp: None,
                     codex_session_id,
                     codex_forked_from_id,
+                    codex_fork_accounting_state: None,
+                    codex_lineage,
                     codex_fork_timestamp,
                     codex_unresolved_fork_parent: true,
                 },
@@ -794,19 +635,16 @@ impl CostScanner {
         }
 
         if let Some(entry) = &cached
-            && cached_codex_file_is_fresh(cache, entry, cache_covers_range, mtime_ms, size)
-            && (entry.codex_file_identity.is_none() || identity_matches_cached(entry))
+            && cached_codex_file_is_fresh(cache, planner, entry, cache_covers_range, mtime_ms, size)
+            && identity_matches_cached(entry)
+            && !cached_identity_changed
+            && !accounting_mode.requires_cached_reparse()
         {
             let (session_cost, has_tokens) =
                 add_codex_days_map_to_summary(summary, &entry.days, range);
             if has_tokens {
                 summary.total_cost_usd += session_cost;
                 summary.sessions_count += 1;
-            }
-            if entry.codex_file_identity != file_identity {
-                let mut refreshed = entry.clone();
-                refreshed.codex_file_identity = file_identity.clone();
-                cache.files.insert(path_key.clone(), refreshed);
             }
             stats.files_skipped = stats.files_skipped.saturating_add(1);
             return CodexFileScanOutcome {
@@ -837,26 +675,37 @@ impl CostScanner {
                 && JsonlScanner::is_line_boundary_offset(path, start_offset)
             {
                 let resumable_target_size = codex_resumable_scan_target_size(size, entry);
-                let parse_result = match JsonlScanner::parse_codex_file_with_state_bounded_target(
-                    path,
-                    range,
-                    start_offset,
-                    entry.last_model.clone(),
-                    entry.last_totals.clone(),
-                    entry.codex_last_token_timestamp.clone(),
-                    entry.codex_token_timestamps_monotonic,
-                    cancel,
-                    resumable_target_size,
-                    max_bytes_to_read,
-                ) {
-                    Ok(result) => result,
-                    Err(_) => return CodexFileScanOutcome::default(),
-                };
+                let mut parse_result =
+                    match JsonlScanner::parse_codex_file_with_state_bounded_target(
+                        path,
+                        range,
+                        start_offset,
+                        entry.last_model.clone(),
+                        entry.last_totals.clone(),
+                        entry.codex_last_token_timestamp.clone(),
+                        entry.codex_token_timestamps_monotonic,
+                        cancel,
+                        resumable_target_size,
+                        max_bytes_to_read,
+                    ) {
+                        Ok(result) => result,
+                        Err(_) => return CodexFileScanOutcome::default(),
+                    };
                 stats.token_timestamp_comparisons = stats
                     .token_timestamp_comparisons
                     .saturating_add(parse_result.token_timestamp_comparisons);
+                mark_included_records(&mut parse_result.records, has_creator_account);
                 let mut days = entry.days.clone();
                 merge_codex_records_into_days(&mut days, &parse_result.records);
+                if codex_forked_from_id.is_some() {
+                    // Only extend rows that already cover the parsed prefix;
+                    // a partial row set could never match the day totals.
+                    if let Some(rows) = cache.codex_fork_rows.get_mut(&path_key) {
+                        rows.extend(codex_fork_rows_from_records(&parse_result.records));
+                    }
+                } else {
+                    cache.codex_fork_rows.remove(&path_key);
+                }
                 let (session_cost, has_tokens) =
                     add_codex_days_map_to_summary(summary, &days, range);
                 if has_tokens {
@@ -890,6 +739,8 @@ impl CostScanner {
                             .or_else(|| entry.codex_last_token_timestamp.clone()),
                         codex_session_id: codex_session_id.clone(),
                         codex_forked_from_id: codex_forked_from_id.clone(),
+                        codex_fork_accounting_state: None,
+                        codex_lineage,
                         codex_fork_timestamp: codex_fork_timestamp.clone(),
                         codex_unresolved_fork_parent: false,
                     },
@@ -899,20 +750,28 @@ impl CostScanner {
             }
         }
 
-        let parse_target_size = cached
+        let fork_resume = cached
             .as_ref()
-            .and_then(|entry| codex_resumable_scan_target_size(size, entry));
-        let parse_result = match if let Some(baseline) = fork_baseline.clone() {
-            JsonlScanner::parse_codex_file_with_state_bounded_fork_target(
-                path,
-                range,
-                baseline,
-                cancel,
-                parse_target_size,
-                max_bytes_to_read,
-            )
-        } else {
-            JsonlScanner::parse_codex_file_with_state_bounded(
+            .filter(|entry| {
+                is_fork
+                    && cache_covers_range
+                    && !cached_identity_changed
+                    && identity_matches_cached(entry)
+            })
+            .zip(matching_cached_fork_state)
+            .and_then(|(entry, state)| {
+                CodexForkResume::for_entry(path, entry, state, &accounting_mode, size, mtime_ms)
+            });
+        let resumed = fork_resume.is_some();
+        let parse_target_size = (!accounting_mode.requires_cached_reparse())
+            .then(|| {
+                cached
+                    .as_ref()
+                    .and_then(|entry| codex_resumable_scan_target_size(size, entry))
+            })
+            .flatten();
+        let mut parse_result = match match &accounting_mode {
+            CodexAccountingMode::Standard => JsonlScanner::parse_codex_file_with_state_bounded(
                 path,
                 range,
                 0,
@@ -922,7 +781,49 @@ impl CostScanner {
                 None,
                 cancel,
                 max_bytes_to_read,
-            )
+            ),
+            CodexAccountingMode::Baseline {
+                baseline,
+                paginated_continuation,
+                ..
+            } => match fork_resume {
+                Some(resume) => JsonlScanner::parse_codex_fork_resume(
+                    path,
+                    range,
+                    resume.parse,
+                    cancel,
+                    Some(resume.target_size),
+                    max_bytes_to_read,
+                ),
+                None => {
+                    JsonlScanner::parse_codex_file_with_state_bounded_fork_target_with_accounting(
+                        path,
+                        range,
+                        baseline.clone(),
+                        *paginated_continuation,
+                        // A parse from byte zero replays the inherited counters
+                        // itself. Only a resumed parse carries their used-up
+                        // remainder, as upstream restores fork state only then.
+                        None,
+                        cancel,
+                        parse_target_size,
+                        max_bytes_to_read,
+                    )
+                }
+            },
+            CodexAccountingMode::InferSubagent { start_ordinal } => {
+                JsonlScanner::parse_codex_file_with_inferred_fork_baseline(
+                    path,
+                    range,
+                    *start_ordinal,
+                    cancel,
+                    parse_target_size,
+                    max_bytes_to_read,
+                )
+            }
+            CodexAccountingMode::Unresolved => {
+                unreachable!("unresolved forks return before parsing")
+            }
         } {
             Ok(result) => result,
             Err(_) => return CodexFileScanOutcome::default(),
@@ -930,7 +831,14 @@ impl CostScanner {
         stats.token_timestamp_comparisons = stats
             .token_timestamp_comparisons
             .saturating_add(parse_result.token_timestamp_comparisons);
-        if parse_result.fork_baseline_ambiguous {
+        mark_included_records(&mut parse_result.records, has_creator_account);
+        if parse_result.fork_baseline_ambiguous
+            || (accounting_mode.infers_subagent_baseline()
+                && !parse_result.fork_baseline_locally_resolved)
+        {
+            // Priority evidence lives in `codex_fork_rows`; an ambiguous fork
+            // baseline must not keep stale rows.
+            cache.codex_fork_rows.remove(&path_key);
             cache.files.insert(
                 path_key,
                 CostUsageFileUsage {
@@ -946,6 +854,8 @@ impl CostScanner {
                     codex_last_token_timestamp: None,
                     codex_session_id,
                     codex_forked_from_id,
+                    codex_fork_accounting_state: None,
+                    codex_lineage,
                     codex_fork_timestamp,
                     codex_unresolved_fork_parent: true,
                 },
@@ -956,10 +866,29 @@ impl CostScanner {
                 is_complete: false,
             };
         }
-        let mut days = HashMap::new();
+        // A resumed parse returns only the suffix; its prefix is the cached day
+        // map, which is billed as the non-fork resume path bills it.
+        let mut days = match (resumed, cached.as_ref()) {
+            (true, Some(entry)) => entry.days.clone(),
+            _ => HashMap::new(),
+        };
         merge_codex_records_into_days(&mut days, &parse_result.records);
-        let (session_cost, has_tokens) =
-            add_codex_records_to_summary(summary, &parse_result.records, range);
+        if is_fork || codex_forked_from_id.is_some() {
+            // Priority evidence for fork-shaped files is tracked separately
+            // (source-row evidence skips them), so rebuild the row set from
+            // the same parsed records that fed the day totals.
+            cache.codex_fork_rows.insert(
+                path_key.clone(),
+                codex_fork_rows_from_records(&parse_result.records),
+            );
+        } else {
+            cache.codex_fork_rows.remove(&path_key);
+        }
+        let (session_cost, has_tokens) = if resumed {
+            add_codex_days_map_to_summary(summary, &days, range)
+        } else {
+            add_codex_records_to_summary(summary, &parse_result.records, range)
+        };
         if has_tokens {
             summary.total_cost_usd += session_cost;
             summary.sessions_count += 1;
@@ -967,6 +896,24 @@ impl CostScanner {
         let outcome = CodexFileScanOutcome {
             bytes_read: parse_result.bytes_read,
             is_complete: parse_result.is_complete,
+        };
+        let locally_resolved = parse_result.fork_baseline_locally_resolved;
+        let codex_fork_accounting_state = if is_fork
+            && (parse_result.fork_baseline.is_some() || parse_result.fork_baseline_locally_resolved)
+        {
+            Some(CodexForkAccountingState {
+                session_id: codex_session_id.clone(),
+                forked_from_id: codex_forked_from_id.clone(),
+                history_base_thread_id: history_base_thread_id.clone(),
+                fork_timestamp: codex_fork_timestamp.clone(),
+                inherited_totals: parse_result.fork_baseline.clone(),
+                first_token_timestamp: parse_result.first_token_timestamp.clone(),
+                remaining_inherited_totals: parse_result.remaining_inherited_totals.clone(),
+                locally_resolved,
+                resume: parse_result.fork_resume_state.clone(),
+            })
+        } else {
+            None
         };
         cache.files.insert(
             path_key,
@@ -983,13 +930,30 @@ impl CostScanner {
                 codex_last_token_timestamp: parse_result.last_token_timestamp,
                 codex_session_id,
                 codex_forked_from_id,
+                codex_fork_accounting_state,
+                codex_lineage,
                 codex_fork_timestamp,
                 codex_unresolved_fork_parent: false,
             },
         );
-        stats.files_parsed = stats.files_parsed.saturating_add(1);
+        if resumed {
+            stats.files_resumed = stats.files_resumed.saturating_add(1);
+        } else {
+            stats.files_parsed = stats.files_parsed.saturating_add(1);
+        }
         outcome
     }
+}
+
+/// Request rows for a fork-shaped file, keeping exactly the records that
+/// [`merge_codex_records_into_days`] folds into its day totals.
+fn codex_fork_rows_from_records(
+    records: &[(crate::core::CodexUsageRecord, i64)],
+) -> Vec<crate::core::CodexSourceUsageRow> {
+    crate::core::rows_from_records(records)
+        .into_iter()
+        .filter(|row| crate::core::CostUsagePricing::counts_toward_codex_subscription(&row.model))
+        .collect()
 }
 
 #[cfg(test)]

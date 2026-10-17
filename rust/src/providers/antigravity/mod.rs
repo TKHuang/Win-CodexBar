@@ -3,34 +3,44 @@
 //! Fetches usage data from Antigravity's local language server probe
 //! Uses Windows process detection to find CSRF token
 
+mod cli_fallback;
+mod cli_print_failure;
+mod cli_resolution;
+mod cost;
+mod legacy_status;
+mod local_history;
 mod local_proto;
 pub mod local_sessions;
+mod local_sessions_reader;
 mod local_sqlite;
 mod local_step_resolver;
+mod offline_reason;
 mod quota_summary;
 
+use legacy_status::{UserStatus, UserStatusResponse};
+use offline_reason::LiveFailure;
+
+#[cfg(windows)]
+use crate::managed_process::{ManagedProcess, ManagedProcessConfig, ManagedProcessError};
 use async_trait::async_trait;
 #[cfg(windows)]
 use futures::{StreamExt, stream};
 use regex_lite::Regex;
-use serde::Deserialize;
 #[cfg(windows)]
 use std::ffi::OsString;
+use std::future::Future;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
-use std::path::PathBuf;
 use std::process::Command;
-use std::sync::{LazyLock, OnceLock};
+use std::sync::LazyLock;
+#[cfg(windows)]
 use std::time::Duration;
 #[cfg(windows)]
 use std::time::Instant;
 
-#[cfg(windows)]
-use crate::managed_process::{ManagedProcess, ManagedProcessConfig, ManagedProcessError};
-
 use crate::core::{
-    FetchContext, NamedRateWindow, Provider, ProviderError, ProviderFetchResult, ProviderId,
-    ProviderMetadata, RateWindow, SourceMode, UsageSnapshot,
+    FetchContext, Provider, ProviderError, ProviderFetchResult, ProviderId, ProviderMetadata,
+    RateWindow, SourceMode, UsageSnapshot,
 };
 
 const AGY_NOT_FOUND_MESSAGE: &str =
@@ -64,6 +74,32 @@ impl From<ManagedProcessError> for ProviderError {
 /// Antigravity provider
 pub struct AntigravityProvider {
     metadata: ProviderMetadata,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AntigravityStrategyId {
+    Local,
+    Cli,
+    Offline,
+}
+
+impl AntigravityStrategyId {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Cli => "cli",
+            Self::Offline => "offline",
+        }
+    }
+}
+
+pub(crate) fn strategy_from_source_label(source_label: &str) -> Option<AntigravityStrategyId> {
+    match source_label {
+        "local" => Some(AntigravityStrategyId::Local),
+        "cli" => Some(AntigravityStrategyId::Cli),
+        "offline" => Some(AntigravityStrategyId::Offline),
+        _ => None,
+    }
 }
 
 /// Return a regex that matches `--<flag> <value>` or `--<flag>=<value>`.
@@ -118,6 +154,7 @@ impl AntigravityProvider {
                 is_primary: false,
                 dashboard_url: None,
                 status_page_url: None,
+                tertiary_label_key: None,
             },
         }
     }
@@ -332,13 +369,14 @@ impl AntigravityProvider {
             .secondary
             .as_ref()
             .is_some_and(|window| window.window_minutes == Some(7 * 24 * 60))
+            && usage.secondary_label.is_none()
         {
             usage.secondary_label = Some("Weekly".to_string());
         }
         usage
     }
 
-    async fn fetch_user_status(&self) -> Result<Option<UsageSnapshot>, ProviderError> {
+    async fn fetch_user_status(&self) -> Result<Option<ProviderFetchResult>, LiveFailure> {
         let process_info = tokio::task::spawn_blocking(Self::detect_process_info)
             .await
             .map_err(|error| {
@@ -359,7 +397,7 @@ impl AntigravityProvider {
         &self,
         process_info: &ProcessInfo,
         api_port: u16,
-    ) -> Result<UsageSnapshot, ProviderError> {
+    ) -> Result<ProviderFetchResult, LiveFailure> {
         // SECURITY: TLS verification disabled only for this loopback language server.
         let client = crate::core::credentialed_http_client_builder()
             .no_proxy()
@@ -404,9 +442,9 @@ impl AntigravityProvider {
                         && let Ok(identity) =
                             serde_json::from_slice::<UserStatusResponse>(&identity_bytes)
                     {
-                        Self::apply_user_identity(&mut snapshot, &identity);
+                        legacy_status::apply_user_identity(&mut snapshot, &identity);
                     }
-                    return Ok(snapshot);
+                    return Ok(Self::fetch_result(snapshot, AntigravityStrategyId::Local));
                 }
                 Err(error) => tracing::debug!(
                     %error,
@@ -438,7 +476,19 @@ impl AntigravityProvider {
         .await?;
         let response: UserStatusResponse = serde_json::from_slice(&bytes)
             .map_err(|e| ProviderError::Parse(format!("Failed to parse response: {e}")))?;
-        self.parse_user_status(response)
+        let usage = self.parse_user_status(response)?;
+        Ok(Self::fetch_result(usage, AntigravityStrategyId::Local))
+    }
+
+    pub(super) fn fetch_result(
+        usage: UsageSnapshot,
+        strategy: AntigravityStrategyId,
+    ) -> ProviderFetchResult {
+        ProviderFetchResult::new(Self::with_cadence_labels(usage), strategy.as_str())
+    }
+
+    async fn try_print_usage_fallback(&self) -> Result<Option<ProviderFetchResult>, LiveFailure> {
+        cli_fallback::try_fetch(cli_resolution::locate_agy_binary()?).await
     }
 
     /// Start a short-lived, headless `agy` session when neither the Antigravity
@@ -465,11 +515,11 @@ impl AntigravityProvider {
         match tokio::time::timeout(recheck_budget, self.fetch_user_status()).await {
             Ok(Ok(Some(usage))) => return Ok(ManagedAgyOutcome::Reused(usage)),
             Ok(Ok(None)) => {}
-            Ok(Err(error)) => return Err(error),
+            Ok(Err(error)) => return Err(error.into_error()),
             Err(_) => return Err(Self::managed_agy_timeout()),
         }
 
-        let Some(binary) = Self::locate_agy_binary() else {
+        let Some(binary) = cli_resolution::locate_agy_binary()? else {
             return Ok(ManagedAgyOutcome::Missing);
         };
         let probe_client = crate::core::credentialed_http_client_builder()
@@ -485,7 +535,8 @@ impl AntigravityProvider {
             env: vec![
                 (OsString::from("TERM"), OsString::from("xterm-256color")),
                 (OsString::from("COLORTERM"), OsString::from("truecolor")),
-            ],
+            ]
+            .into(),
             cwd: dirs::home_dir().filter(|path| path.is_dir()),
             pty_rows: 30,
             pty_cols: 120,
@@ -526,10 +577,10 @@ impl AntigravityProvider {
                             .await
                             {
                                 Ok(Ok(usage)) => return Ok(ManagedAgyOutcome::Fetched(usage)),
-                                Ok(Err(ProviderError::AuthRequired)) => {
+                                Ok(Err(error)) if error.is_auth_required() => {
                                     return Err(ProviderError::AuthRequired);
                                 }
-                                Ok(Err(error)) => last_error = Some(error),
+                                Ok(Err(error)) => last_error = Some(error.into_error()),
                                 Err(_) => break,
                             }
                         }
@@ -580,7 +631,7 @@ impl AntigravityProvider {
     }
 
     fn offline_usage_result() -> Option<ProviderFetchResult> {
-        let count = local_sessions::offline_conversation_count();
+        let count = local_history::offline_conversation_count();
         if count == 0 {
             return None;
         }
@@ -593,7 +644,10 @@ impl AntigravityProvider {
             "Offline · {count} {noun}"
         )))
         .with_login_method("offline");
-        Some(ProviderFetchResult::new(usage, "offline"))
+        Some(ProviderFetchResult::new(
+            usage,
+            AntigravityStrategyId::Offline.as_str(),
+        ))
     }
 
     /// Resolve a failure to obtain live usage.
@@ -601,15 +655,19 @@ impl AntigravityProvider {
     /// A failed sign-in is actionable, so it always surfaces. Every other
     /// failure means the runtime/CLI is unavailable or inconclusive, so an
     /// available offline conversation-history snapshot is preferred over
-    /// discarding it for a transient error.
+    /// discarding it for a transient error. The offline snapshot carries the
+    /// failure's fixed-text reason, never the error message.
     fn resolve_probe_failure(
-        error: ProviderError,
+        failure: impl Into<LiveFailure>,
         offline: Option<ProviderFetchResult>,
     ) -> Result<ProviderFetchResult, ProviderError> {
-        if matches!(error, ProviderError::AuthRequired) {
-            return Err(error);
+        let failure = failure.into();
+        match offline {
+            Some(result) if !failure.is_auth_required() => {
+                Ok(result.with_display_detail(failure.offline_detail()))
+            }
+            _ => Err(failure.into_error()),
         }
-        offline.ok_or(error)
     }
 
     /// Map a managed-lifecycle outcome onto provider policy.
@@ -625,14 +683,11 @@ impl AntigravityProvider {
         outcome: Result<ManagedAgyOutcome, ProviderError>,
     ) -> Result<Option<ProviderFetchResult>, ProviderError> {
         match outcome {
-            Ok(ManagedAgyOutcome::Reused(usage)) => Ok(Some(ProviderFetchResult::new(
-                Self::with_cadence_labels(usage),
-                "local",
-            ))),
-            Ok(ManagedAgyOutcome::Fetched(usage)) => Ok(Some(ProviderFetchResult::new(
-                Self::with_cadence_labels(usage),
-                "cli",
-            ))),
+            Ok(ManagedAgyOutcome::Reused(result)) => Ok(Some(result)),
+            Ok(ManagedAgyOutcome::Fetched(mut result)) => {
+                result.source_label = AntigravityStrategyId::Cli.as_str().to_string();
+                Ok(Some(result))
+            }
             Ok(ManagedAgyOutcome::Missing) => Ok(None),
             Err(error) => {
                 if !matches!(error, ProviderError::AuthRequired) {
@@ -643,45 +698,104 @@ impl AntigravityProvider {
         }
     }
 
-    fn offline_or_unavailable() -> Result<ProviderFetchResult, ProviderError> {
-        Self::offline_usage_result()
-            .ok_or_else(|| ProviderError::NotInstalled(AGY_NOT_FOUND_MESSAGE.to_string()))
+    /// Resolve the ordered fallback chain once per fetch.
+    ///
+    /// A successful local probe is terminal. A local probe failure is
+    /// inconclusive, including the typed `AuthRequired` produced by the
+    /// affected local API/CSRF path, so the structured CLI report may still
+    /// recover live usage. When no local runtime was found, a managed runtime
+    /// gets the first fallback attempt; its own `AuthRequired` remains
+    /// terminal and never starts another CLI process.
+    async fn resolve_runtime_fallback<F, Fut>(
+        &self,
+        local_result: Result<Option<ProviderFetchResult>, LiveFailure>,
+        cli_fallback: F,
+    ) -> Result<ProviderFetchResult, ProviderError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Option<ProviderFetchResult>, LiveFailure>>,
+    {
+        self.resolve_runtime_fallback_with_offline(
+            local_result,
+            cli_fallback,
+            Self::offline_usage_result(),
+        )
+        .await
     }
 
-    fn locate_agy_binary() -> Option<PathBuf> {
-        let candidates = Self::agy_binary_candidates(
-            std::env::var_os("ANTIGRAVITY_CLI_PATH").map(PathBuf::from),
-            which::which("agy").ok(),
-            std::env::var_os("LOCALAPPDATA").map(PathBuf::from),
-            dirs::home_dir(),
-        );
-        candidates.into_iter().find(|path| path.is_file())
-    }
+    async fn resolve_runtime_fallback_with_offline<F, Fut>(
+        &self,
+        local_result: Result<Option<ProviderFetchResult>, LiveFailure>,
+        cli_fallback: F,
+        offline: Option<ProviderFetchResult>,
+    ) -> Result<ProviderFetchResult, ProviderError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Option<ProviderFetchResult>, LiveFailure>>,
+    {
+        let (mut failure, allow_managed_runtime) = match local_result {
+            Ok(Some(result)) => return Ok(result),
+            Ok(None) => (None, true),
+            Err(error) => {
+                if !error.is_auth_required() {
+                    tracing::debug!(%error, "Antigravity local probe failed");
+                }
+                (Some(error), false)
+            }
+        };
 
-    fn agy_binary_candidates(
-        explicit: Option<PathBuf>,
-        path_lookup: Option<PathBuf>,
-        local_app_data: Option<PathBuf>,
-        home: Option<PathBuf>,
-    ) -> Vec<PathBuf> {
-        let mut candidates = Vec::new();
-        if let Some(path) = explicit {
-            candidates.push(path);
+        #[cfg(windows)]
+        if allow_managed_runtime {
+            match cli_resolution::locate_agy_binary() {
+                Ok(binary) => {
+                    if cli_fallback::managed_spawn_is_csrf_gated(binary).await {
+                        tracing::debug!(
+                            "skipping managed agy readiness wait because the local server requires CSRF"
+                        );
+                    } else {
+                        match self.fetch_with_managed_agy().await {
+                            Ok(ManagedAgyOutcome::Reused(result)) => return Ok(result),
+                            Ok(ManagedAgyOutcome::Fetched(mut result)) => {
+                                result.source_label =
+                                    AntigravityStrategyId::Cli.as_str().to_string();
+                                return Ok(result);
+                            }
+                            Ok(ManagedAgyOutcome::Missing) => {}
+                            Err(error) => {
+                                if matches!(error, ProviderError::AuthRequired) {
+                                    return Err(error);
+                                }
+                                tracing::debug!(%error, "managed Antigravity CLI probe failed");
+                                failure = Some(error.into());
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "managed Antigravity CLI resolution failed");
+                    failure = Some(error.into());
+                }
+            }
         }
-        if let Some(path) = path_lookup {
-            candidates.push(path);
+
+        #[cfg(not(windows))]
+        let _ = allow_managed_runtime;
+
+        match cli_fallback().await {
+            Ok(Some(result)) => return Ok(result),
+            Ok(None) => {}
+            Err(error) => {
+                if !error.is_auth_required() {
+                    tracing::debug!(%error, "structured Antigravity CLI fallback failed");
+                }
+                // A failed CLI attempt is an inconclusive runtime probe. Let
+                // the same offline-history policy handle it rather than
+                // returning the earlier local-probe error directly.
+                failure = Some(error);
+            }
         }
-        if let Some(root) = local_app_data {
-            candidates.push(root.join("agy").join("bin").join("agy.exe"));
-        }
-        if let Some(root) = home {
-            candidates.push(root.join(".local").join("bin").join(if cfg!(windows) {
-                "agy.exe"
-            } else {
-                "agy"
-            }));
-        }
-        candidates
+
+        Self::resolve_probe_failure(failure.unwrap_or_else(LiveFailure::not_running), offline)
     }
 
     async fn fetch_local_payload(
@@ -691,7 +805,7 @@ impl AntigravityProvider {
         path: &str,
         body: &serde_json::Value,
         timeout: std::time::Duration,
-    ) -> Result<Vec<u8>, ProviderError> {
+    ) -> Result<Vec<u8>, LiveFailure> {
         let url = format!("https://127.0.0.1:{api_port}{path}");
         let requires_csrf = process_info.source == ProcessSource::Ide;
         let csrf_token = process_info
@@ -710,13 +824,13 @@ impl AntigravityProvider {
         let response = request
             .send()
             .await
-            .map_err(|e| ProviderError::Other(format!("API request failed: {e}")))?;
+            .map_err(|e| LiveFailure::request("API request failed", &e))?;
         if response.status().is_success() {
             return response
                 .bytes()
                 .await
                 .map(|bytes| bytes.to_vec())
-                .map_err(|e| ProviderError::Other(format!("Failed to read response: {e}")));
+                .map_err(|e| LiveFailure::request("Failed to read response", &e));
         }
 
         let status = response.status();
@@ -738,7 +852,7 @@ impl AntigravityProvider {
                     .bytes()
                     .await
                     .map(|bytes| bytes.to_vec())
-                    .map_err(|e| ProviderError::Other(format!("Failed to read response: {e}")));
+                    .map_err(|e| LiveFailure::request("Failed to read response", &e));
             }
         }
 
@@ -749,129 +863,23 @@ impl AntigravityProvider {
                 || text.to_ascii_lowercase().contains("login method")
                 || text.to_ascii_lowercase().contains("keyring"))
         {
-            return Err(ProviderError::AuthRequired);
+            return Err(ProviderError::AuthRequired.into());
         }
-        Err(ProviderError::Other(format!("API error {status}: {text}")))
+        Err(LiveFailure::http_status(
+            status.as_u16(),
+            ProviderError::Other(format!("API error {status}: {text}")),
+        ))
     }
 
-    fn apply_user_identity(snapshot: &mut UsageSnapshot, response: &UserStatusResponse) {
-        let Some(status) = response.user_status.as_ref() else {
-            return;
-        };
-        snapshot.account_email = status
-            .email
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-        snapshot.login_method = status
-            .plan_status
-            .as_ref()
-            .and_then(|plan_status| plan_status.plan_info.as_ref())
-            .and_then(|plan| plan.plan_display_name.as_ref().or(plan.plan_name.as_ref()))
-            .cloned();
+    fn resolve_plan_name(status: &UserStatus) -> Option<String> {
+        legacy_status::resolve_plan_name(status)
     }
 
     fn parse_user_status(
         &self,
         response: UserStatusResponse,
     ) -> Result<UsageSnapshot, ProviderError> {
-        let user_status = response
-            .user_status
-            .ok_or_else(|| ProviderError::Other("Missing userStatus".to_string()))?;
-
-        let model_configs = user_status
-            .cascade_model_config_data
-            .and_then(|d| d.client_model_configs)
-            .unwrap_or_default();
-
-        let mut quota_configs = model_configs
-            .iter()
-            .filter(|config| config.quota_info.is_some())
-            .filter(|config| !model_label(config).is_empty())
-            .collect::<Vec<_>>();
-        quota_configs.sort_by(|a, b| compare_model_configs(a, b));
-
-        let summary_candidates = quota_configs
-            .iter()
-            .copied()
-            .filter(|config| !is_noisy_summary_model(model_label(config)))
-            .collect::<Vec<_>>();
-
-        let primary = best_summary_model(&summary_candidates, ModelFamily::Claude)
-            .and_then(|config| config.quota_info.as_ref())
-            .map(rate_window_from_quota)
-            .or_else(|| {
-                summary_candidates
-                    .first()
-                    .and_then(|config| config.quota_info.as_ref())
-                    .map(rate_window_from_quota)
-            })
-            .or_else(|| {
-                quota_configs
-                    .first()
-                    .and_then(|config| config.quota_info.as_ref())
-                    .map(rate_window_from_quota)
-            });
-
-        let secondary = best_summary_model(&summary_candidates, ModelFamily::GeminiPro)
-            .and_then(|config| config.quota_info.as_ref())
-            .map(rate_window_from_quota);
-
-        let tertiary = best_summary_model(&summary_candidates, ModelFamily::GeminiFlash)
-            .and_then(|config| config.quota_info.as_ref())
-            .map(rate_window_from_quota);
-
-        let primary = primary.unwrap_or_else(|| RateWindow::new(0.0));
-        let mut snapshot = UsageSnapshot::new(primary);
-
-        if let Some(sec) = secondary {
-            snapshot = snapshot.with_secondary(sec);
-        }
-        if let Some(ter) = tertiary {
-            snapshot = snapshot.with_model_specific(ter);
-        }
-
-        // Upstream 0.50.1 #2963: one lane per quota bucket. When Antigravity
-        // emits multiple model configs that map to the same quota bucket
-        // (e.g. multiple Claude variants in the same 5h session), show one
-        // lane per quota bucket, not one per model. Dedup by (remaining,
-        // reset_time) — models sharing the same quota state collapse.
-        let mut seen_buckets: Vec<(Option<f64>, Option<String>)> = Vec::new();
-        for config in quota_configs {
-            let Some(quota) = &config.quota_info else {
-                continue;
-            };
-            let bucket = (quota.remaining_fraction, quota.reset_time.clone());
-            if seen_buckets.contains(&bucket) {
-                continue;
-            }
-            seen_buckets.push(bucket);
-            let title = clean_model_label(model_label(config));
-            if title.is_empty() {
-                continue;
-            }
-            snapshot.extra_rate_windows.push(
-                NamedRateWindow::new(
-                    model_window_id(config),
-                    title,
-                    rate_window_from_quota(quota),
-                )
-                .with_usage_known(quota.remaining_fraction.is_some()),
-            );
-        }
-
-        // Add plan info
-        let plan_name = user_status
-            .plan_status
-            .and_then(|ps| ps.plan_info)
-            .and_then(|pi| pi.plan_display_name.or(pi.plan_name));
-
-        if let Some(plan) = plan_name {
-            snapshot = snapshot.with_login_method(&plan);
-        }
-
-        Ok(snapshot)
+        legacy_status::parse_user_status(response)
     }
 }
 
@@ -906,32 +914,9 @@ impl Provider for AntigravityProvider {
 
         tracing::debug!("Fetching Antigravity usage via local probe");
 
-        match self.fetch_user_status().await {
-            Ok(Some(usage)) => Ok(ProviderFetchResult::new(
-                Self::with_cadence_labels(usage),
-                "local",
-            )),
-            Ok(None) => {
-                #[cfg(windows)]
-                {
-                    if let Some(result) =
-                        Self::resolve_managed_outcome(self.fetch_with_managed_agy().await)?
-                    {
-                        return Ok(result);
-                    }
-                }
-
-                Self::offline_or_unavailable()
-            }
-            Err(error) => {
-                // The local probe is inconclusive (e.g. PowerShell unavailable);
-                // preserve offline history before surfacing the probe error.
-                if !matches!(error, ProviderError::AuthRequired) {
-                    tracing::debug!(%error, "Antigravity local probe failed");
-                }
-                Self::resolve_probe_failure(error, Self::offline_usage_result())
-            }
-        }
+        let local_result = self.fetch_user_status().await;
+        self.resolve_runtime_fallback(local_result, || self.try_print_usage_fallback())
+            .await
     }
 
     fn available_sources(&self) -> Vec<SourceMode> {
@@ -971,250 +956,11 @@ struct ProcessInfo {
 #[cfg(windows)]
 enum ManagedAgyOutcome {
     /// A user-owned desktop or CLI process appeared after the launch lock.
-    Reused(UsageSnapshot),
+    Reused(ProviderFetchResult),
     /// Usage came from the short-lived process owned by this fetch.
-    Fetched(UsageSnapshot),
+    Fetched(ProviderFetchResult),
     /// No configured `agy` executable exists, so offline history may be used.
     Missing,
-}
-
-// API Response types
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UserStatusResponse {
-    user_status: Option<UserStatus>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UserStatus {
-    #[allow(
-        dead_code,
-        reason = "field mirrors the Antigravity API user payload; deserialized for round-trip fidelity but not read yet"
-    )]
-    email: Option<String>,
-    plan_status: Option<PlanStatus>,
-    cascade_model_config_data: Option<ModelConfigData>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PlanStatus {
-    plan_info: Option<PlanInfo>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PlanInfo {
-    plan_name: Option<String>,
-    plan_display_name: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ModelConfigData {
-    client_model_configs: Option<Vec<ModelConfig>>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ModelConfig {
-    #[serde(default)]
-    label: String,
-    #[serde(default)]
-    model_id: Option<String>,
-    #[serde(default)]
-    id: Option<String>,
-    quota_info: Option<QuotaInfo>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct QuotaInfo {
-    remaining_fraction: Option<f64>,
-    reset_time: Option<String>,
-}
-
-// ── Model-family classification ──────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum ModelFamily {
-    Claude,
-    ClaudeThinking,
-    GeminiPro,
-    GeminiFlash,
-    Other,
-}
-
-fn classify_model(label: &str) -> ModelFamily {
-    let lower = label.to_lowercase();
-    if lower.contains("claude") {
-        if lower.contains("thinking") {
-            ModelFamily::ClaudeThinking
-        } else {
-            ModelFamily::Claude
-        }
-    } else if lower.contains("gemini") && lower.contains("pro") {
-        ModelFamily::GeminiPro
-    } else if lower.contains("gemini") && lower.contains("flash") {
-        ModelFamily::GeminiFlash
-    } else if lower.contains("pro") && !is_noisy_summary_model(&lower) {
-        ModelFamily::GeminiPro
-    } else if lower.contains("flash") {
-        ModelFamily::GeminiFlash
-    } else {
-        ModelFamily::Other
-    }
-}
-
-fn best_summary_model<'a>(
-    candidates: &[&'a ModelConfig],
-    family: ModelFamily,
-) -> Option<&'a ModelConfig> {
-    candidates
-        .iter()
-        .copied()
-        .filter(|config| classify_model(model_label(config)) == family)
-        .min_by(|a, b| {
-            let a_label = model_label(a);
-            let b_label = model_label(b);
-            let a_priority = selection_priority(a_label, family);
-            let b_priority = selection_priority(b_label, family);
-            a_priority
-                .cmp(&b_priority)
-                .then_with(|| compare_model_configs(a, b))
-        })
-}
-
-fn selection_priority(label: &str, family: ModelFamily) -> u8 {
-    let lower = label.to_lowercase();
-    match family {
-        ModelFamily::GeminiPro if lower.contains("low") => 0,
-        ModelFamily::GeminiPro => 1,
-        _ => 0,
-    }
-}
-
-fn compare_model_configs(a: &ModelConfig, b: &ModelConfig) -> std::cmp::Ordering {
-    let a_label = model_label(a);
-    let b_label = model_label(b);
-    family_rank(classify_model(a_label))
-        .cmp(&family_rank(classify_model(b_label)))
-        .then_with(|| parse_model_version(b_label).cmp(&parse_model_version(a_label)))
-        .then_with(|| tier_rank(a_label).cmp(&tier_rank(b_label)))
-        .then_with(|| clean_model_label(a_label).cmp(&clean_model_label(b_label)))
-}
-
-fn family_rank(family: ModelFamily) -> u8 {
-    match family {
-        ModelFamily::Claude => 0,
-        ModelFamily::GeminiPro => 1,
-        ModelFamily::GeminiFlash => 2,
-        ModelFamily::ClaudeThinking => 3,
-        ModelFamily::Other => 4,
-    }
-}
-
-fn tier_rank(label: &str) -> u8 {
-    let lower = label.to_lowercase();
-    if lower.contains("high") {
-        0
-    } else if lower.contains("medium") {
-        1
-    } else if lower.contains("low") {
-        2
-    } else {
-        3
-    }
-}
-
-fn parse_model_version(label: &str) -> (u16, u16) {
-    static VERSION_RE: OnceLock<Regex> = OnceLock::new();
-    let regex =
-        VERSION_RE.get_or_init(|| Regex::new(r"(?i)(\d+)(?:[.-](\d+))?").expect("valid regex"));
-    let Some(caps) = regex.captures(label) else {
-        return (0, 0);
-    };
-    let major = caps
-        .get(1)
-        .and_then(|m| m.as_str().parse::<u16>().ok())
-        .unwrap_or(0);
-    let minor = caps
-        .get(2)
-        .and_then(|m| m.as_str().parse::<u16>().ok())
-        .unwrap_or(0);
-    (major, minor)
-}
-
-fn is_noisy_summary_model(label: &str) -> bool {
-    let lower = label.to_lowercase();
-    lower.contains("image")
-        || lower.contains("lite")
-        || lower.contains("autocomplete")
-        || lower.contains("completion")
-        || lower.contains("internal")
-}
-
-fn model_label(config: &ModelConfig) -> &str {
-    if !config.label.trim().is_empty() {
-        &config.label
-    } else if let Some(model_id) = config.model_id.as_deref() {
-        model_id
-    } else {
-        config.id.as_deref().unwrap_or_default()
-    }
-}
-
-fn canonical_model_id(raw: &str) -> &str {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "gemini-3.6-flash"
-        | "gemini-3.6-flash-low"
-        | "gemini-3.6-flash-medium"
-        | "gemini-3.6-flash-high"
-        | "gemini-3.5-flash-extra-low"
-        | "gemini-3.5-flash-low"
-        | "gemini-3.5-flash-mid"
-        | "gemini-3.5-flash-high"
-        | "gemini-3-flash-agent" => "gemini-3.7-flash",
-        _ => raw,
-    }
-}
-
-fn model_window_id(config: &ModelConfig) -> String {
-    let raw = config
-        .model_id
-        .as_deref()
-        .or(config.id.as_deref())
-        .unwrap_or_else(|| model_label(config));
-    let raw = canonical_model_id(raw);
-    let slug = raw
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string();
-    format!("model-{}", if slug.is_empty() { "unknown" } else { &slug })
-}
-
-fn rate_window_from_quota(quota: &QuotaInfo) -> RateWindow {
-    let remaining = quota.remaining_fraction.unwrap_or(1.0);
-    let used_percent = (1.0 - remaining) * 100.0;
-    RateWindow::with_details(used_percent, None, None, quota.reset_time.clone())
-}
-
-fn clean_model_label(label: &str) -> String {
-    let mut out = label.trim().replace('_', " ");
-    while out.contains("  ") {
-        out = out.replace("  ", " ");
-    }
-    out
 }
 
 #[cfg(test)]

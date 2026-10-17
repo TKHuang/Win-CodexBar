@@ -1,23 +1,54 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import type { ClaudeAccount } from "../../../../../types/bridge";
+import type { ClaudeReconciliationSnapshot } from "../../../../../types/bridge";
+import type { Language } from "../../../../../types/bridge";
 import type { LocaleKey } from "../../../../../i18n/keys";
 import {
   claudeAccountsList,
   claudeAccountAdd,
+  claudeAccountReauthenticate,
   claudeAccountCancelLogin,
   claudeAccountSaveCurrent,
   claudeAccountRemove,
   claudeAccountSwitch,
 } from "../../../../../lib/tauri";
 import { ClaudeSwapAccountsSection } from "./ClaudeSwapAccountsSection";
+import ClaudeAccountUsage from "../../../../../components/ClaudeAccountUsage";
+import {
+  buildAccountOrdinals,
+  buildPrivateClaudeAccountLabel,
+} from "../../../../../components/claudeAccountDisplay";
+import {
+  localClaudeReconciliationOutcome,
+  useClaudeReconciliation,
+} from "../../../../../hooks/useClaudeReconciliation";
 
-export function ClaudeAccountsSection({ t }: { t: (key: LocaleKey) => string }) {
+export function ClaudeAccountsSection({
+  t,
+  language = "english",
+  hidePersonalInfo = false,
+  showAsUsed = false,
+  resetTimeRelative = true,
+  claudeSwapEnabled = false,
+  claudeSwapExecutablePath = "",
+}: {
+  t: (key: LocaleKey) => string;
+  language?: Language;
+  hidePersonalInfo?: boolean;
+  showAsUsed?: boolean;
+  resetTimeRelative?: boolean;
+  /** Settings `claudeSwapEnabled`; the claude-swap list renders only while on. */
+  claudeSwapEnabled?: boolean;
+  claudeSwapExecutablePath?: string;
+}) {
   const [accounts, setAccounts] = useState<ClaudeAccount[]>([]);
   const [busy, setBusy] = useState(false);
   const [loggingIn, setLoggingIn] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  const [operation, setOperation] = useState<{ generation: number; success?: LocaleKey } | null>(null);
+  const { snapshot, accept, reconciling } = useClaudeReconciliation();
   const mounted = useRef(false);
   const load = useCallback(async () => {
     const next = await claudeAccountsList();
@@ -37,14 +68,33 @@ export function ClaudeAccountsSection({ t }: { t: (key: LocaleKey) => string }) 
       void unlisten.then(fn => fn());
     };
   }, [load]);
-  const run = async (operation: () => Promise<void>, success?: LocaleKey) => {
+  useEffect(() => {
+    const outcome = localClaudeReconciliationOutcome(snapshot, operation?.generation ?? null);
+    if (!outcome) return;
+    if (outcome.status === "failed") {
+      setMessage(null);
+      setError(outcome.detail);
+    } else if (operation) {
+      if (operation.success) setMessage(t(operation.success));
+      setError(null);
+    }
+  }, [operation, snapshot, t]);
+  const run = async (
+    action: () => Promise<void | ClaudeReconciliationSnapshot>,
+    success?: LocaleKey,
+  ) => {
     setBusy(true);
     setError(null);
     setMessage(null);
     try {
-      await operation();
+      const result = await action();
       await load();
-      if (mounted.current && success) setMessage(t(success));
+      if (result) {
+        setOperation({ generation: result.generation, success });
+        accept(result);
+      } else if (mounted.current && success) {
+        setMessage(t(success));
+      }
     } catch (e) {
       if (mounted.current) setError(String(e));
     } finally {
@@ -54,6 +104,7 @@ export function ClaudeAccountsSection({ t }: { t: (key: LocaleKey) => string }) 
       }
     }
   };
+  const accountOrdinals = buildAccountOrdinals(accounts);
   return (
     <>
       <section className="provider-detail-section codex-accounts">
@@ -61,20 +112,36 @@ export function ClaudeAccountsSection({ t }: { t: (key: LocaleKey) => string }) 
         <p className="settings-section__hint">{t("ClaudeAccountsHint")}</p>
         {error && <div className="provider-detail-error" role="alert">{error}</div>}
         {message && <div className="provider-detail-note" role="status">{message}</div>}
+        {reconciling && <p role="status">{t("ClaudeAccountsReconciling")}</p>}
         {loggingIn && <p role="status">{t("ClaudeAccountsSigningIn")}</p>}
         {accounts.length === 0 && <p>{t("ClaudeAccountsEmpty")}</p>}
         <ul className="credential-list">
-          {accounts.map(account => (
+          {accounts.map(account => {
+            const privateLabel = buildPrivateClaudeAccountLabel(
+              account,
+              accountOrdinals[account.id],
+              hidePersonalInfo,
+              t("Account"),
+            );
+            return (
             <li className="credential-card" key={account.id}>
               <div className="credential-card__header">
                 <div className="credential-card__info">
-                  <strong>{account.email}</strong>
+                  <strong title={privateLabel.tooltip}>{privateLabel.label}</strong>
                   <span className="credential-card__meta">
                     {[
-                      account.organization?.includes(account.email) ? null : account.organization,
+                      hidePersonalInfo || account.organization?.includes(account.email)
+                        ? null
+                        : account.organization,
                       account.plan,
                     ].filter(Boolean).join(" · ")}
                   </span>
+                  <ClaudeAccountUsage
+                    account={account}
+                    t={t}
+                    showAsUsed={showAsUsed}
+                    resetTimeRelative={resetTimeRelative}
+                  />
                   {account.isActive && (
                     <span className="credential-card__badge credential-card__badge--set">
                       {t("TokenAccountActive")}
@@ -82,10 +149,19 @@ export function ClaudeAccountsSection({ t }: { t: (key: LocaleKey) => string }) 
                   )}
                 </div>
                 <div className="credential-card__actions">
+                  {account.needsAuthentication && <button
+                    className="credential-btn credential-btn--secondary"
+                    disabled={busy || reconciling}
+                    aria-label={`${t("CodexAccountsReauthenticateButton")}: ${privateLabel.label}`}
+                    onClick={() => {
+                      setLoggingIn(true);
+                      void run(() => claudeAccountReauthenticate(account.id));
+                    }}
+                  >{t("CodexAccountsReauthenticateButton")}</button>}
                   {!account.isActive && account.isSaved && (
                     <button
                       className="credential-btn credential-btn--primary"
-                      disabled={busy}
+                      disabled={busy || reconciling}
                       onClick={() => void run(() => claudeAccountSwitch(account.id), "ClaudeAccountsSwitched")}
                     >
                       {t("CodexAccountsSwitchButton")}
@@ -94,7 +170,7 @@ export function ClaudeAccountsSection({ t }: { t: (key: LocaleKey) => string }) 
                   {!account.isSaved && (
                     <button
                       className="credential-btn credential-btn--secondary"
-                      disabled={busy}
+                      disabled={busy || reconciling}
                       onClick={() => void run(claudeAccountSaveCurrent)}
                     >
                       {t("ClaudeAccountsSaveCurrent")}
@@ -103,7 +179,7 @@ export function ClaudeAccountsSection({ t }: { t: (key: LocaleKey) => string }) 
                   {account.isSaved && (
                     <button
                       className="credential-btn credential-btn--danger"
-                      disabled={busy}
+                      disabled={busy || reconciling}
                       onClick={() => void run(() => claudeAccountRemove(account.id))}
                     >
                       {t("CodexAccountsRemoveButton")}
@@ -112,11 +188,12 @@ export function ClaudeAccountsSection({ t }: { t: (key: LocaleKey) => string }) 
                 </div>
               </div>
             </li>
-          ))}
+            );
+          })}
         </ul>
         <button
           className="credential-btn credential-btn--primary"
-          disabled={busy}
+          disabled={busy || reconciling}
           onClick={() => {
             setLoggingIn(true);
             void run(claudeAccountAdd, "ClaudeAccountsAdded");
@@ -133,7 +210,12 @@ export function ClaudeAccountsSection({ t }: { t: (key: LocaleKey) => string }) 
           </button>
         )}
       </section>
-      <ClaudeSwapAccountsSection t={t} />
+      <ClaudeSwapAccountsSection
+        t={t}
+        language={language}
+        enabled={claudeSwapEnabled}
+        executablePath={claudeSwapExecutablePath}
+      />
     </>
   );
 }

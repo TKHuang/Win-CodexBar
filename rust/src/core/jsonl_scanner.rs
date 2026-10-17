@@ -9,10 +9,10 @@
 )]
 
 use crate::core::{CostUsagePricing, ProviderId};
-use chrono::{NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 
 #[cfg(test)]
-use chrono::{DateTime, Local};
+use chrono::Local;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -43,6 +43,8 @@ struct CachedCostReadStatusProjection {
     previous_report: Option<CachedCostReport>,
     #[serde(default)]
     codex_scan_pause_reason: Option<CodexScanPauseReason>,
+    #[serde(default)]
+    bucket_time_zone: Option<String>,
 }
 
 fn deserialize_nonempty_object<'de, D>(deserializer: D) -> Result<bool, D::Error>
@@ -169,6 +171,36 @@ impl CacheStamp {
             content_hash: hasher.finish(),
         }
     }
+
+    /// Stamp the serialized cache while ignoring its scan timestamp. This
+    /// avoids allocating a second full-size JSON buffer just to normalize one
+    /// scalar before comparing cache payloads.
+    fn from_cache_payload(bytes: &[u8]) -> Option<Self> {
+        const FIELD: &[u8] = b"\"last_scan_unix_ms\":";
+        let value_start = bytes
+            .windows(FIELD.len())
+            .position(|window| window == FIELD)?
+            + FIELD.len();
+        let mut value_end = value_start;
+        if bytes.get(value_end) == Some(&b'-') {
+            value_end += 1;
+        }
+        let digits_start = value_end;
+        while bytes.get(value_end).is_some_and(u8::is_ascii_digit) {
+            value_end += 1;
+        }
+        if value_end == digits_start {
+            return None;
+        }
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        hasher.write(&bytes[..value_start]);
+        hasher.write(&bytes[value_end..]);
+        Some(Self {
+            byte_len: bytes.len() - (value_end - value_start),
+            content_hash: hasher.finish(),
+        })
+    }
 }
 
 /// Terminal reason for a bounded Codex catch-up pause.
@@ -190,8 +222,10 @@ pub struct CostUsageCache {
     /// Last scan timestamp in milliseconds
     pub last_scan_unix_ms: i64,
     /// Per-file usage data
+    #[serde(serialize_with = "save_skip::sorted_map")]
     pub files: HashMap<String, CostUsageFileUsage>,
     /// Aggregated daily data: day_key -> model -> [input, cached, output, reasoning?]
+    #[serde(serialize_with = "save_skip::sorted_days")]
     pub days: HashMap<String, HashMap<String, Vec<i64>>>,
     /// Inclusive range covered by the last successful full inspection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -231,10 +265,93 @@ pub struct CostUsageCache {
     /// refresh clears it before starting the next pass.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_scan_pause_reason: Option<CodexScanPauseReason>,
+    /// Cached request rows retained as source evidence for Codex recovery.
+    ///
+    /// This is separate from `files` because the Windows cache currently
+    /// persists aggregate day/model totals rather than the native request-row
+    /// representation used by upstream.  The map is optional on disk so old
+    /// caches remain valid and can be upgraded lazily.
+    #[serde(
+        default,
+        skip_serializing_if = "HashMap::is_empty",
+        serialize_with = "save_skip::sorted_map"
+    )]
+    pub codex_source_rows: HashMap<String, CodexSourceRowCache>,
+    /// Request rows of fork-shaped Codex files (a `forked_from_id` or a
+    /// parent-baseline lineage), built from the same parsed records as the
+    /// file's day totals. Source-row evidence skips these files, so this map
+    /// is what lets Priority trace evidence reach forked sessions.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub codex_fork_rows: HashMap<String, Vec<CodexSourceUsageRow>>,
+    /// Priority (Fast) turn evidence read from the Codex trace database.
+    /// Applied as a pricing overlay whenever day totals are rebuilt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_priority_turns_cursor: Option<CodexPriorityTurnsCursor>,
+    /// Trace-database path and presence seen by the last full scan
+    /// (`sqlite:<path>` or `missing:<path>`, upstream
+    /// `codexPriorityMetadataKey`). A database that appears later bypasses
+    /// the scan debounce once so its evidence is applied promptly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_priority_metadata_key: Option<String>,
+    /// Zone the day keys were bucketed in (upstream `timeZoneIdentifier`).
+    /// A cache from another zone is rebuilt; caches written before the stamp
+    /// existed are kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket_time_zone: Option<String>,
     /// Content stamp of the decoded on-disk baseline. This is process-local
     /// and omitted from JSON so a stale reader cannot replace a newer cache.
     #[serde(skip)]
     pub(crate) loaded_stamp: Option<Option<CacheStamp>>,
+    /// Stamp of the loaded cache payload with `last_scan_unix_ms` omitted.
+    /// This is separate from `loaded_stamp`, which still protects stale writes.
+    #[serde(skip)]
+    pub(crate) loaded_payload_stamp: Option<CacheStamp>,
+}
+
+/// Pricing evidence attached to one cached Codex request row.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexSourcePricingEvidence {
+    pub pricing_model: Option<String>,
+    pub pricing_mode: Option<String>,
+}
+
+/// A request row recovered from a complete Codex JSONL source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexSourceUsageRow {
+    pub day_key: String,
+    /// Exact event time when the source exposed one. Legacy rows omit it and
+    /// remain valid for daily history but cannot be split at a quota reset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<DateTime<Utc>>,
+    pub model: String,
+    pub input: i64,
+    pub cached: i64,
+    pub output: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<i64>,
+    /// End offset of the source JSONL line that produced this row.
+    /// Zero means the row came from a legacy cache and cannot be replayed
+    /// safely across an append boundary.
+    #[serde(default)]
+    pub source_end_offset: i64,
+    #[serde(default)]
+    pub pricing: CodexSourcePricingEvidence,
+    /// Codex turn (`task_started`) the request belongs to; matches Priority
+    /// trace evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+}
+
+/// Source identity and rows retained for a cached Codex file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexSourceRowCache {
+    /// Platform file identity of the source at cache time. A cache entry is
+    /// only built when identity succeeds, so the field is always usable.
+    pub file_identity: String,
+    pub size: i64,
+    pub mtime_unix_ms: i64,
+    pub prefix_hash: u64,
+    pub rows: Vec<CodexSourceUsageRow>,
 }
 
 /// Per-file usage tracking
@@ -249,6 +366,7 @@ pub struct CostUsageFileUsage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_file_identity: Option<String>,
     /// Daily usage data extracted from this file
+    #[serde(serialize_with = "save_skip::sorted_days")]
     pub days: HashMap<String, HashMap<String, Vec<i64>>>,
     /// Bytes parsed so far (for incremental parsing)
     pub parsed_bytes: Option<i64>,
@@ -278,6 +396,14 @@ pub struct CostUsageFileUsage {
     /// Native Codex parent session identity for forked rollouts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_forked_from_id: Option<String>,
+    /// Native Codex fork accounting state. This preserves the normalized
+    /// inherited baseline across bounded scans and process restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_fork_accounting_state: Option<CodexForkAccountingState>,
+    /// Native Codex session lineage. This distinguishes a root session from a
+    /// paginated subagent whose ancestry is independent for billing purposes.
+    #[serde(default, skip_serializing_if = "CodexSessionLineage::is_root")]
+    pub codex_lineage: CodexSessionLineage,
     /// Native Codex fork timestamp used for safe parent-baseline validation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_fork_timestamp: Option<String>,
@@ -286,23 +412,90 @@ pub struct CostUsageFileUsage {
     pub codex_unresolved_fork_parent: bool,
 }
 
+/// Billing-relevant Codex session lineage.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexSessionLineage {
+    #[default]
+    Root,
+    Independent,
+    Child,
+}
+
+impl CodexSessionLineage {
+    fn is_root(&self) -> bool {
+        matches!(self, Self::Root)
+    }
+
+    pub(crate) fn uses_parent_baseline(self) -> bool {
+        matches!(self, Self::Child)
+    }
+}
+
 /// Lightweight identity metadata read from the first authoritative Codex
 /// `session_meta` row.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CodexSessionMetadata {
     pub session_id: Option<String>,
     pub forked_from_id: Option<String>,
+    pub lineage: CodexSessionLineage,
     pub fork_timestamp: Option<String>,
+    pub history_base_thread_id: Option<String>,
+    pub is_subagent: bool,
+    pub subagent_history_start_ordinal: Option<i64>,
+    /// Whether the rollout names a ChatGPT creator account
+    /// (`payload.creator_account_id`, non-empty after trimming).
+    pub has_creator_account: bool,
 }
 
 /// Running totals for Codex token counting
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodexTotals {
     pub input: i64,
     pub cached: i64,
     pub output: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<i64>,
+}
+
+/// Persisted accounting state for a Codex fork whose cumulative counters may
+/// include a paginated continuation of an earlier thread.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexForkAccountingState {
+    pub session_id: Option<String>,
+    pub forked_from_id: Option<String>,
+    pub history_base_thread_id: Option<String>,
+    pub fork_timestamp: Option<String>,
+    pub inherited_totals: Option<CodexTotals>,
+    /// Timestamp of the first token event in this fork's log. A descendant
+    /// forked before it uses this fork's inherited counter origin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_token_timestamp: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_inherited_totals: Option<CodexTotals>,
+    /// True when the child log itself supplied enough copied-prefix history to
+    /// establish the inherited baseline without consulting a parent cache row.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub locally_resolved: bool,
+    /// Parser state of an unfinished bounded parse, so the next pass continues
+    /// at `parsed_bytes` instead of rereading the fork from byte zero. Absent
+    /// once the parse reaches its target, and in caches written before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<CodexForkResumeState>,
+}
+
+/// Fork parser state that the per-file cache fields do not already carry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexForkResumeState {
+    /// Parent baseline the interrupted parse started from. A validated parent
+    /// that now supplies a different baseline restarts the parse.
+    pub parse_baseline: CodexTotals,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totals_watermark: Option<CodexTotals>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub saw_interleaved_totals: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub paginated_baseline_checked: bool,
 }
 
 /// Snapshot of the last validated cost report, persisted so spend surfaces keep
@@ -334,8 +527,9 @@ pub struct CachedCostReport {
 /// Result of parsing a Codex file
 #[derive(Debug)]
 pub struct CodexParseResult {
-    /// Individual token-count deltas used for per-request pricing.
-    pub records: Vec<CodexUsageRecord>,
+    /// Individual token-count deltas used for per-request pricing, paired
+    /// with the end offset of the source JSONL line that produced each.
+    pub records: Vec<(CodexUsageRecord, i64)>,
     /// Bytes parsed
     pub parsed_bytes: i64,
     /// Stable logical target reached by this parse. This may be behind the
@@ -349,6 +543,10 @@ pub struct CodexParseResult {
     pub token_timestamps_monotonic: Option<bool>,
     /// Last token timestamp observed by the parser.
     pub last_token_timestamp: Option<String>,
+    /// First token timestamp of the parsed history. A resumed fork parse
+    /// carries its saved value forward; resumed standard parses see only their
+    /// suffix, so fork accounting never reads it from them.
+    pub first_token_timestamp: Option<String>,
     /// Number of timestamp comparisons performed while validating this parse.
     pub token_timestamp_comparisons: u64,
     /// Newly consumed bytes in this parse pass.
@@ -358,17 +556,27 @@ pub struct CodexParseResult {
     /// A fork-baseline parse observed a cumulative component below the inherited
     /// parent baseline. The child must be discarded rather than billed as fresh.
     pub fork_baseline_ambiguous: bool,
+    /// Effective inherited baseline after normalizing a paginated continuation.
+    pub fork_baseline: Option<CodexTotals>,
+    /// Remaining inherited counters used when a fork emits last-only rows.
+    pub remaining_inherited_totals: Option<CodexTotals>,
+    pub fork_baseline_locally_resolved: bool,
+    /// State to continue an unfinished parent-baseline fork parse. `None` once
+    /// the parse is complete and for every other parse mode.
+    pub fork_resume_state: Option<CodexForkResumeState>,
 }
 
 /// A billable Codex token-count delta.
 #[derive(Debug, Clone)]
 pub struct CodexUsageRecord {
     pub day_key: String,
+    pub timestamp: Option<DateTime<Utc>>,
     pub model: String,
     pub input: i64,
     pub cached: i64,
     pub output: i64,
     pub reasoning: Option<i64>,
+    pub turn_id: Option<String>,
 }
 
 /// Day range for scanning
@@ -407,7 +615,18 @@ impl CostUsageDayRange {
 
 /// JSONL Scanner for cost/usage logs
 pub struct JsonlScanner;
-mod codex;
+pub(crate) mod codex;
+pub(crate) use codex::CodexForkParseResume;
+pub(crate) use codex::priority::CodexPriorityOverlay;
+pub use codex::priority::{
+    CODEX_PRIORITY_COMPLETED_MODEL_RETENTION_LIMIT, CodexPriorityCursorAnchor,
+    CodexPriorityTurnMetadata, CodexPriorityTurnsCursor,
+};
+mod save_skip;
+pub(crate) use codex::source_rows::{
+    read_source_rows, recover_rows, row_cache, row_cache_matches, row_cache_needs_recovery,
+    row_priced_model, rows_from_records,
+};
 
 impl JsonlScanner {
     /// Whether a cached scan should be reused under `options` (issue #2089).
@@ -446,6 +665,10 @@ impl JsonlScanner {
             && let Ok(mut cache) = serde_json::from_str::<CostUsageCache>(&contents)
         {
             let stamp = CacheStamp::from_bytes(contents.as_bytes());
+            cache.loaded_payload_stamp = CacheStamp::from_cache_payload(contents.as_bytes());
+            if let Some(scan_unix_ms) = save_skip::recorded_scan_time(&cache_path, &stamp) {
+                cache.last_scan_unix_ms = scan_unix_ms;
+            }
             if provider == ProviderId::Codex {
                 return codex::codex_cache_apply_load_policy(cache, stamp);
             }
@@ -490,7 +713,8 @@ impl JsonlScanner {
             return CachedCostReadStatus::default();
         };
         if provider == ProviderId::Codex
-            && !codex::codex_cache_schema_is_current(projection.codex_cache_schema_version)
+            && (!codex::codex_cache_schema_is_current(projection.codex_cache_schema_version)
+                || !codex::codex_cache_zone_is_current(projection.bucket_time_zone.as_deref()))
         {
             return CachedCostReadStatus::default();
         }
@@ -501,6 +725,31 @@ impl JsonlScanner {
         }
     }
     pub(crate) fn cached_cost_report_from_days(cache: &CostUsageCache) -> CachedCostReport {
+        Self::cached_cost_report_from_days_filtered(cache, None)
+    }
+
+    /// Build a retained report for one requested reporting window.
+    ///
+    /// Codex catch-up can retain days outside the active dashboard window while
+    /// it processes historical files. A retained report must therefore use the
+    /// requested days rather than summing every day that happens to remain in
+    /// the cache. The cache scan timestamp is the measurement time for the
+    /// report; this keeps a stale report honest while a later bounded pass is
+    /// still pending.
+    pub(crate) fn cached_cost_report_for_range(
+        cache: &CostUsageCache,
+        range: &CostUsageDayRange,
+    ) -> CachedCostReport {
+        Self::cached_cost_report_from_days_filtered(
+            cache,
+            Some((&range.since_key, &range.until_key)),
+        )
+    }
+
+    fn cached_cost_report_from_days_filtered(
+        cache: &CostUsageCache,
+        range: Option<(&str, &str)>,
+    ) -> CachedCostReport {
         let mut total_cost_usd = 0.0;
         let mut input_tokens = 0_i64;
         let mut cached_tokens = 0_i64;
@@ -509,7 +758,14 @@ impl JsonlScanner {
         let mut reasoning_known = true;
         let mut partial = false;
 
+        let day_is_included = |day_key: &str| {
+            range.is_none_or(|(since, until)| CostUsageDayRange::is_in_range(day_key, since, until))
+        };
+
         for (day_key, models) in &cache.days {
+            if !day_is_included(day_key) {
+                continue;
+            }
             let pricing_day = NaiveDate::parse_from_str(day_key, "%Y-%m-%d").ok();
             for (model, values) in models {
                 let input = values.first().copied().unwrap_or(0).max(0);
@@ -534,24 +790,13 @@ impl JsonlScanner {
                 if !CostUsagePricing::counts_toward_codex_subscription(model) {
                     continue;
                 }
-                let priced = pricing_day
-                    .and_then(|day| {
-                        CostUsagePricing::codex_cost_usd_at_date(
-                            model,
-                            u64::try_from(input).unwrap_or(0),
-                            u64::try_from(cached).unwrap_or(0),
-                            u64::try_from(output).unwrap_or(0),
-                            day,
-                        )
-                    })
-                    .or_else(|| {
-                        CostUsagePricing::codex_cost_usd(
-                            model,
-                            u64::try_from(input).unwrap_or(0),
-                            u64::try_from(cached).unwrap_or(0),
-                            u64::try_from(output).unwrap_or(0),
-                        )
-                    });
+                let priced = CostUsagePricing::codex_day_aggregate_cost_usd(
+                    model,
+                    u64::try_from(input).unwrap_or(0),
+                    u64::try_from(cached).unwrap_or(0),
+                    u64::try_from(output).unwrap_or(0),
+                    pricing_day,
+                );
                 if let Some(cost) = priced {
                     total_cost_usd += cost;
                 } else {
@@ -564,10 +809,16 @@ impl JsonlScanner {
             cache
                 .files
                 .values()
-                .filter(|usage| !usage.days.is_empty())
+                .filter(|usage| usage.days.keys().any(|day| day_is_included(day)))
                 .count(),
         )
         .unwrap_or(i32::MAX);
+        let measured_at = if cache.last_scan_unix_ms > 0 {
+            DateTime::<Utc>::from_timestamp_millis(cache.last_scan_unix_ms)
+                .map(|timestamp| timestamp.to_rfc3339())
+        } else {
+            None
+        };
         CachedCostReport {
             total_cost_usd,
             input_tokens,
@@ -575,7 +826,7 @@ impl JsonlScanner {
             output_tokens,
             reasoning_tokens: reasoning_known.then_some(reasoning_tokens),
             sessions_count,
-            updated_at: Some(Utc::now().to_rfc3339()),
+            updated_at: Some(measured_at.unwrap_or_else(|| Utc::now().to_rfc3339())),
             partial,
         }
     }
@@ -711,6 +962,9 @@ impl JsonlScanner {
             let _cleared = fs::remove_file(&cache_path);
             return;
         }
+        if save_skip::skip_unchanged_save(&cache_path, cache, &json) {
+            return;
+        }
 
         let tmp_name = format!(
             ".{}.{}-{}.tmp",
@@ -742,6 +996,7 @@ impl JsonlScanner {
         };
         if wrote {
             cache.loaded_stamp = Some(Some(CacheStamp::from_bytes(json.as_bytes())));
+            cache.loaded_payload_stamp = CacheStamp::from_cache_payload(json.as_bytes());
         }
         // Best-effort temp cleanup (ignore errors — unique name avoids clashes).
         let _truncated_tmp = fs::File::create(&tmp_path).and_then(|f| f.set_len(0));

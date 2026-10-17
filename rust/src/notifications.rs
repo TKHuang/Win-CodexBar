@@ -14,6 +14,18 @@ use crate::settings::Settings;
 use crate::sound::{NotificationSoundEvent, play_alert};
 use chrono::{DateTime, Utc};
 
+mod credential;
+mod identity_gaps;
+mod limit_reset;
+
+pub use credential::CredentialAlertPolicy;
+use credential::CredentialEpisodes;
+pub use identity_gaps::WarningScope;
+pub use limit_reset::{
+    LimitResetAccount, LimitResetObservation, LimitResetPersistence, LimitResetSample,
+    LimitResetWindow, limit_reset_notification_copy, limit_reset_supported,
+};
+
 /// Notification types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NotificationType {
@@ -78,15 +90,18 @@ struct PredictiveWarningKey {
 }
 
 impl NotificationType {
-    pub fn title(&self) -> &'static str {
-        match self {
-            NotificationType::HighUsage => "High Usage Warning",
-            NotificationType::CriticalUsage => "Critical Usage Alert",
-            NotificationType::Exhausted => "Usage Limit Reached",
-            NotificationType::StatusIssue => "Provider Status Issue",
-            NotificationType::SessionDepleted => "Session Depleted",
-            NotificationType::SessionRestored => "Session Restored",
-        }
+    pub fn title(&self, language: crate::settings::Language) -> String {
+        locale::get_text(
+            language,
+            match self {
+                NotificationType::HighUsage => LocaleKey::NotificationHighUsageTitle,
+                NotificationType::CriticalUsage => LocaleKey::NotificationCriticalUsageTitle,
+                NotificationType::Exhausted => LocaleKey::NotificationExhaustedTitle,
+                NotificationType::StatusIssue => LocaleKey::NotificationStatusIssueTitle,
+                NotificationType::SessionDepleted => LocaleKey::NotificationSessionDepletedTitle,
+                NotificationType::SessionRestored => LocaleKey::NotificationSessionRestoredTitle,
+            },
+        )
     }
 
     pub fn icon(&self) -> &'static str {
@@ -121,8 +136,27 @@ type ThresholdKey = (
     NotificationType,
 );
 
-/// Session-transition tracking key: provider + account identity.
-type SessionTransitionKey = (ProviderId, String /* account */);
+/// Session-transition tracking key: provider + session owner (see
+/// `identity_gaps::session_owner_of`). Threshold keys stay per account.
+type SessionTransitionKey = (ProviderId, String /* session owner */);
+
+/// Session-transition key for a sample's account, normalized to its session owner.
+fn session_transition_key(provider: ProviderId, account: &str) -> SessionTransitionKey {
+    (
+        provider,
+        identity_gaps::session_owner_of(provider, account).to_string(),
+    )
+}
+
+/// Depleted marker for a session owner. Shares `sent_notifications` with threshold keys.
+fn session_depleted_key(provider: ProviderId, owner: &str) -> ThresholdKey {
+    (
+        provider,
+        owner.to_string(),
+        "session".to_string(),
+        NotificationType::SessionDepleted,
+    )
+}
 
 /// Notification manager
 pub struct NotificationManager {
@@ -130,8 +164,21 @@ pub struct NotificationManager {
     sent_notifications: std::collections::HashSet<ThresholdKey>,
     /// Track previous session percent for depleted/restored transitions (per account)
     previous_session_percent: std::collections::HashMap<SessionTransitionKey, f64>,
+    /// Account that produced the last session transition sample per provider. A change
+    /// (including missing identity `""` versus a named account) starts a fresh baseline.
+    session_owner: std::collections::HashMap<ProviderId, String>,
     predictive_warning_keys: std::collections::HashSet<PredictiveWarningKey>,
     deepseek_pricing_period: Option<String>,
+    identity_gaps: identity_gaps::IdentityGapState,
+    /// Open credential-expiry episodes (in memory; reset on restart).
+    credential_episodes: CredentialEpisodes,
+    /// Session restored toasts held for the reset detector this batch (only
+    /// while limit reset notifications are on).
+    deferred_restored: std::collections::HashSet<SessionTransitionKey>,
+    limit_reset: limit_reset::LimitResetTracker,
+    /// Toasts that would have been shown; tests assert on this instead of popping real toasts.
+    #[cfg(test)]
+    toasts: std::cell::RefCell<Vec<String>>,
 }
 
 impl NotificationManager {
@@ -139,8 +186,17 @@ impl NotificationManager {
         Self {
             sent_notifications: std::collections::HashSet::new(),
             previous_session_percent: std::collections::HashMap::new(),
+            session_owner: std::collections::HashMap::new(),
             predictive_warning_keys: std::collections::HashSet::new(),
             deepseek_pricing_period: None,
+            identity_gaps: identity_gaps::IdentityGapState::default(),
+            credential_episodes: CredentialEpisodes::default(),
+            deferred_restored: std::collections::HashSet::new(),
+            limit_reset: limit_reset::LimitResetTracker::new(
+                limit_reset::LimitResetTracker::default_config_root(),
+            ),
+            #[cfg(test)]
+            toasts: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -278,6 +334,12 @@ impl NotificationManager {
         used_percent: f64,
         settings: &Settings,
     ) {
+        if !settings.quota_warning_enabled(provider, window) {
+            // Quota warnings set to Off for this provider window: forget its
+            // sent state so turning them back on starts fresh (Mac parity).
+            self.clear_threshold_toasts(provider, account, window);
+            return;
+        }
         if !settings.show_notifications {
             return;
         }
@@ -293,9 +355,7 @@ impl NotificationManager {
             // Clear only this provider+account+window's threshold toasts so a cool
             // session on one account cannot re-arm another account's weekly (or
             // another window on the same account) on the next poll.
-            self.sent_notifications.retain(|(p, a, w, t)| {
-                *p != provider || a != account || w != window || !t.is_threshold_toast()
-            });
+            self.clear_threshold_toasts(provider, account, window);
             None
         };
 
@@ -311,6 +371,32 @@ impl NotificationManager {
                 self.sent_notifications.insert(key);
             }
         }
+    }
+
+    fn clear_threshold_toasts(&mut self, provider: ProviderId, account: &str, window: &str) {
+        self.sent_notifications.retain(|(p, a, w, t)| {
+            *p != provider || a != account || w != window || !t.is_threshold_toast()
+        });
+    }
+
+    /// Observe a session lane across all session consumers. Informational
+    /// placeholders represent missing data and must not clear or re-arm
+    /// threshold, transition, or hook state in the caller.
+    pub fn check_session_lane(
+        &mut self,
+        provider: ProviderId,
+        account: &str,
+        used_percent: f64,
+        is_informational: bool,
+        settings: &Settings,
+    ) -> bool {
+        if is_informational {
+            return false;
+        }
+
+        self.check_and_notify(provider, account, "session", used_percent, settings);
+        self.check_session_transition(provider, account, used_percent, settings);
+        true
     }
 
     /// Send a notification for a status issue
@@ -354,13 +440,25 @@ impl NotificationManager {
         current_percent: f64,
         settings: &Settings,
     ) {
-        if !settings.show_notifications {
+        const DEPLETED_THRESHOLD: f64 = 99.99; // Consider depleted at 99.99%+
+
+        // Upstream `ownerChanged`: a different account (or missing identity versus a named
+        // one) re-baselines and drops every session edge for this provider. Recovery seen
+        // while another account owned the lane must not surface as a restore on return.
+        // Owner tracking runs even while session alerts are off, so a switch made while
+        // they are off cannot leave a depletion for the next owner to restore.
+        let transition_key = session_transition_key(provider, account);
+        let owner_changed = self.observe_session_owner(provider, account);
+        if owner_changed {
+            self.reset_session_transition_state(provider);
+            self.previous_session_percent
+                .insert(transition_key, current_percent);
+            return;
+        }
+        if !settings.session_quota_notifications_enabled {
             return;
         }
 
-        const DEPLETED_THRESHOLD: f64 = 99.99; // Consider depleted at 99.99%+
-
-        let transition_key: SessionTransitionKey = (provider, account.to_string());
         let previous_percent = self
             .previous_session_percent
             .get(&transition_key)
@@ -369,44 +467,67 @@ impl NotificationManager {
 
         // Check for depleted transition: was not depleted, now is
         if previous_percent < DEPLETED_THRESHOLD && current_percent >= DEPLETED_THRESHOLD {
-            let title = NotificationType::SessionDepleted.title();
-            let body = format!(
-                "{} session depleted. 0% left. Will notify when available again.",
-                provider.display_name()
+            let title = NotificationType::SessionDepleted.title(settings.ui_language);
+            let body = locale::format_locale(
+                settings.ui_language,
+                LocaleKey::NotificationSessionDepletedBody,
+                &[provider.display_name()],
             );
-            self.show_toast(title, &body);
+            self.show_toast(&title, &body);
             Self::play_notification_sound(NotificationSoundEvent::SessionDepleted, settings);
-            self.sent_notifications.insert((
-                provider,
-                account.to_string(),
-                "session".to_string(),
-                NotificationType::SessionDepleted,
-            ));
+            self.sent_notifications
+                .insert(session_depleted_key(provider, &transition_key.1));
         }
         // Check for restored transition: was depleted, now is not
         else if previous_percent >= DEPLETED_THRESHOLD && current_percent < DEPLETED_THRESHOLD {
             // Only notify restored if we previously sent a depleted notification
-            let depleted_key = (
-                provider,
-                account.to_string(),
-                "session".to_string(),
-                NotificationType::SessionDepleted,
-            );
+            let depleted_key = session_depleted_key(provider, &transition_key.1);
             if self.sent_notifications.contains(&depleted_key) {
-                let title = NotificationType::SessionRestored.title();
-                let body = format!(
-                    "{} session restored. Session quota is available again.",
-                    provider.display_name()
-                );
-                self.show_toast(title, &body);
-                Self::play_notification_sound(NotificationSoundEvent::SessionRestored, settings);
+                if settings.limit_reset_notifications_enabled {
+                    // The reset detector decides whether this restored toast or a
+                    // reset banner announces the session reset.
+                    self.deferred_restored.insert(transition_key.clone());
+                } else {
+                    self.post_session_restored(provider, settings);
+                }
                 self.sent_notifications.remove(&depleted_key);
             }
         }
 
-        // Update the tracked previous percent for this account
+        // Update the tracked previous percent for this session owner
         self.previous_session_percent
             .insert(transition_key, current_percent);
+    }
+
+    /// Record the session owner for `account` and report whether it differs from the
+    /// previous sample's owner for this provider.
+    fn observe_session_owner(&mut self, provider: ProviderId, account: &str) -> bool {
+        let owner = identity_gaps::session_owner_of(provider, account);
+        self.session_owner
+            .insert(provider, owner.to_string())
+            .is_some_and(|previous| previous != owner)
+    }
+
+    /// Forget every session edge for `provider` (all accounts): the baseline, pending
+    /// depleted flags, and deferred restored confirmations. Threshold toasts are kept.
+    fn reset_session_transition_state(&mut self, provider: ProviderId) {
+        self.previous_session_percent
+            .retain(|(p, _), _| *p != provider);
+        self.sent_notifications.retain(|(p, _, w, t)| {
+            *p != provider || w != "session" || *t != NotificationType::SessionDepleted
+        });
+        self.deferred_restored.retain(|(p, _)| *p != provider);
+    }
+
+    fn post_session_restored(&self, provider: ProviderId, settings: &Settings) {
+        let title = NotificationType::SessionRestored.title(settings.ui_language);
+        let body = locale::format_locale(
+            settings.ui_language,
+            LocaleKey::NotificationSessionRestoredBody,
+            &[provider.display_name()],
+        );
+        self.show_toast(&title, &body);
+        Self::play_notification_sound(NotificationSoundEvent::SessionRestored, settings);
     }
 
     /// Send a Windows toast notification with sound
@@ -418,19 +539,26 @@ impl NotificationManager {
         notif_type: NotificationType,
         settings: &Settings,
     ) {
-        let title = notif_type.title();
-        let body = Self::notification_body(provider, window, used_percent, notif_type);
-        self.show_toast(title, &body);
+        let title = notif_type.title(settings.ui_language);
+        let body = Self::notification_body(
+            provider,
+            window,
+            used_percent,
+            notif_type,
+            settings.ui_language,
+        );
+        self.show_toast(&title, &body);
         Self::play_notification_sound(Self::sound_event_for(notif_type), settings);
     }
 
-    fn window_label(window: &str) -> &str {
-        match window {
-            "session" => "session",
-            "weekly" => "weekly",
-            other if !other.is_empty() => other,
-            _ => "usage",
-        }
+    fn window_label(window: &str, language: crate::settings::Language) -> String {
+        let key = match window {
+            "session" => LocaleKey::NotificationWindowSession,
+            "weekly" => LocaleKey::NotificationWindowWeekly,
+            other if !other.is_empty() => return other.to_string(),
+            _ => LocaleKey::NotificationWindowUsage,
+        };
+        locale::get_text(language, key)
     }
 
     fn notification_body(
@@ -438,31 +566,30 @@ impl NotificationManager {
         window: &str,
         used_percent: f64,
         notif_type: NotificationType,
+        language: crate::settings::Language,
     ) -> String {
         let provider_name = provider.display_name();
-        let window_label = Self::window_label(window);
-        match notif_type {
-            NotificationType::HighUsage => {
-                format!(
-                    "{provider_name} {window_label} usage at {used_percent:.0}% - approaching limit"
-                )
-            }
+        let window_label = Self::window_label(window, language);
+        let percent = format!("{used_percent:.0}");
+        let usage_args = [provider_name, window_label.as_str(), percent.as_str()];
+        let provider_args = [provider_name];
+        let (key, args): (LocaleKey, &[&str]) = match notif_type {
+            NotificationType::HighUsage => (LocaleKey::NotificationHighUsageBody, &usage_args),
             NotificationType::CriticalUsage => {
-                format!(
-                    "{provider_name} {window_label} usage at {used_percent:.0}% - critically high!"
-                )
+                (LocaleKey::NotificationCriticalUsageBody, &usage_args)
             }
-            NotificationType::Exhausted => {
-                format!("{provider_name} {window_label} usage limit exhausted ({used_percent:.0}%)")
+            NotificationType::Exhausted => (LocaleKey::NotificationExhaustedBody, &usage_args),
+            NotificationType::StatusIssue => {
+                (LocaleKey::NotificationStatusIssueBody, &provider_args)
             }
-            NotificationType::StatusIssue => format!("{provider_name} is experiencing issues"),
             NotificationType::SessionDepleted => {
-                format!("{provider_name} session depleted. 0% left.")
+                (LocaleKey::NotificationSessionDepletedBody, &provider_args)
             }
             NotificationType::SessionRestored => {
-                format!("{provider_name} session restored. Quota available again.")
+                (LocaleKey::NotificationSessionRestoredBody, &provider_args)
             }
-        }
+        };
+        locale::format_locale(language, key, args)
     }
 
     fn sound_event_for(notif_type: NotificationType) -> NotificationSoundEvent {
@@ -488,14 +615,23 @@ impl NotificationManager {
         description: &str,
         settings: &Settings,
     ) {
-        let title = NotificationType::StatusIssue.title();
+        let title = NotificationType::StatusIssue.title(settings.ui_language);
         let body = format!("{}: {}", provider.display_name(), description);
-        self.show_toast(title, &body);
+        self.show_toast(&title, &body);
         Self::play_notification_sound(NotificationSoundEvent::StatusIssue, settings);
     }
 
-    #[cfg(target_os = "windows")]
-    fn show_toast(&self, title: &str, body: &str) {
+    /// Tests record the toast and report it as handed to the OS.
+    #[cfg(test)]
+    fn show_toast(&self, title: &str, body: &str) -> bool {
+        self.toasts.borrow_mut().push(format!("{title}: {body}"));
+        true
+    }
+
+    /// Returns whether the toast was handed to the OS (a spawn failure is the
+    /// only failure the fire-and-forget PowerShell dispatch can observe).
+    #[cfg(all(target_os = "windows", not(test)))]
+    fn show_toast(&self, title: &str, body: &str) -> bool {
         use std::os::windows::process::CommandExt;
         use std::process::Command;
         use std::sync::Once;
@@ -553,13 +689,19 @@ impl NotificationManager {
             .creation_flags(0x08000000) // CREATE_NO_WINDOW
             .spawn()
         {
-            Ok(_) => tracing::debug!("Toast notification dispatched: {}", title),
-            Err(e) => tracing::warn!("Failed to dispatch toast notification '{}': {}", title, e),
+            Ok(_) => {
+                tracing::debug!("Toast notification dispatched: {}", title);
+                true
+            }
+            Err(e) => {
+                tracing::warn!("Failed to dispatch toast notification '{}': {}", title, e);
+                false
+            }
         }
     }
 
-    #[cfg(not(target_os = "windows"))]
-    fn show_toast(&self, title: &str, body: &str) {
+    #[cfg(all(not(target_os = "windows"), not(test)))]
+    fn show_toast(&self, title: &str, body: &str) -> bool {
         use std::process::Command;
 
         // Try notify-send first (works on most Linux distros including WSL with WSLg)
@@ -574,10 +716,11 @@ impl NotificationManager {
             && output.status.success()
         {
             tracing::debug!("Sent notification via notify-send: {}", title);
-            return;
+            return true;
         }
 
         tracing::info!("Notification: {} - {}", title, body);
+        false
     }
 }
 
@@ -676,6 +819,51 @@ mod tests {
                 sound_event
             );
         }
+    }
+
+    #[test]
+    fn usage_toasts_follow_ui_language() {
+        use crate::settings::Language;
+
+        assert_eq!(
+            NotificationType::HighUsage.title(Language::English),
+            "High Usage Warning"
+        );
+        assert_eq!(
+            NotificationManager::notification_body(
+                ProviderId::Claude,
+                "weekly",
+                86.0,
+                NotificationType::HighUsage,
+                Language::English,
+            ),
+            "Claude weekly usage at 86% - approaching limit"
+        );
+        assert_eq!(
+            NotificationType::HighUsage.title(Language::Russian),
+            "Высокое использование"
+        );
+        assert_eq!(
+            NotificationManager::notification_body(
+                ProviderId::Claude,
+                "weekly",
+                86.0,
+                NotificationType::HighUsage,
+                Language::Russian,
+            ),
+            "Claude (неделя): использовано 86% — лимит почти исчерпан"
+        );
+        // Unknown windows pass through untranslated instead of falling back.
+        assert_eq!(
+            NotificationManager::notification_body(
+                ProviderId::Claude,
+                "opus",
+                100.0,
+                NotificationType::Exhausted,
+                Language::English,
+            ),
+            "Claude opus usage limit exhausted (100%)"
+        );
     }
 
     fn pace(will_last_to_reset: bool, eta_seconds: Option<f64>) -> UsagePace {
@@ -836,6 +1024,115 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_and_resolved_warning_histories_remain_separate() {
+        let now = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let reset = window(now, Duration::hours(3), 300);
+        let risk = pace(false, Some(3600.0));
+        let mut manager = NotificationManager::new();
+
+        assert!(manager.record_predictive_observation(
+            true,
+            ProviderId::Claude,
+            "claude:oauth:unknown",
+            PredictiveWarningWindow::Session,
+            &reset,
+            &risk,
+        ));
+        assert!(manager.record_predictive_observation(
+            true,
+            ProviderId::Claude,
+            "oauth:person@example.com",
+            PredictiveWarningWindow::Session,
+            &reset,
+            &risk,
+        ));
+        assert_eq!(manager.predictive_warning_keys.len(), 2);
+    }
+
+    #[test]
+    fn quota_warnings_off_suppresses_threshold_toasts_for_that_window_only() {
+        use crate::settings::{ProviderQuotaWarnings, QuotaWarningWindow};
+        let mut manager = NotificationManager::new();
+        let mut settings = Settings::default();
+        let account = "";
+        let key = |window: &str, kind| {
+            (
+                ProviderId::Claude,
+                account.to_string(),
+                window.to_string(),
+                kind,
+            )
+        };
+
+        manager.check_and_notify(ProviderId::Claude, account, "session", 80.0, &settings);
+        assert!(
+            manager
+                .sent_notifications
+                .contains(&key("session", NotificationType::HighUsage))
+        );
+
+        settings.set_quota_warnings(
+            ProviderId::Claude,
+            ProviderQuotaWarnings {
+                session: QuotaWarningWindow {
+                    enabled: Some(false),
+                    high: None,
+                    critical: None,
+                },
+                weekly: QuotaWarningWindow::default(),
+            },
+        );
+        manager.check_and_notify(ProviderId::Claude, account, "session", 95.0, &settings);
+        manager.check_and_notify(ProviderId::Claude, account, "weekly", 80.0, &settings);
+        assert!(
+            !manager
+                .sent_notifications
+                .iter()
+                .any(|(_, _, window, _)| window == "session"),
+            "Off clears and suppresses the session window"
+        );
+        assert!(
+            manager
+                .sent_notifications
+                .contains(&key("weekly", NotificationType::HighUsage)),
+            "the Global weekly window still warns"
+        );
+    }
+
+    #[test]
+    fn custom_quota_warning_threshold_decides_when_a_toast_fires() {
+        use crate::settings::{ProviderQuotaWarnings, QuotaWarningWindow};
+        let mut manager = NotificationManager::new();
+        let mut settings = Settings::default();
+        settings.set_quota_warnings(
+            ProviderId::Codex,
+            ProviderQuotaWarnings {
+                session: QuotaWarningWindow {
+                    enabled: None,
+                    high: Some(40.0),
+                    critical: Some(60.0),
+                },
+                weekly: QuotaWarningWindow::default(),
+            },
+        );
+        manager.check_and_notify(ProviderId::Codex, "", "session", 45.0, &settings);
+        assert!(manager.sent_notifications.contains(&(
+            ProviderId::Codex,
+            String::new(),
+            "session".to_string(),
+            NotificationType::HighUsage,
+        )));
+        // 45% is below the global 70% high threshold, so weekly stays quiet.
+        manager.check_and_notify(ProviderId::Codex, "", "weekly", 45.0, &settings);
+        assert!(
+            !manager
+                .sent_notifications
+                .iter()
+                .any(|(_, _, window, _)| window == "weekly")
+        );
+    }
+
+    #[test]
     fn session_below_high_does_not_rearm_weekly_high_toast() {
         // Repro for #198: session cool + weekly hot on every refresh used to
         // clear all provider keys on the session call, then re-fire weekly.
@@ -876,6 +1173,49 @@ mod tests {
         assert!(!manager.sent_notifications.contains(&weekly_key));
         manager.check_and_notify(ProviderId::Claude, account, "weekly", 76.0, &settings);
         assert!(manager.sent_notifications.contains(&weekly_key));
+    }
+
+    #[test]
+    fn missing_session_lane_preserves_warning_history_and_weekly_eligibility() {
+        let settings = Settings {
+            high_usage_threshold: 50.0,
+            ..Settings::default()
+        };
+        let mut manager = NotificationManager::new();
+        let account = "";
+
+        let session_high = (
+            ProviderId::Claude,
+            account.to_string(),
+            "session".to_string(),
+            NotificationType::HighUsage,
+        );
+        let weekly_high = (
+            ProviderId::Claude,
+            account.to_string(),
+            "weekly".to_string(),
+            NotificationType::HighUsage,
+        );
+
+        assert!(manager.check_session_lane(ProviderId::Claude, account, 51.0, false, &settings,));
+        assert!(manager.sent_notifications.contains(&session_high));
+
+        assert!(!manager.check_session_lane(ProviderId::Claude, account, 0.0, true, &settings,));
+        manager.check_and_notify(ProviderId::Claude, account, "weekly", 76.0, &settings);
+        assert!(manager.sent_notifications.contains(&weekly_high));
+
+        assert!(manager.check_session_lane(ProviderId::Claude, account, 52.0, false, &settings,));
+        assert!(manager.check_session_lane(ProviderId::Claude, account, 81.0, false, &settings,));
+        assert_eq!(
+            manager
+                .sent_notifications
+                .iter()
+                .filter(|key| **key == session_high)
+                .count(),
+            1,
+            "missing session data must not re-arm the session warning"
+        );
+        assert!(manager.sent_notifications.contains(&weekly_high));
     }
 
     #[test]
@@ -1052,8 +1392,143 @@ mod tests {
         assert!(!manager.sent_notifications.contains(&depleted_a));
         assert!(!manager.sent_notifications.contains(&depleted_b));
 
-        // Account B can still fire depleted independently.
+        // Account B can still fire depleted once it is the active owner again.
+        manager.check_session_transition(ProviderId::Claude, "account-b", 40.0, &settings);
         manager.check_session_transition(ProviderId::Claude, "account-b", 100.0, &settings);
         assert!(manager.sent_notifications.contains(&depleted_b));
+    }
+
+    fn toast_count(manager: &NotificationManager, notification: NotificationType) -> usize {
+        let prefix = notification.title(crate::settings::Language::English);
+        manager
+            .toasts
+            .borrow()
+            .iter()
+            .filter(|toast| toast.starts_with(&prefix))
+            .count()
+    }
+
+    #[test]
+    fn session_owner_change_starts_a_fresh_baseline() {
+        let mut manager = NotificationManager::new();
+        let settings = Settings::default();
+
+        manager.check_session_transition(ProviderId::Claude, "account-a", 50.0, &settings);
+        // Switching to an account already depleted is a new baseline, not a depleted edge.
+        manager.check_session_transition(ProviderId::Claude, "account-b", 100.0, &settings);
+        assert_eq!(
+            toast_count(&manager, NotificationType::SessionDepleted),
+            0,
+            "owner change must not fire depleted"
+        );
+
+        // The new owner's later samples produce normal edges again.
+        manager.check_session_transition(ProviderId::Claude, "account-b", 40.0, &settings);
+        manager.check_session_transition(ProviderId::Claude, "account-b", 100.0, &settings);
+        assert_eq!(toast_count(&manager, NotificationType::SessionDepleted), 1);
+    }
+
+    #[test]
+    fn session_switching_back_does_not_restore_a_stale_depletion() {
+        let mut manager = NotificationManager::new();
+        let settings = Settings::default();
+        let depleted_a = (
+            ProviderId::Claude,
+            "account-a".to_string(),
+            "session".to_string(),
+            NotificationType::SessionDepleted,
+        );
+
+        manager.check_session_transition(ProviderId::Claude, "account-a", 50.0, &settings);
+        manager.check_session_transition(ProviderId::Claude, "account-a", 100.0, &settings);
+        assert_eq!(toast_count(&manager, NotificationType::SessionDepleted), 1);
+
+        // A -> B -> A: the recovery happened while B was the owner, so A's
+        // return must rebaseline instead of announcing a restore.
+        manager.check_session_transition(ProviderId::Claude, "account-b", 40.0, &settings);
+        manager.check_session_transition(ProviderId::Claude, "account-a", 20.0, &settings);
+        assert_eq!(toast_count(&manager, NotificationType::SessionRestored), 0);
+        assert!(!manager.sent_notifications.contains(&depleted_a));
+    }
+
+    #[test]
+    fn session_owner_switch_while_alerts_are_off_still_rebaselines() {
+        let mut manager = NotificationManager::new();
+        let on = Settings::default();
+        let off = Settings {
+            session_quota_notifications_enabled: false,
+            ..Settings::default()
+        };
+
+        manager.check_session_transition(ProviderId::Claude, "account-a", 50.0, &on);
+        manager.check_session_transition(ProviderId::Claude, "account-a", 100.0, &on);
+        assert_eq!(toast_count(&manager, NotificationType::SessionDepleted), 1);
+
+        // Owner B arrives while alerts are off: silent, but it still re-baselines.
+        manager.check_session_transition(ProviderId::Claude, "account-b", 100.0, &off);
+        assert_eq!(toast_count(&manager, NotificationType::SessionDepleted), 1);
+
+        // A returns with alerts on at 20%. A's recovery happened while B owned the
+        // lane, so A's stale depletion must not surface as a restore.
+        manager.check_session_transition(ProviderId::Claude, "account-a", 20.0, &on);
+        assert_eq!(toast_count(&manager, NotificationType::SessionRestored), 0);
+        assert!(!manager.sent_notifications.contains(&(
+            ProviderId::Claude,
+            "account-a".to_string(),
+            "session".to_string(),
+            NotificationType::SessionDepleted,
+        )));
+    }
+
+    #[test]
+    fn session_missing_identity_is_its_own_owner() {
+        let mut manager = NotificationManager::new();
+        let settings = Settings::default();
+
+        // Missing identity ("") repeats like a nil discriminator: same owner, normal edges.
+        manager.check_session_transition(ProviderId::Claude, "", 50.0, &settings);
+        manager.check_session_transition(ProviderId::Claude, "", 100.0, &settings);
+        assert_eq!(toast_count(&manager, NotificationType::SessionDepleted), 1);
+
+        // Missing -> named and named -> missing are owner changes (nil != value).
+        manager.check_session_transition(ProviderId::Claude, "account-a", 40.0, &settings);
+        manager.check_session_transition(ProviderId::Claude, "", 0.0, &settings);
+        assert_eq!(
+            toast_count(&manager, NotificationType::SessionRestored),
+            0,
+            "missing identity must not restore a depletion from before the switch"
+        );
+    }
+
+    #[test]
+    fn session_transition_follows_its_own_setting_not_threshold_warnings() {
+        let depleted = (
+            ProviderId::Codex,
+            "account".to_string(),
+            "session".to_string(),
+            NotificationType::SessionDepleted,
+        );
+
+        // Threshold warnings off must not silence depleted/restored alerts.
+        let mut manager = NotificationManager::new();
+        let settings = Settings {
+            show_notifications: false,
+            session_quota_notifications_enabled: true,
+            ..Settings::default()
+        };
+        manager.check_session_transition(ProviderId::Codex, "account", 40.0, &settings);
+        manager.check_session_transition(ProviderId::Codex, "account", 100.0, &settings);
+        assert!(manager.sent_notifications.contains(&depleted));
+
+        // Turning the session-quota alerts off silences them even with warnings on.
+        let mut manager = NotificationManager::new();
+        let settings = Settings {
+            show_notifications: true,
+            session_quota_notifications_enabled: false,
+            ..Settings::default()
+        };
+        manager.check_session_transition(ProviderId::Codex, "account", 40.0, &settings);
+        manager.check_session_transition(ProviderId::Codex, "account", 100.0, &settings);
+        assert!(!manager.sent_notifications.contains(&depleted));
     }
 }

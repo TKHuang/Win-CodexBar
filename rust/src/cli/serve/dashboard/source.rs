@@ -11,16 +11,22 @@ use std::collections::{BTreeSet, HashMap};
 use std::pin::Pin;
 use std::time::Duration;
 
-use chrono::{Local, Utc};
+use chrono::Utc;
 
+use crate::cli::fetch_context::populate_api_region_from_settings;
 use crate::core::{CostScanOptions, FetchContext, ProviderId, SourceMode, instantiate_provider};
 use crate::cost_scanner::{self, CostScanner};
 use crate::settings::Settings;
+use crate::spend_contract::build_local_spend_contract_from_summary;
 
-use super::snapshot::{
-    AccountFetchEnvelope, ClaudeAccountsInput, DashboardIdentity, ProviderFetchEnvelope,
-    RawCostPayload, SnapshotInput, SnapshotPayload, build_snapshot,
+use crate::cli::serve::collection::{
+    AccountFetchEnvelope, ClaudeAccountsInput, ProviderFetchEnvelope, RawCostPayload,
+    SnapshotCollection,
 };
+use crate::cli::serve::dashboard::coordinator::{BoxSnapshotArtifactsFuture, SnapshotArtifacts};
+use crate::cli::serve::metrics::MetricsSnapshot;
+
+use super::snapshot::{DashboardIdentity, SnapshotInput, SnapshotPayload, build_snapshot};
 
 pub type BoxSnapshotFuture = Pin<Box<dyn Future<Output = Result<SnapshotPayload, String>> + Send>>;
 
@@ -63,10 +69,15 @@ impl SnapshotProducer {
 
     pub fn collect(&self) -> BoxSnapshotFuture {
         let this = self.clone();
-        Box::pin(async move { this.collect_inner().await })
+        Box::pin(async move { Ok(this.collect_artifacts_inner().await?.dashboard) })
     }
 
-    async fn collect_inner(&self) -> Result<SnapshotPayload, String> {
+    pub(crate) fn collect_artifacts(&self) -> BoxSnapshotArtifactsFuture<MetricsSnapshot> {
+        let this = self.clone();
+        Box::pin(async move { this.collect_artifacts_inner().await })
+    }
+
+    async fn collect_artifacts_inner(&self) -> Result<SnapshotArtifacts<MetricsSnapshot>, String> {
         let settings = Settings::load();
         // Resolve identity: explicit --identity flag wins; otherwise follow
         // the app's hide_personal_info setting (upstream 0.50.1 #2960).
@@ -82,10 +93,12 @@ impl SnapshotProducer {
         for (index, provider_id) in provider_ids.iter().enumerate() {
             let provider_id = *provider_id;
             let fetch_timeout = self.fetch_timeout;
+            let mut ctx = provider_fetch_context();
+            populate_api_region_from_settings(provider_id, &settings, &mut ctx);
             set.spawn(async move {
                 (
                     index,
-                    fetch_provider_envelope(provider_id, fetch_timeout).await,
+                    fetch_provider_envelope(provider_id, ctx, fetch_timeout).await,
                 )
             });
         }
@@ -102,27 +115,35 @@ impl SnapshotProducer {
         let providers: Vec<ProviderFetchEnvelope> =
             indexed.into_iter().map(|(_, envelope)| envelope).collect();
 
-        let costs = collect_costs().await;
+        let costs = collect_costs(provider_ids.contains(&ProviderId::Pi)).await;
         let claude_accounts =
-            collect_claude_accounts(provider_ids.contains(&ProviderId::Claude)).await;
+            collect_claude_accounts(provider_ids.contains(&ProviderId::Claude), &settings).await;
 
         let order: Vec<String> = provider_ids
             .iter()
             .map(|id| id.cli_name().to_string())
             .collect();
         let enabled: BTreeSet<String> = order.iter().cloned().collect();
-        let input = SnapshotInput {
+        let collection = SnapshotCollection {
             providers,
             costs,
             claude_accounts,
-            identity,
             generated_at: Utc::now(),
             refresh_seconds: self.refresh_seconds,
-            version: Some(self.version.clone()),
             order,
             enabled,
         };
-        Ok(build_snapshot(&input))
+        let metrics = MetricsSnapshot::from_collection(&collection);
+        Ok(SnapshotArtifacts {
+            dashboard: build_snapshot(&SnapshotInput {
+                collection,
+                identity,
+                version: Some(self.version.clone()),
+                usage_bars_show_used: Some(settings.show_as_used),
+                weekly_work_days: settings.weekly_progress_work_days,
+            }),
+            sidecar: Some(metrics),
+        })
     }
 }
 
@@ -130,23 +151,12 @@ impl SnapshotProducer {
 /// failure instead of failing the whole snapshot (F9 semantics).
 async fn fetch_provider_envelope(
     provider_id: ProviderId,
+    ctx: FetchContext,
     fetch_timeout: Option<Duration>,
 ) -> ProviderFetchEnvelope {
     let provider = instantiate_provider(provider_id);
     let metadata = provider.metadata();
-    let ctx = FetchContext {
-        source_mode: SourceMode::Auto,
-        include_credits: true,
-        web_timeout: 60,
-        verbose: false,
-        manual_cookie_header: None,
-        api_key: None,
-        workspace_id: None,
-        api_region: None,
-        gateway_url: None,
-        auto_prefer_web: false,
-        requires_optional_usage_completeness: false,
-    };
+
     let fetch = bounded_fetch(provider_id, ctx, None, fetch_timeout).await;
     ProviderFetchEnvelope {
         id: provider_id.cli_name().to_string(),
@@ -154,6 +164,29 @@ async fn fetch_provider_envelope(
         session_label: metadata.session_label.to_string(),
         weekly_label: metadata.weekly_label.to_string(),
         fetch,
+    }
+}
+
+fn provider_fetch_context() -> FetchContext {
+    FetchContext {
+        source_mode: SourceMode::Auto,
+        include_credits: true,
+        web_timeout: 60,
+        verbose: false,
+        manual_cookie_header: None,
+        manual_cookie_missing: false,
+        api_key: None,
+        token_account_kind: None,
+        token_account_isolated: false,
+        workspace_id: None,
+        seat_credit_entitlement: None,
+        api_region: None,
+        gateway_url: None,
+        auto_prefer_web: false,
+        browser_cookie_import: false,
+        requires_optional_usage_completeness: false,
+        optional_details_enabled: false,
+        live_usage_enabled: false,
     }
 }
 
@@ -187,14 +220,22 @@ async fn bounded_fetch(
     }
 }
 
-/// Local cost data for the two scanned providers, computed off the async
+/// Local cost data for the scanned providers, computed off the async
 /// runtime so a large corpus cannot stall dashboard builds.
-async fn collect_costs() -> HashMap<String, RawCostPayload> {
-    let result = tokio::task::spawn_blocking(|| {
-        let scanner = CostScanner::new(30).with_options(CostScanOptions::app_driven());
+async fn collect_costs(pi_selected: bool) -> HashMap<String, RawCostPayload> {
+    let result = tokio::task::spawn_blocking(move || {
+        let mut scan_options = CostScanOptions::app_driven();
+        scan_options.include_pi_sessions = !pi_selected;
+        let scanner = CostScanner::new(30).with_options(scan_options);
         let codex = scanner.scan_codex_with_cancel(None);
-        let claude = scanner.scan_claude_with_cancel(None);
-        let today = Local::now().date_naive().format("%Y-%m-%d").to_string();
+        let claude = scanner.scan_claude_with_cancel_and_pi_sessions(None, !pi_selected);
+        let pi = scanner.scan_pi_with_cancel(None);
+        let pi_contract =
+            build_local_spend_contract_from_summary("pi", 30, false, false, false, pi);
+        let today = crate::cost_reporting_period::cost_bucket_zone()
+            .date(Utc::now())
+            .format("%Y-%m-%d")
+            .to_string();
         let today_of = |provider: &str| {
             cost_scanner::get_daily_cost_history(provider, 30)
                 .into_iter()
@@ -216,6 +257,13 @@ async fn collect_costs() -> HashMap<String, RawCostPayload> {
                 last_30_days_usd: Some(claude.total_cost_usd),
             },
         );
+        costs.insert(
+            "pi".to_string(),
+            RawCostPayload {
+                today_usd: today_of("pi"),
+                last_30_days_usd: pi_contract.known_cost_usd,
+            },
+        );
         costs
     })
     .await;
@@ -233,7 +281,10 @@ async fn collect_costs() -> HashMap<String, RawCostPayload> {
 
 /// Claude token-account rows (upstream "claude-swap" analog): per-account
 /// cookie-override fetches, active flag from the store, errors as rows.
-async fn collect_claude_accounts(claude_enabled: bool) -> Option<ClaudeAccountsInput> {
+async fn collect_claude_accounts(
+    claude_enabled: bool,
+    settings: &Settings,
+) -> Option<ClaudeAccountsInput> {
     if !claude_enabled {
         return None;
     }
@@ -248,24 +299,32 @@ async fn collect_claude_accounts(claude_enabled: bool) -> Option<ClaudeAccountsI
     let active_index = data.active_account().map(|active| active.id);
     let mut set = tokio::task::JoinSet::new();
     for (index, account) in data.accounts.iter().cloned().enumerate() {
+        let header = crate::core::TokenAccountSupport::normalized_cookie_header(
+            ProviderId::Claude,
+            &account.token,
+        );
+        let mut ctx = FetchContext {
+            source_mode: SourceMode::Auto,
+            include_credits: true,
+            web_timeout: 60,
+            verbose: false,
+            manual_cookie_header: Some(header),
+            manual_cookie_missing: false,
+            api_key: None,
+            token_account_kind: None,
+            token_account_isolated: false,
+            workspace_id: None,
+            seat_credit_entitlement: None,
+            api_region: None,
+            gateway_url: None,
+            auto_prefer_web: false,
+            browser_cookie_import: false,
+            requires_optional_usage_completeness: false,
+            optional_details_enabled: false,
+            live_usage_enabled: false,
+        };
+        populate_api_region_from_settings(ProviderId::Claude, settings, &mut ctx);
         set.spawn(async move {
-            let header = crate::core::TokenAccountSupport::normalized_cookie_header(
-                ProviderId::Claude,
-                &account.token,
-            );
-            let ctx = FetchContext {
-                source_mode: SourceMode::Auto,
-                include_credits: true,
-                web_timeout: 60,
-                verbose: false,
-                manual_cookie_header: Some(header),
-                api_key: None,
-                workspace_id: None,
-                api_region: None,
-                gateway_url: None,
-                auto_prefer_web: false,
-                requires_optional_usage_completeness: false,
-            };
             let fetch = bounded_fetch(
                 ProviderId::Claude,
                 ctx,

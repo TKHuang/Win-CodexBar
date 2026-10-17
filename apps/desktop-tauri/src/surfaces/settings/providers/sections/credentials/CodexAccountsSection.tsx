@@ -16,10 +16,11 @@ import {
   codexAccountSwitch,
   getCodexAccountsState,
 } from "../../../../../lib/tauri";
-import { buildCodexAccountDisplayNames } from "../../../../../components/codexAccountDisplay";
+import { buildCodexAccountSurfaceLabels } from "../../../../../components/codexAccountDisplay";
 
 interface Props {
   t: (key: LocaleKey) => string;
+  hidePersonalInfo?: boolean;
 }
 
 /**
@@ -33,12 +34,14 @@ interface Props {
  * ambient identity, and remove managed homes. For MSIX Codex Desktop installs
  * a restart action is offered when a session snapshot is available to restore.
  */
-export function CodexAccountsSection({ t }: Props) {
+export function CodexAccountsSection({ t, hidePersonalInfo = false }: Props) {
   const [accounts, setAccounts] = useState<CodexAccount[]>([]);
   const [snapshots, setSnapshots] = useState<
     Record<string, CodexAccountUsageSnapshot>
   >({});
   const [displayNames, setDisplayNames] = useState<Record<string, string>>({});
+  const [accountOrdinals, setAccountOrdinals] = useState<Record<string, number>>({});
+  const [accountNeedsAuthentication, setAccountNeedsAuthentication] = useState<Record<string, boolean>>({});
   const [loaded, setLoaded] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -53,7 +56,9 @@ export function CodexAccountsSection({ t }: Props) {
       const next: CodexAccountsStateBridge = await getCodexAccountsState();
       setAccounts(next.accounts);
       setDisplayNames(next.displayNames ?? {});
+      setAccountOrdinals(next.accountOrdinals);
       setSnapshots(next.snapshots);
+      setAccountNeedsAuthentication(next.needsAuthentication ?? {});
       setLoaded(true);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
@@ -121,12 +126,12 @@ export function CodexAccountsSection({ t }: Props) {
     }
   };
 
-  const handleReauthenticate = async () => {
+  const handleReauthenticate = async (id: string) => {
     setBusy(true);
     setError(null);
     setSwitchResult(null);
     try {
-      await codexAccountReauthenticate();
+      await codexAccountReauthenticate(id);
       await load();
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
@@ -167,9 +172,12 @@ export function CodexAccountsSection({ t }: Props) {
     return null;
   }
 
-  const accountDisplayNames = buildCodexAccountDisplayNames(
+  const accountDisplayNames = buildCodexAccountSurfaceLabels(
     accounts,
     displayNames,
+    accountOrdinals,
+    hidePersonalInfo,
+    t("Account"),
   );
 
   return (
@@ -248,16 +256,14 @@ export function CodexAccountsSection({ t }: Props) {
                       </span>
                     </div>
                     <div className="credential-card__actions">
-                      {account.source === "ambient" && (
-                        <button
-                          type="button"
-                          className="credential-btn credential-btn--secondary"
-                          disabled={busy}
-                          onClick={() => void handleReauthenticate()}
-                        >
-                          {t("CodexAccountsReauthenticateButton")}
-                        </button>
-                      )}
+                      {accountNeedsAuthentication[account.id] && <button
+                        type="button"
+                        className="credential-btn credential-btn--secondary"
+                        disabled={busy}
+                        onClick={() => void handleReauthenticate(account.id)}
+                      >
+                        {t("CodexAccountsReauthenticateButton")}
+                      </button>}
                       <button
                         type="button"
                         className="credential-btn credential-btn--secondary"
@@ -274,14 +280,18 @@ export function CodexAccountsSection({ t }: Props) {
                       >
                         {t("CodexAccountsSwitchButton")}
                       </button>
-                      <button
-                        type="button"
-                        className="credential-btn credential-btn--danger"
-                        disabled={busy}
-                        onClick={() => void handleRemove(account.id)}
-                      >
-                        {t("CodexAccountsRemoveButton")}
-                      </button>
+                      {/* The ambient account is Codex's own ~/.codex login and is
+                          rediscovered on every load, so Remove could never stick. */}
+                      {account.source !== "ambient" && (
+                        <button
+                          type="button"
+                          className="credential-btn credential-btn--danger"
+                          disabled={busy}
+                          onClick={() => void handleRemove(account.id)}
+                        >
+                          {t("CodexAccountsRemoveButton")}
+                        </button>
+                      )}
                     </div>
                   </div>
                 </li>
@@ -311,13 +321,21 @@ function CodexUsagePill({
   snapshot: CodexAccountUsageSnapshot;
   t: (key: LocaleKey) => string;
 }) {
-  const window = snapshot.primaryWindow;
-  const percent = window ? Math.round(window.usedPercent) : null;
   const plan = snapshot.plan ?? "";
   const blocked = snapshot.allowed === false || snapshot.limitReached === true;
-  const label = [plan, percent !== null ? `${percent}%` : null]
-    .filter(Boolean)
-    .join(" · ");
+  const windows = [snapshot.primaryWindow, snapshot.secondaryWindow]
+    .filter((window): window is NonNullable<typeof window> => window != null)
+    .map((window) => {
+      const pct = `${Math.round(window.usedPercent)}%`;
+      if (window.limitWindowSeconds % 86_400 === 0) {
+        return `${window.limitWindowSeconds / 86_400}d ${pct}`;
+      }
+      if (window.limitWindowSeconds % 3_600 === 0) {
+        return `${window.limitWindowSeconds / 3_600}h ${pct}`;
+      }
+      return pct;
+    });
+  const label = [plan, ...windows].filter(Boolean).join(" · ");
   return (
     <span className={blocked ? "codex-usage codex-usage--blocked" : "codex-usage"}>
       {label || t("CodexAccountsUsageUnavailable")}

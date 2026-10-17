@@ -18,6 +18,8 @@ pub enum HookEventType {
     QuotaLow,
     QuotaReached,
     QuotaReset,
+    /// A successful provider refresh published a current usage snapshot.
+    UsageUpdated,
     ProviderUnavailable,
     ProviderRecovered,
     RefreshFailed,
@@ -29,15 +31,36 @@ impl HookEventType {
             Self::QuotaLow => "quota_low",
             Self::QuotaReached => "quota_reached",
             Self::QuotaReset => "quota_reset",
+            Self::UsageUpdated => "usage_updated",
             Self::ProviderUnavailable => "provider_unavailable",
             Self::ProviderRecovered => "provider_recovered",
             Self::RefreshFailed => "refresh_failed",
         }
     }
 
+    /// Every event, in the order the Settings picker lists them (macOS
+    /// `HookEventType.allCases`).
+    pub const ALL: [Self; 7] = [
+        Self::QuotaLow,
+        Self::QuotaReached,
+        Self::QuotaReset,
+        Self::UsageUpdated,
+        Self::ProviderUnavailable,
+        Self::ProviderRecovered,
+        Self::RefreshFailed,
+    ];
+
+    /// The event with this config name, or `None` for an unknown name.
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|event| event.as_str() == value)
+    }
+
     /// Events that can repeat every refresh while a condition persists.
     pub fn is_rate_limited(self) -> bool {
-        matches!(self, Self::ProviderUnavailable | Self::RefreshFailed)
+        matches!(
+            self,
+            Self::UsageUpdated | Self::ProviderUnavailable | Self::RefreshFailed
+        )
     }
 }
 
@@ -56,6 +79,21 @@ pub struct HookEvent {
     /// Used fraction 0..=1 (upstream-compatible env/payload).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage_percent: Option<f64>,
+    /// Duration of the primary quota window, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_minutes: Option<u32>,
+    /// Primary quota reset timestamp, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset_at: Option<String>,
+    /// Used fraction for the secondary quota window, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secondary_usage_percent: Option<f64>,
+    /// Duration of the secondary quota window, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secondary_window_minutes: Option<u32>,
+    /// Secondary quota reset timestamp, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secondary_reset_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
     pub timestamp: String,
@@ -70,6 +108,11 @@ impl HookEvent {
             window: None,
             remaining_percent: None,
             usage_percent: None,
+            window_minutes: None,
+            reset_at: None,
+            secondary_usage_percent: None,
+            secondary_window_minutes: None,
+            secondary_reset_at: None,
             status: None,
             timestamp: utc_now_iso(),
         }
@@ -110,6 +153,32 @@ impl HookEvent {
         self
     }
 
+    pub fn with_window_minutes(mut self, minutes: Option<u32>) -> Self {
+        self.window_minutes = minutes;
+        self
+    }
+
+    pub fn with_reset_at(mut self, reset_at: Option<String>) -> Self {
+        self.reset_at = reset_at;
+        self
+    }
+
+    pub fn with_secondary_usage_fraction(mut self, usage: f64) -> Self {
+        let usage = usage.clamp(0.0, 1.0);
+        self.secondary_usage_percent = Some(usage);
+        self
+    }
+
+    pub fn with_secondary_window_minutes(mut self, minutes: Option<u32>) -> Self {
+        self.secondary_window_minutes = minutes;
+        self
+    }
+
+    pub fn with_secondary_reset_at(mut self, reset_at: Option<String>) -> Self {
+        self.secondary_reset_at = reset_at;
+        self
+    }
+
     pub fn with_timestamp(mut self, ts: chrono::DateTime<chrono::Utc>) -> Self {
         self.timestamp = format_unix_utc(ts.timestamp().max(0) as u64);
         self
@@ -129,6 +198,27 @@ impl HookEvent {
         }
         if let Some(usage) = self.usage_percent {
             env.insert("CODEXBAR_USAGE_PERCENT".into(), format_number(usage));
+        }
+        if let Some(minutes) = self.window_minutes {
+            env.insert("CODEXBAR_WINDOW_MINUTES".into(), minutes.to_string());
+        }
+        if let Some(reset_at) = &self.reset_at {
+            env.insert("CODEXBAR_RESET_AT".into(), reset_at.clone());
+        }
+        if let Some(usage) = self.secondary_usage_percent {
+            env.insert(
+                "CODEXBAR_SECONDARY_USAGE_PERCENT".into(),
+                format_number(usage),
+            );
+        }
+        if let Some(minutes) = self.secondary_window_minutes {
+            env.insert(
+                "CODEXBAR_SECONDARY_WINDOW_MINUTES".into(),
+                minutes.to_string(),
+            );
+        }
+        if let Some(reset_at) = &self.secondary_reset_at {
+            env.insert("CODEXBAR_SECONDARY_RESET_AT".into(), reset_at.clone());
         }
         if let Some(remaining) = self.remaining_percent {
             env.insert(
@@ -180,6 +270,9 @@ fn default_timeout_secs() -> u64 {
 }
 
 impl HookRule {
+    /// Most arguments one rule may pass (macOS `HookRule.maximumArgumentCount`).
+    pub const MAX_ARGUMENTS: usize = 32;
+
     fn matched_events(&self) -> Vec<HookEventType> {
         let mut out = self.events.clone();
         if let Some(event) = self.event
@@ -203,6 +296,9 @@ impl HookRule {
         if self.timeout_secs == 0 || self.timeout_secs > 300 {
             return false;
         }
+        if self.arguments.len() > Self::MAX_ARGUMENTS {
+            return false;
+        }
         if let Some(provider) = &self.provider
             && provider != &event.provider
         {
@@ -219,6 +315,25 @@ impl HookRule {
         }
         true
     }
+}
+
+/// Why a hooks config can't be saved from Settings.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum HooksConfigError {
+    #[error("hooks support at most {max} rules (got {count})")]
+    TooManyRules { count: usize, max: usize },
+    #[error("hook rule {n} has {count} arguments; the limit is {max}", n = .rule + 1)]
+    TooManyArguments {
+        rule: usize,
+        count: usize,
+        max: usize,
+    },
+    #[error("hook rule {n} has an unknown event \"{event}\"", n = .rule + 1)]
+    UnknownEvent { rule: usize, event: String },
+    #[error("hooks.json can't be read: {0}")]
+    Unreadable(String),
+    #[error("hooks.json can't be saved: {0}")]
+    Unwritable(String),
 }
 
 /// Top-level hooks config file contents.
@@ -253,6 +368,41 @@ impl HooksConfig {
         serde_json::from_str(content.trim_start_matches('\u{feff}')).unwrap_or_default()
     }
 
+    /// Like [`Self::load_from`], but tells a missing file (`Ok(None)`) apart
+    /// from one that exists and doesn't parse (`Err`), so an editor never
+    /// saves an empty rule list over rules it couldn't read.
+    pub fn load_existing(path: &Path) -> Result<Option<Self>, HooksConfigError> {
+        let content = match std::fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(HooksConfigError::Unreadable(err.to_string())),
+        };
+        serde_json::from_str(content.trim_start_matches('\u{feff}'))
+            .map(Some)
+            .map_err(|err| HooksConfigError::Unreadable(err.to_string()))
+    }
+
+    /// The limits Settings enforces before it writes `hooks.json`: at most
+    /// [`Self::MAX_RULES`] rules and [`HookRule::MAX_ARGUMENTS`] arguments per rule.
+    pub fn validate(&self) -> Result<(), HooksConfigError> {
+        if self.events.len() > Self::MAX_RULES {
+            return Err(HooksConfigError::TooManyRules {
+                count: self.events.len(),
+                max: Self::MAX_RULES,
+            });
+        }
+        for (index, rule) in self.events.iter().enumerate() {
+            if rule.arguments.len() > HookRule::MAX_ARGUMENTS {
+                return Err(HooksConfigError::TooManyArguments {
+                    rule: index,
+                    count: rule.arguments.len(),
+                    max: HookRule::MAX_ARGUMENTS,
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Persist config to the standard hooks.json path (creates parent dirs).
     pub fn save(&self) -> Result<PathBuf, String> {
         let path = Self::path().ok_or_else(|| "config directory unavailable".to_string())?;
@@ -265,7 +415,8 @@ impl HooksConfig {
             std::fs::create_dir_all(parent).map_err(|e| format!("create hooks dir: {e}"))?;
         }
         let body = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(path, body).map_err(|e| format!("write hooks.json: {e}"))
+        crate::atomic_file::write_atomic(path, body.as_bytes())
+            .map_err(|e| format!("write hooks.json: {e}"))
     }
 
     pub fn matching_rules(&self, event: &HookEvent) -> Vec<&HookRule> {
@@ -315,12 +466,17 @@ pub struct HookRunner;
 
 impl HookRunner {
     /// Dispatch matching rules for `event`. Failures are logged, never returned.
-    pub fn dispatch(event: &HookEvent, config: &HooksConfig, rate_limiter: &HookRateLimiter) {
+    pub fn dispatch(
+        event: &HookEvent,
+        config: &HooksConfig,
+        rate_limiter: &HookRateLimiter,
+        rate_limit_scope: Option<&str>,
+    ) {
         let rules = config.matching_rules(event);
         if rules.is_empty() {
             return;
         }
-        if event.event.is_rate_limited() && !rate_limiter.allow(event) {
+        if event.event.is_rate_limited() && !rate_limiter.allow(event, rate_limit_scope) {
             tracing::debug!(
                 event = event.event.as_str(),
                 provider = %event.provider,
@@ -348,7 +504,11 @@ impl HookRunner {
     }
 
     /// Best-effort load + dispatch when settings allow hooks.
-    pub fn dispatch_if_enabled(event: HookEvent, hooks_enabled: bool) {
+    pub fn dispatch_if_enabled(
+        event: HookEvent,
+        hooks_enabled: bool,
+        rate_limit_scope: Option<&str>,
+    ) {
         if !hooks_enabled {
             return;
         }
@@ -357,7 +517,7 @@ impl HookRunner {
             return;
         }
         HOOK_RATE_LIMITER.with(|limiter| {
-            Self::dispatch(&event, &config, limiter);
+            Self::dispatch(&event, &config, limiter, rate_limit_scope);
         });
     }
 
@@ -378,15 +538,24 @@ impl HookRunner {
         }
 
         let env = build_hook_environment(base_env, event);
-        let mut child = Command::new(&rule.executable)
+        let mut command = Command::new(&rule.executable);
+        command
             .args(&rule.arguments)
             .env_clear()
             .envs(env)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("launch failed: {e}"))?;
+            .stderr(Stdio::null());
+        // Hooks fire on background events and their output is discarded:
+        // without this, a console hook opens a console window over the app the
+        // user is working in.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        let mut child = command.spawn().map_err(|e| format!("launch failed: {e}"))?;
 
         if let Some(mut stdin) = child.stdin.take() {
             // Fire-and-forget payload delivery: a hook that closed stdin early
@@ -437,8 +606,12 @@ impl HookRateLimiter {
         }
     }
 
-    pub fn allow(&self, event: &HookEvent) -> bool {
-        let key = rate_limit_key(event);
+    /// `scope` keys the suppression window (e.g. a private account
+    /// discriminator for `usage_updated`); `None` falls back to public event
+    /// identity (event/provider/account/window). The scope value is never
+    /// serialized or forwarded to hook processes.
+    pub fn allow(&self, event: &HookEvent, scope: Option<&str>) -> bool {
+        let key = rate_limit_key(event, scope);
         let Ok(mut map) = self.last_fired.lock() else {
             return true;
         };
@@ -459,7 +632,18 @@ impl Default for HookRateLimiter {
     }
 }
 
-fn rate_limit_key(event: &HookEvent) -> String {
+/// Private limiter keys are provider-qualified so two providers sharing an
+/// account identity never suppress each other; the event name separates this
+/// from the event-identity branch.
+fn rate_limit_key(event: &HookEvent, scope: Option<&str>) -> String {
+    if let Some(scope) = scope.filter(|scope| !scope.is_empty()) {
+        return format!(
+            "{}\u{1f}{}\u{1f}{}",
+            event.event.as_str(),
+            event.provider,
+            scope
+        );
+    }
     format!(
         "{}\u{1f}{}\u{1f}{}\u{1f}{}",
         event.event.as_str(),
@@ -608,163 +792,26 @@ pub fn emit_quota_threshold_hooks(
                 if !account.is_empty() {
                     event = event.with_account(account.clone());
                 }
-                HookRunner::dispatch_if_enabled(event, true);
+                HookRunner::dispatch_if_enabled(event, true, None);
             }
         })
         .ok();
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-
-    #[test]
-    fn payload_env_includes_event_and_remaining() {
-        let event = HookEvent::new(HookEventType::QuotaLow, "claude")
-            .with_used_percent(80.0)
-            .with_window("session")
-            .with_account("user@example.com");
-        let env = event.environment_variables();
-        assert_eq!(
-            env.get("CODEXBAR_EVENT").map(String::as_str),
-            Some("quota_low")
-        );
-        assert_eq!(
-            env.get("CODEXBAR_PROVIDER").map(String::as_str),
-            Some("claude")
-        );
-        assert_eq!(
-            env.get("CODEXBAR_WINDOW").map(String::as_str),
-            Some("session")
-        );
-        assert_eq!(
-            env.get("CODEXBAR_ACCOUNT").map(String::as_str),
-            Some("user@example.com")
-        );
-        assert_eq!(
-            env.get("CODEXBAR_USAGE_PERCENT").map(String::as_str),
-            Some("0.8")
-        );
-        assert_eq!(
-            env.get("CODEXBAR_REMAINING_PERCENT").map(String::as_str),
-            Some("20")
-        );
-        let payload = event.json_payload().unwrap();
-        assert!(payload.len() < HooksConfig::MAX_PAYLOAD_BYTES);
-        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
-        assert_eq!(parsed["event"], "quota_low");
-        assert_eq!(parsed["provider"], "claude");
-        assert!((parsed["remaining_percent"].as_f64().unwrap() - 20.0).abs() < 0.01);
+/// Fire-and-forget background dispatch of one hook event.
+pub(super) fn spawn_hook_dispatch(
+    event: HookEvent,
+    hooks_enabled: bool,
+    rate_limit_scope: Option<String>,
+) {
+    if !hooks_enabled {
+        return;
     }
-
-    #[test]
-    fn build_hook_environment_whitelists_only_safe_keys() {
-        let mut base = HashMap::new();
-        base.insert("PATH".into(), "/usr/bin".into());
-        base.insert("HOME".into(), "/home/u".into());
-        base.insert("USER".into(), "u".into());
-        base.insert("TEMP".into(), "C:\\Temp".into());
-        base.insert("SECRET_API_KEY".into(), "should-not-pass".into());
-        base.insert("OPENAI_API_KEY".into(), "nope".into());
-        let event = HookEvent::new(HookEventType::QuotaReached, "codex").with_used_percent(100.0);
-        let env = build_hook_environment(&base, &event);
-        assert_eq!(env.get("PATH").map(String::as_str), Some("/usr/bin"));
-        assert_eq!(env.get("HOME").map(String::as_str), Some("/home/u"));
-        assert_eq!(env.get("USER").map(String::as_str), Some("u"));
-        assert_eq!(env.get("TEMP").map(String::as_str), Some("C:\\Temp"));
-        assert!(!env.contains_key("SECRET_API_KEY"));
-        assert!(!env.contains_key("OPENAI_API_KEY"));
-        assert_eq!(
-            env.get("CODEXBAR_EVENT").map(String::as_str),
-            Some("quota_reached")
-        );
-    }
-
-    #[test]
-    fn rate_limiter_suppresses_repeat_within_window() {
-        let limiter = HookRateLimiter::new(Duration::from_secs(600));
-        let event = HookEvent::new(HookEventType::RefreshFailed, "cursor");
-        assert!(limiter.allow(&event));
-        assert!(!limiter.allow(&event));
-        let other = HookEvent::new(HookEventType::RefreshFailed, "claude");
-        assert!(limiter.allow(&other));
-    }
-
-    #[test]
-    fn rule_matches_event_list_and_provider() {
-        #[cfg(windows)]
-        let absolute = PathBuf::from(r"C:\Windows\System32\cmd.exe");
-        #[cfg(not(windows))]
-        let absolute = PathBuf::from("/usr/bin/true");
-        let rule = HookRule {
-            enabled: true,
-            event: None,
-            events: vec![HookEventType::QuotaLow, HookEventType::QuotaReached],
-            provider: Some("codex".into()),
-            threshold: Some(0.7),
-            executable: absolute,
-            arguments: vec![],
-            timeout_secs: 10,
-        };
-        let match_event = HookEvent::new(HookEventType::QuotaLow, "codex").with_used_percent(80.0);
-        assert!(rule.matches(&match_event));
-        let low = HookEvent::new(HookEventType::QuotaLow, "codex").with_used_percent(50.0);
-        assert!(!rule.matches(&low));
-        let other = HookEvent::new(HookEventType::QuotaLow, "claude").with_used_percent(80.0);
-        assert!(!rule.matches(&other));
-    }
-
-    #[test]
-    fn config_matching_respects_enabled_flag() {
-        let rule = HookRule {
-            enabled: true,
-            event: Some(HookEventType::QuotaReset),
-            events: vec![],
-            provider: None,
-            threshold: None,
-            executable: PathBuf::from("C:\\Windows\\System32\\cmd.exe"),
-            arguments: vec![],
-            timeout_secs: 5,
-        };
-        let event = HookEvent::new(HookEventType::QuotaReset, "claude");
-        let disabled = HooksConfig {
-            enabled: false,
-            events: vec![rule.clone()],
-        };
-        assert!(disabled.matching_rules(&event).is_empty());
-        let enabled = HooksConfig {
-            enabled: true,
-            events: vec![rule],
-        };
-        assert_eq!(enabled.matching_rules(&event).len(), 1);
-    }
-
-    #[test]
-    fn relative_executable_never_matches() {
-        let rule = HookRule {
-            enabled: true,
-            event: Some(HookEventType::QuotaLow),
-            events: vec![],
-            provider: None,
-            threshold: None,
-            executable: PathBuf::from("notify.sh"),
-            arguments: vec![],
-            timeout_secs: 10,
-        };
-        let event = HookEvent::new(HookEventType::QuotaLow, "codex").with_used_percent(90.0);
-        assert!(!rule.matches(&event));
-    }
-
-    #[test]
-    fn rate_limiter_key_is_stable() {
-        let a = HookEvent::new(HookEventType::ProviderUnavailable, "warp")
-            .with_window("session")
-            .with_account("a");
-        let b = HookEvent::new(HookEventType::ProviderUnavailable, "warp")
-            .with_window("session")
-            .with_account("a");
-        assert_eq!(rate_limit_key(&a), rate_limit_key(&b));
-        let _ = Arc::new(a);
-    }
+    std::thread::Builder::new()
+        .name("codexbar-hook".into())
+        .spawn(move || HookRunner::dispatch_if_enabled(event, true, rate_limit_scope.as_deref()))
+        .expect("spawn codexbar-hook thread");
 }
+
+#[cfg(test)]
+mod tests;

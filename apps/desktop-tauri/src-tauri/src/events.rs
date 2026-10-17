@@ -20,8 +20,10 @@ pub const REFRESH_COMPLETE: &str = "refresh-complete";
 pub const UPDATE_STATE_CHANGED: &str = "update-state-changed";
 pub const LOCALE_CHANGED: &str = "locale-changed";
 pub const SETTINGS_CHANGED: &str = "settings-changed";
+pub const STAY_AWAKE_CHANGED: &str = "stay-awake-changed";
 pub const CODEX_ACCOUNTS_UPDATED: &str = "codex-accounts-updated";
 pub const LOGIN_PHASE: &str = "login-phase";
+pub const PROVIDER_STATUSES_UPDATED: &str = "provider-statuses-updated";
 
 // ── Payloads ─────────────────────────────────────────────────────────
 
@@ -73,13 +75,9 @@ pub fn emit_surface_mode_changed(
 }
 
 pub fn emit_provider_updated(app: &AppHandle, snapshot: &ProviderUsageSnapshot) {
-    let mut snapshot = snapshot.clone();
     let settings = codexbar::settings::Settings::load();
-    crate::commands::filter_hidden_codex_spark_rows(
-        &mut snapshot,
-        settings.codex_spark_usage_visible(),
-    );
-    let presentation = crate::commands::ProviderUsagePresentationSnapshot::new(snapshot, &settings);
+    let presentation =
+        crate::commands::ProviderUsagePresentationSnapshot::new(snapshot.clone(), &settings);
     let _emit_provider = app.emit(PROVIDER_UPDATED, presentation);
 }
 
@@ -114,6 +112,10 @@ pub fn emit_update_state_changed(app: &AppHandle, payload: &UpdateStatePayload) 
 /// do not share React state. Payload-less; listeners re-fetch the snapshot.
 pub fn emit_settings_changed(app: &AppHandle) {
     let _emit_settings = app.emit(SETTINGS_CHANGED, ());
+}
+
+pub fn emit_stay_awake_changed(app: &AppHandle, held: bool) {
+    let _emit_stay_awake = app.emit(STAY_AWAKE_CHANGED, held);
 }
 
 pub fn emit_login_phase(app: &AppHandle, provider_id: &str, phase: &str, auth_link: Option<&str>) {

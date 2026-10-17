@@ -3,7 +3,8 @@
 //! Store and manage multiple accounts/tokens per provider.
 //! Supports parallel fetching and account switching.
 
-use crate::core::ProviderId;
+use crate::core::{ProviderId, SourceMode};
+use crate::process_environment::ProcessEnvironment;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -20,6 +21,15 @@ pub enum TokenInjection {
     CookieHeader,
     /// Inject as environment variable
     Environment { key: String },
+    /// Accept either an API key or a Cookie header, as with OpenCode Go.
+    EnvironmentOrCookie { key: String },
+}
+
+/// Credential route selected by a labeled account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenAccountKind {
+    Cookie,
+    ApiKey,
 }
 
 /// Support definition for a provider's token accounts
@@ -179,7 +189,7 @@ impl TokenAccountSupport {
                 placeholder: "Cookie: __Secure-commandcode_prod_.session_token=... or better-auth value",
                 injection: TokenInjection::CookieHeader,
                 requires_manual_cookie_source: true,
-                cookie_name: Some("__Secure-better-auth.session_token"),
+                cookie_name: Some("__Secure-commandcode_prod_.session_token"),
             }),
             ProviderId::Qoder => Some(TokenAccountSupport {
                 title: "Session tokens",
@@ -213,6 +223,14 @@ impl TokenAccountSupport {
                 requires_manual_cookie_source: true,
                 cookie_name: Some("token_v2"),
             }),
+            ProviderId::Replicate => Some(TokenAccountSupport {
+                title: "Session tokens",
+                subtitle: "Store multiple Replicate Cookie headers from the billing page.",
+                placeholder: "Cookie: sessionid=...; ...",
+                injection: TokenInjection::CookieHeader,
+                requires_manual_cookie_source: true,
+                cookie_name: Some("sessionid"),
+            }),
             ProviderId::Sub2Api => Some(TokenAccountSupport {
                 title: "Group API keys",
                 subtitle: "Store multiple sub2api group API keys with labels such as Claude, Codex, or Gemini.",
@@ -229,6 +247,16 @@ impl TokenAccountSupport {
                 placeholder: "API key from deepinfra.com/dash",
                 injection: TokenInjection::Environment {
                     key: "DEEPINFRA_API_KEY".to_string(),
+                },
+                requires_manual_cookie_source: false,
+                cookie_name: None,
+            }),
+            ProviderId::HuggingFace => Some(TokenAccountSupport {
+                title: "API tokens",
+                subtitle: "Store multiple Hugging Face access tokens.",
+                placeholder: "Paste a Hugging Face access token",
+                injection: TokenInjection::Environment {
+                    key: "CODEXBAR_HUGGINGFACE_API_KEY".to_string(),
                 },
                 requires_manual_cookie_source: false,
                 cookie_name: None,
@@ -255,10 +283,10 @@ impl TokenAccountSupport {
             }),
             ProviderId::ClinePass => Some(TokenAccountSupport {
                 title: "API keys",
-                subtitle: "Store multiple ClinePass API keys.",
+                subtitle: "Store multiple ClinePass API keys. Without one, CodexBar reads your existing Cline session (run cline auth) without copying it.",
                 placeholder: "API key",
                 injection: TokenInjection::Environment {
-                    key: "CLINEPASS_API_KEY".to_string(),
+                    key: "CLINE_API_KEY".to_string(),
                 },
                 requires_manual_cookie_source: false,
                 cookie_name: None,
@@ -312,13 +340,63 @@ impl TokenAccountSupport {
                 requires_manual_cookie_source: false,
                 cookie_name: None,
             }),
+            ProviderId::Kimi => Some(TokenAccountSupport {
+                title: "Web sessions",
+                subtitle: "Store labeled Kimi kimi-auth web sessions.",
+                placeholder: "kimi-auth value or Cookie: kimi-auth=...",
+                injection: TokenInjection::CookieHeader,
+                requires_manual_cookie_source: true,
+                cookie_name: Some("kimi-auth"),
+            }),
+            ProviderId::Doubao => Some(TokenAccountSupport {
+                title: "Ark API keys",
+                subtitle: "Store labeled Volcengine Ark API keys.",
+                placeholder: "Ark API key",
+                injection: TokenInjection::Environment {
+                    key: "ARK_API_KEY".to_string(),
+                },
+                requires_manual_cookie_source: false,
+                cookie_name: None,
+            }),
+            ProviderId::OpenCodeGo => Some(TokenAccountSupport {
+                title: "API keys or sessions",
+                subtitle: "Store labeled OpenCode Go API keys or Cookie headers.",
+                placeholder: "API key or Cookie: ...",
+                injection: TokenInjection::EnvironmentOrCookie {
+                    key: "OPENCODE_API_KEY".to_string(),
+                },
+                requires_manual_cookie_source: false,
+                cookie_name: None,
+            }),
+            // Upstream 0.67: labeled Aixy API keys via token accounts.
+            ProviderId::Aixy => Some(TokenAccountSupport {
+                title: "API keys",
+                subtitle: "Store multiple Aixy API keys.",
+                placeholder: "Paste Aixy API key…",
+                injection: TokenInjection::Environment {
+                    key: "AIXY_API_KEY".to_string(),
+                },
+                requires_manual_cookie_source: false,
+                cookie_name: None,
+            }),
+            // Upstream 0.73: labeled IBM Bob API keys via token accounts.
+            ProviderId::IBMBob => Some(TokenAccountSupport {
+                title: "API keys",
+                subtitle: "Store multiple IBM Bob API keys.",
+                placeholder: "Paste API key…",
+                injection: TokenInjection::Environment {
+                    key: "BOBSHELL_API_KEY".to_string(),
+                },
+                requires_manual_cookie_source: false,
+                cookie_name: None,
+            }),
             // These providers don't support token accounts
             ProviderId::Codex
+            | ProviderId::Pi
             | ProviderId::Gemini
             | ProviderId::Antigravity
             | ProviderId::Kiro
             | ProviderId::VertexAI
-            | ProviderId::Kimi
             | ProviderId::KimiK2
             | ProviderId::JetBrains
             | ProviderId::Warp
@@ -327,20 +405,21 @@ impl TokenAccountSupport {
             | ProviderId::Infini
             | ProviderId::Perplexity
             | ProviderId::Abacus
-            | ProviderId::OpenCodeGo
             | ProviderId::Kilo
             | ProviderId::Bedrock
             | ProviderId::Codebuff
+            | ProviderId::CodeRabbit
             | ProviderId::DeepSeek
             | ProviderId::Windsurf
-            | ProviderId::Doubao
-            | ProviderId::Crof
             | ProviderId::StepFun
             | ProviderId::Venice
             | ProviderId::OpenAIApi
             | ProviderId::ElevenLabs
             | ProviderId::Deepgram
             | ProviderId::Groq
+            | ProviderId::Helmcode
+            | ProviderId::V0
+            | ProviderId::TypeSafe
             | ProviderId::LLMProxy
             | ProviderId::Chutes
             | ProviderId::LiteLLM
@@ -352,7 +431,36 @@ impl TokenAccountSupport {
             | ProviderId::Wayfinder
             | ProviderId::QwenCloud
             | ProviderId::Fireworks
-            | ProviderId::Meta => None,
+            | ProviderId::Meta
+            | ProviderId::Nous
+            | ProviderId::Muse
+            | ProviderId::AtlasCloud
+            | ProviderId::Hyper
+            | ProviderId::GitKraken
+            | ProviderId::Bifrost
+            | ProviderId::LLMMan
+            | ProviderId::DevPass
+            | ProviderId::XKiro
+            | ProviderId::Raycast
+            | ProviderId::Vercel
+            | ProviderId::Synthetic
+            | ProviderId::ClawRouter
+            | ProviderId::Langdock
+            | ProviderId::LithosAI
+            | ProviderId::Linkup
+            | ProviderId::MuseAI
+            | ProviderId::WorkBuddy
+            | ProviderId::SailResearch
+            | ProviderId::Sofya
+            | ProviderId::TinyApi
+            | ProviderId::Xapi
+            | ProviderId::Tavily
+            | ProviderId::Exa
+            | ProviderId::Cosmic
+            | ProviderId::Aerostack
+            | ProviderId::Parallel
+            | ProviderId::Fal
+            | ProviderId::Flora => None,
         }
     }
 
@@ -377,6 +485,12 @@ impl TokenAccountSupport {
                 map.insert(key.clone(), token.to_string());
                 Some(map)
             }
+            TokenInjection::EnvironmentOrCookie { key } => {
+                let api_key = Self::normalized_opencodego_api_key(token)?;
+                let mut map = HashMap::new();
+                map.insert(key.clone(), api_key);
+                Some(map)
+            }
             TokenInjection::CookieHeader => {
                 // Check for Claude OAuth token
                 if provider == ProviderId::Claude
@@ -389,6 +503,43 @@ impl TokenAccountSupport {
                 }
                 None
             }
+        }
+    }
+
+    fn normalized_opencodego_api_key(token: &str) -> Option<String> {
+        let token = token.trim();
+        let token = if token.len() >= 2
+            && ((token.starts_with('"') && token.ends_with('"'))
+                || (token.starts_with('\'') && token.ends_with('\'')))
+        {
+            token[1..token.len() - 1].trim()
+        } else {
+            token
+        };
+        if token.is_empty()
+            || token
+                .chars()
+                .any(|ch| ch.is_whitespace() || matches!(ch, '=' | ':'))
+        {
+            return None;
+        }
+        Some(token.to_string())
+    }
+
+    pub fn account_kind(provider: ProviderId, token: &str) -> TokenAccountKind {
+        if provider == ProviderId::OpenCodeGo {
+            if Self::normalized_opencodego_api_key(token).is_some() {
+                TokenAccountKind::ApiKey
+            } else {
+                TokenAccountKind::Cookie
+            }
+        } else if matches!(
+            Self::for_provider(provider).map(|support| support.injection),
+            Some(TokenInjection::Environment { .. })
+        ) {
+            TokenAccountKind::ApiKey
+        } else {
+            TokenAccountKind::Cookie
         }
     }
 
@@ -629,10 +780,9 @@ impl TokenAccountStore {
         Self { file_path: path }
     }
 
-    /// Get the default storage path
+    /// Get the default storage path (beside a `CODEXBAR_CONFIG` settings file).
     pub fn default_path() -> PathBuf {
-        dirs::config_dir()
-            .map(|dir| dir.join("CodexBar"))
+        crate::settings::config_store_dir()
             .unwrap_or_else(|| {
                 dirs::home_dir()
                     .unwrap_or_else(|| PathBuf::from("."))
@@ -727,15 +877,17 @@ pub struct TokenAccountOverride {
     pub provider: ProviderId,
     /// The account being used
     pub account: TokenAccount,
-    /// Environment variables to set
-    pub env_override: Option<HashMap<String, String>>,
+    /// Environment variables to set (`Debug` renders only the entry count)
+    pub env_override: ProcessEnvironment<Option<HashMap<String, String>>>,
     /// Cookie header to use
     pub cookie_header: Option<String>,
+    pub kind: TokenAccountKind,
 }
 
 impl TokenAccountOverride {
     /// Create an override from an account
     pub fn from_account(provider: ProviderId, account: TokenAccount) -> Self {
+        let kind = TokenAccountSupport::account_kind(provider, &account.token);
         let env_override = TokenAccountSupport::env_override(provider, &account.token);
         let cookie_header = if env_override.is_none() {
             Some(TokenAccountSupport::normalized_cookie_header(
@@ -749,8 +901,23 @@ impl TokenAccountOverride {
         Self {
             provider,
             account,
-            env_override,
+            env_override: env_override.into(),
             cookie_header,
+            kind,
+        }
+    }
+
+    /// Normalize source selection for account types whose credential requires
+    /// a specific route. `None` leaves unrelated providers' source policy alone.
+    pub fn effective_source_mode(&self, requested: SourceMode) -> Option<SourceMode> {
+        match (self.provider, self.kind, requested) {
+            (ProviderId::Kimi, _, _) => Some(SourceMode::Web),
+            (ProviderId::Doubao, _, _) => Some(SourceMode::OAuth),
+            (ProviderId::OpenCodeGo, TokenAccountKind::Cookie, SourceMode::Auto) => {
+                Some(SourceMode::Web)
+            }
+            (ProviderId::OpenCodeGo, _, _) => Some(requested),
+            _ => None,
         }
     }
 }
@@ -769,8 +936,185 @@ mod tests {
         assert!(TokenAccountSupport::is_supported(ProviderId::Copilot));
         assert!(TokenAccountSupport::is_supported(ProviderId::OpenRouter));
         assert!(TokenAccountSupport::is_supported(ProviderId::Grok));
+        assert!(TokenAccountSupport::is_supported(ProviderId::Kimi));
+        assert!(TokenAccountSupport::is_supported(ProviderId::Doubao));
+        assert!(TokenAccountSupport::is_supported(ProviderId::OpenCodeGo));
+        assert!(TokenAccountSupport::is_supported(ProviderId::Aixy));
         assert!(!TokenAccountSupport::is_supported(ProviderId::Codex));
         assert!(!TokenAccountSupport::is_supported(ProviderId::Gemini));
+        assert!(!TokenAccountSupport::is_supported(ProviderId::Hyper));
+        assert!(!TokenAccountSupport::is_supported(ProviderId::GitKraken));
+        assert!(!TokenAccountSupport::is_supported(ProviderId::Bifrost));
+    }
+
+    #[test]
+    fn command_code_bare_token_uses_production_cookie_name() {
+        // Upstream #4212: a pasted bare token gets the live production cookie name.
+        assert_eq!(
+            TokenAccountSupport::normalized_cookie_header(ProviderId::CommandCode, "bare-value"),
+            "__Secure-commandcode_prod_.session_token=bare-value"
+        );
+        // Explicit cookie headers are preserved untouched.
+        assert_eq!(
+            TokenAccountSupport::normalized_cookie_header(
+                ProviderId::CommandCode,
+                "__Secure-better-auth.session_token=legacy"
+            ),
+            "__Secure-better-auth.session_token=legacy"
+        );
+    }
+
+    #[test]
+    fn upstream_account_sources_normalize_and_classify_selected_credentials() {
+        assert_eq!(
+            TokenAccountSupport::normalized_cookie_header(ProviderId::Kimi, "selected-session"),
+            "kimi-auth=selected-session"
+        );
+        assert_eq!(
+            TokenAccountSupport::account_kind(ProviderId::Kimi, "selected-session"),
+            TokenAccountKind::Cookie
+        );
+        assert_eq!(
+            TokenAccountSupport::account_kind(ProviderId::Doubao, "ark-key"),
+            TokenAccountKind::ApiKey
+        );
+        assert_eq!(
+            TokenAccountSupport::account_kind(ProviderId::OpenCodeGo, "opencode-key"),
+            TokenAccountKind::ApiKey
+        );
+        assert_eq!(
+            TokenAccountSupport::account_kind(
+                ProviderId::OpenCodeGo,
+                "Cookie: session=opencode-session"
+            ),
+            TokenAccountKind::Cookie
+        );
+        assert_eq!(
+            TokenAccountSupport::env_override(ProviderId::OpenCodeGo, "opencode-key")
+                .and_then(|env| env.get("OPENCODE_API_KEY").cloned())
+                .as_deref(),
+            Some("opencode-key")
+        );
+        assert!(
+            TokenAccountSupport::env_override(
+                ProviderId::OpenCodeGo,
+                "Cookie: session=opencode-session"
+            )
+            .is_none()
+        );
+        for malformed in ["", " ", "Cookie: broken", "auth=fixture", "two words"] {
+            assert_eq!(
+                TokenAccountSupport::account_kind(ProviderId::OpenCodeGo, malformed),
+                TokenAccountKind::Cookie
+            );
+            assert!(TokenAccountSupport::env_override(ProviderId::OpenCodeGo, malformed).is_none());
+        }
+        assert_eq!(
+            TokenAccountSupport::env_override(ProviderId::OpenCodeGo, " 'go_key' ")
+                .and_then(|env| env.get("OPENCODE_API_KEY").cloned())
+                .as_deref(),
+            Some("go_key")
+        );
+    }
+
+    #[test]
+    fn selected_account_effective_source_normalization() {
+        let cases = [
+            (
+                ProviderId::Kimi,
+                "kimi-session",
+                SourceMode::Auto,
+                Some(SourceMode::Web),
+            ),
+            (
+                ProviderId::Kimi,
+                "kimi-session",
+                SourceMode::OAuth,
+                Some(SourceMode::Web),
+            ),
+            (
+                ProviderId::Kimi,
+                "kimi-session",
+                SourceMode::Cli,
+                Some(SourceMode::Web),
+            ),
+            (
+                ProviderId::Doubao,
+                "ark-key",
+                SourceMode::Cli,
+                Some(SourceMode::OAuth),
+            ),
+            (
+                ProviderId::Doubao,
+                "ark-key",
+                SourceMode::Web,
+                Some(SourceMode::OAuth),
+            ),
+            (
+                ProviderId::OpenCodeGo,
+                "Cookie: session=web",
+                SourceMode::Auto,
+                Some(SourceMode::Web),
+            ),
+            (
+                ProviderId::OpenCodeGo,
+                "Cookie: session=web",
+                SourceMode::Cli,
+                Some(SourceMode::Cli),
+            ),
+            (
+                ProviderId::OpenCodeGo,
+                "api-key",
+                SourceMode::Auto,
+                Some(SourceMode::Auto),
+            ),
+            (
+                ProviderId::OpenCodeGo,
+                "api-key",
+                SourceMode::Web,
+                Some(SourceMode::Web),
+            ),
+            (
+                ProviderId::OpenCodeGo,
+                "api-key",
+                SourceMode::Cli,
+                Some(SourceMode::Cli),
+            ),
+            (ProviderId::OpenRouter, "api-key", SourceMode::Auto, None),
+        ];
+
+        for (provider, token, requested, expected) in cases {
+            let account =
+                TokenAccountOverride::from_account(provider, TokenAccount::new("selected", token));
+            assert_eq!(account.effective_source_mode(requested), expected);
+        }
+    }
+
+    #[test]
+    fn aixy_token_accounts_inject_api_key_env() {
+        let support = TokenAccountSupport::for_provider(ProviderId::Aixy).unwrap();
+        assert_eq!(support.title, "API keys");
+        assert_eq!(support.placeholder, "Paste Aixy API key…");
+        assert!(!support.requires_manual_cookie_source);
+        let env = TokenAccountSupport::env_override(ProviderId::Aixy, "gak_fixture").unwrap();
+        assert_eq!(
+            env.get("AIXY_API_KEY").map(String::as_str),
+            Some("gak_fixture")
+        );
+    }
+
+    #[test]
+    fn ibmbob_token_accounts_inject_bobshell_api_key_env() {
+        let support = TokenAccountSupport::for_provider(ProviderId::IBMBob).unwrap();
+        assert_eq!(support.title, "API keys");
+        assert_eq!(support.subtitle, "Store multiple IBM Bob API keys.");
+        assert_eq!(support.placeholder, "Paste API key…");
+        assert!(!support.requires_manual_cookie_source);
+        let env = TokenAccountSupport::env_override(ProviderId::IBMBob, "bob_fixture").unwrap();
+        assert_eq!(
+            env.get("BOBSHELL_API_KEY").map(String::as_str),
+            Some("bob_fixture")
+        );
     }
 
     #[test]

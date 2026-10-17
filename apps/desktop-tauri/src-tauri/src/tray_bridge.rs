@@ -3,24 +3,18 @@
 use std::sync::Mutex;
 
 use crate::commands::ProviderCatalogEntry;
-#[cfg(test)]
-use codexbar::core::ProviderId;
-use codexbar::settings::MetricPreference;
-use codexbar::settings::{Settings, TrayIconMode};
+use codexbar::settings::Settings;
 use tauri::image::Image;
 use tauri::menu::{CheckMenuItemBuilder, IsMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager};
 
-use codexbar::tray::{render_bar_icon_rgba, render_percent_icon_rgba};
-
 use crate::shell;
 use crate::state::{AppState, TrayAnchor};
-use crate::surface::SurfaceMode;
-use crate::surface_target::SurfaceTarget;
 #[cfg(test)]
 use crate::tray_menu::build_tray_menu;
-use crate::tray_menu::{TrayMenuEntry, build_tray_menu_with};
+use crate::tray_menu::{MenuState, TrayMenuEntry, build_tray_menu_with};
+use crate::tray_presentation::{TrayPresentationPlan, headline_window};
 
 #[derive(Debug, Clone, Copy)]
 struct MonitorScaleInfo {
@@ -134,7 +128,10 @@ fn build_native_tray_menu(
         providers,
         status_labels,
         &enabled,
-        settings.float_bar_enabled,
+        MenuState {
+            float_bar_enabled: settings.float_bar_enabled,
+            stay_awake_held: crate::stay_awake::is_held(),
+        },
         settings.ui_language,
     );
     crate::tray_accounts::prepend_account_menus(&mut spec, &settings);
@@ -150,31 +147,7 @@ fn build_native_tray_menu(
     Menu::with_items(app, &item_refs)
 }
 
-fn resolve_menu_target(id: &str) -> Option<shell::ShellTransitionRequest> {
-    match id {
-        // "Show Window" — the full draggable window (PopOut mode), unchanged.
-        "show_panel" => Some(shell::ShellTransitionRequest {
-            mode: SurfaceMode::PopOut,
-            target: SurfaceTarget::Dashboard,
-            position: None,
-        }),
-        // NOTE: "pop_out" ("Pop Out Dashboard") is NOT handled here — it opens
-        // the dedicated flyout window (MenuAction::OpenFlyout in
-        // resolve_menu_action below), not a `shell::ShellTransitionRequest`
-        // against the `main`-window surface-mode machine. `SurfaceMode::TrayPanel`
-        // remains as a data key (geometry-key / window_properties source /
-        // panel-size reference) but `main` no longer transitions into it.
-        _ if id.starts_with("provider:") => Some(shell::ShellTransitionRequest {
-            mode: SurfaceMode::PopOut,
-            target: SurfaceTarget::parse(id)?,
-            position: None,
-        }),
-        _ => None,
-    }
-}
-
 enum MenuAction {
-    Transition(shell::ShellTransitionRequest),
     /// Open Settings/About in a detached window.
     OpenSettings(String),
     /// Open (or focus) the dedicated flyout ("Pop Out Dashboard") window.
@@ -187,11 +160,6 @@ enum MenuAction {
     ToggleFloatBar,
     Account(crate::tray_accounts::AccountMenuAction),
     Quit,
-}
-
-enum MenuTransitionDispatch {
-    Transition(shell::ShellTransitionRequest),
-    Reopen(shell::ShellTransitionRequest),
 }
 
 fn resolve_menu_action(id: &str) -> Option<MenuAction> {
@@ -210,22 +178,7 @@ fn resolve_menu_action(id: &str) -> Option<MenuAction> {
             let provider_id = id["toggle_provider:".len()..].to_string();
             Some(MenuAction::ToggleProvider(provider_id))
         }
-        _ => resolve_menu_target(id).map(MenuAction::Transition),
-    }
-}
-
-fn resolve_menu_transition_dispatch(
-    id: &str,
-    request: shell::ShellTransitionRequest,
-) -> MenuTransitionDispatch {
-    if id == "show_panel" {
-        MenuTransitionDispatch::Reopen(shell::ShellTransitionRequest {
-            mode: request.mode,
-            target: request.target,
-            position: None,
-        })
-    } else {
-        MenuTransitionDispatch::Transition(request)
+        _ => None,
     }
 }
 
@@ -277,13 +230,11 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 let app = tray.app_handle();
                 if button == MouseButton::Left && button_state == MouseButtonState::Up {
                     store_anchor(app, &rect, position);
-                    // Left-click toggles the dedicated flyout window (Pop Out
+                    // Left-click toggles the tray-panel flyout window (Pop Out
                     // Dashboard): open it, or cleanly close it when this same
                     // click already blur-dismissed it (no open→close flicker).
-                    // The full window stays available via "Show Window"
-                    // (SurfaceMode::PopOut on `main`) — the two now coexist as
-                    // separate OS windows instead of mutually-exclusive states
-                    // of one window. Called directly (not spawned): native
+                    // The flyout is the only dashboard layout; the legacy
+                    // PopOut layout on `main` is retired. Called directly (not spawned): native
                     // tray-icon event callbacks run on the same main-thread
                     // event-loop context as `on_menu_event` below, where
                     // `settings_window::open_or_focus` is also called
@@ -334,29 +285,6 @@ fn schedule_tray_promotion_retries(app_handle: AppHandle) {
 fn handle_menu_event(app: &AppHandle, id: &str) {
     match resolve_menu_action(id) {
         Some(MenuAction::Account(action)) => crate::tray_accounts::handle_action(app, action),
-        Some(MenuAction::Transition(request)) => {
-            crate::auto_refresh::note_menu_open();
-            match resolve_menu_transition_dispatch(id, request) {
-                // Pass None so default_surface_position can use remembered PopOut
-                // geometry first, then fall back to tray/current-monitor placement.
-                MenuTransitionDispatch::Reopen(request) => {
-                    let _ = shell::reopen_to_target(
-                        app,
-                        request.mode,
-                        request.target,
-                        request.position,
-                    );
-                }
-                MenuTransitionDispatch::Transition(request) => {
-                    let _ = shell::transition_to_target(
-                        app,
-                        request.mode,
-                        request.target,
-                        request.position,
-                    );
-                }
-            }
-        }
         Some(MenuAction::OpenSettings(tab)) => {
             let _ = shell::settings_window::open_or_focus(app, &tab);
         }
@@ -365,7 +293,11 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
             // default position (same placement chain the old TrayPanel
             // transition used) when no explicit position is given.
             crate::auto_refresh::note_menu_open();
-            let _ = shell::flyout_window::open_or_focus(app, None);
+            let _ = shell::flyout_window::open_or_focus(
+                app,
+                None,
+                shell::activation::Activation::UserAction,
+            );
         }
         Some(MenuAction::Refresh) => {
             let handle = app.clone();
@@ -406,11 +338,13 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
 pub(crate) fn rebuild_tray_menu(app: &AppHandle) {
     let catalog = crate::commands::get_provider_catalog();
     let settings = Settings::load();
+    let rates_cache = app
+        .try_state::<crate::commands::CurrencyRateCache>()
+        .map(|state| state.inner());
     let status_labels = if let Some(st) = app.try_state::<Mutex<AppState>>() {
         let guard = st.lock().unwrap();
-        let snapshots =
-            presentation_snapshots(&guard.provider_cache, settings.codex_spark_usage_visible());
-        status_labels_for_settings(&settings, &snapshots, settings.ui_language)
+        TrayPresentationPlan::resolve(&settings, &guard.provider_cache, rates_cache)
+            .status_labels(settings.ui_language)
     } else {
         vec![]
     };
@@ -428,8 +362,11 @@ pub fn update_tray_status_items(
 ) {
     let catalog = crate::commands::get_provider_catalog();
     let settings = Settings::load();
-    let snapshots = presentation_snapshots(snapshots, settings.codex_spark_usage_visible());
-    let status_labels = status_labels_for_settings(&settings, &snapshots, settings.ui_language);
+    let rates_cache = app
+        .try_state::<crate::commands::CurrencyRateCache>()
+        .map(|state| state.inner());
+    let status_labels = TrayPresentationPlan::resolve(&settings, snapshots, rates_cache)
+        .status_labels(settings.ui_language);
 
     if let Ok(menu) = build_native_tray_menu(app, &catalog, &status_labels)
         && let Some(tray) = app.tray_by_id("codexbar-main")
@@ -448,22 +385,11 @@ pub(crate) fn refresh_tray_presentation(app: &AppHandle) {
     update_tray_icon_and_tooltip(app, &snapshots);
 }
 
-fn presentation_snapshots(
-    snapshots: &[crate::commands::ProviderUsageSnapshot],
-    spark_usage_visible: bool,
-) -> Vec<crate::commands::ProviderUsageSnapshot> {
-    let mut snapshots = snapshots.to_vec();
-    for snapshot in &mut snapshots {
-        crate::commands::filter_hidden_codex_spark_rows(snapshot, spark_usage_visible);
-    }
-    snapshots
-}
-
 /// Update the tray icon pixels and tooltip text to reflect current provider usage.
 ///
 /// Behaviour mirrors egui's `choose_tray_update_plan` (rust/src/native_ui/app.rs):
-/// - If `menu_bar_shows_highest_usage` is on OR `menu_bar_display_mode == "minimal"`,
-///   render the bar from the healthy provider with the highest session usage.
+/// - If `menu_bar_shows_highest_usage` is on (legacy Display mode "minimal" is
+///   folded into it on load), render the bar from the healthy provider with the highest session usage.
 /// - Otherwise render from the first enabled healthy provider (catalog order).
 /// - When any provider exposes a weekly/secondary window, the icon shows both
 ///   bars from the same picked provider.
@@ -478,232 +404,25 @@ pub fn update_tray_icon_and_tooltip(
         return;
     };
 
-    // ── Icon ─────────────────────────────────────────────────────────────
     let settings = Settings::load();
-    let snapshots = presentation_snapshots(snapshots, settings.codex_spark_usage_visible());
-    let ordered_snapshots = ordered_snapshot_refs(&settings, &snapshots);
-    let ok_snapshots: Vec<_> = ordered_snapshots
-        .iter()
-        .copied()
-        .filter(|s| s.error.is_none())
-        .collect();
-    let all_error = ok_snapshots.is_empty() && !snapshots.is_empty();
-
-    let prefer_highest = settings.menu_bar_shows_highest_usage
-        || settings.menu_bar_display_mode.as_str() == "minimal";
-
-    let picked = pick_tray_provider(&ok_snapshots, prefer_highest);
-
-    let (session_pct, weekly_pct) = match picked {
-        Some(s) => selected_tray_percents(s, &settings),
-        None => (
-            ok_snapshots
-                .iter()
-                .map(|s| selected_tray_percents(s, &settings).0)
-                .fold(0.0_f64, f64::max),
-            None,
-        ),
-    };
-
-    let (rgba, w, h) = render_tray_icon_for_settings(&settings, session_pct, weekly_pct, all_error);
+    let rates_cache = app
+        .try_state::<crate::commands::CurrencyRateCache>()
+        .map(|state| state.inner());
+    let plan = TrayPresentationPlan::resolve(&settings, snapshots, rates_cache);
+    let (rgba, w, h) = plan.render_icon();
     let icon = Image::new_owned(rgba, w, h);
     let _ = tray.set_icon(Some(icon));
 
-    // ── Tooltip ───────────────────────────────────────────────────────────
-    let tooltip = build_tooltip(&snapshots, settings.ui_language);
+    let tooltip = build_tooltip(snapshots, settings.ui_language, settings.hide_personal_info);
+    let tooltip = crate::status_poller::with_incident_lines(app, &settings, tooltip);
     let _ = tray.set_tooltip(Some(tooltip));
-}
-
-fn status_labels_for_settings(
-    settings: &Settings,
-    snapshots: &[crate::commands::ProviderUsageSnapshot],
-    lang: codexbar::settings::Language,
-) -> Vec<(String, String)> {
-    let ordered_snapshots = ordered_snapshot_refs(settings, snapshots);
-    let healthy: Vec<_> = ordered_snapshots
-        .into_iter()
-        .filter(|s| s.error.is_none())
-        .collect();
-    if settings.tray_icon_mode == TrayIconMode::PerProvider {
-        return healthy
-            .into_iter()
-            .map(|s| provider_status_label(s, lang))
-            .collect::<Vec<_>>();
-    }
-
-    let Some(selected) = pick_tray_provider(
-        &healthy,
-        settings.menu_bar_shows_highest_usage || settings.menu_bar_display_mode == "minimal",
-    ) else {
-        return vec![];
-    };
-
-    let (_, label) = provider_status_label(selected, lang);
-    vec![("status_summary".to_string(), label)]
-}
-
-fn ordered_snapshot_refs<'a>(
-    settings: &Settings,
-    snapshots: &'a [crate::commands::ProviderUsageSnapshot],
-) -> Vec<&'a crate::commands::ProviderUsageSnapshot> {
-    let order = settings
-        .provider_display_order_names()
-        .into_iter()
-        .enumerate()
-        .map(|(index, provider_id)| (provider_id, index))
-        .collect::<std::collections::HashMap<_, _>>();
-    let mut ordered = snapshots.iter().collect::<Vec<_>>();
-    ordered.sort_by(|a, b| {
-        let a_order = order.get(&a.provider_id);
-        let b_order = order.get(&b.provider_id);
-        match (a_order, b_order) {
-            (Some(a_order), Some(b_order)) if a_order != b_order => a_order.cmp(b_order),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            _ => a.display_name.cmp(&b.display_name),
-        }
-    });
-    ordered
-}
-
-fn provider_status_label(
-    snapshot: &crate::commands::ProviderUsageSnapshot,
-    lang: codexbar::settings::Language,
-) -> (String, String) {
-    // MonthlyPlan metric (PAYG spend, e.g. Mistral): show formatted cost.
-    let provider = codexbar::core::ProviderId::from_cli_name(&snapshot.provider_id);
-    let preference = provider
-        .map(|id| Settings::load().get_provider_metric(id))
-        .unwrap_or_default();
-    if preference == MetricPreference::MonthlyPlan
-        && let Some(cost) = snapshot.cost.as_ref()
-    {
-        let amount = if !cost.formatted_used.is_empty() {
-            cost.formatted_used.clone()
-        } else {
-            crate::commands::format_cost_amount(cost)
-        };
-        return (
-            snapshot.provider_id.clone(),
-            format!("{} {}", snapshot.display_name, amount),
-        );
-    }
-
-    let label = crate::commands::compact_tray_status_label(headline_window(snapshot), lang);
-    (
-        snapshot.provider_id.clone(),
-        format!("{} {}", snapshot.display_name, label),
-    )
-}
-
-/// Window that headline tray surfaces should label for a provider.
-///
-/// F5 (upstream 0.48.0): for Codex, prefer the first non-informational lane so
-/// a monthly-only plan shows the monthly window with its reset countdown
-/// instead of the informational "No active 5h session" placeholder.
-///
-/// Shared by the tray menu rows (`provider_status_label`) and the tray tooltip
-/// (`build_tooltip`) so the two cannot drift apart.
-fn headline_window(
-    snapshot: &crate::commands::ProviderUsageSnapshot,
-) -> &crate::commands::RateWindowSnapshot {
-    if snapshot.provider_id == "codex" {
-        codex_lane_headline_window(snapshot)
-    } else {
-        &snapshot.primary
-    }
-}
-
-/// F5 (upstream 0.48.0): pick the first non-informational Codex lane in
-/// session → weekly → monthly order. When all lanes are informational
-/// (no active session at all), fall back to the primary for the
-/// "No active 5h session" placeholder.
-pub(crate) fn codex_lane_headline_window(
-    snapshot: &crate::commands::ProviderUsageSnapshot,
-) -> &crate::commands::RateWindowSnapshot {
-    if !snapshot.primary.is_informational {
-        return &snapshot.primary;
-    }
-    if let Some(ref secondary) = snapshot.secondary
-        && !secondary.is_informational
-    {
-        return secondary;
-    }
-    if let Some(ref tertiary) = snapshot.tertiary
-        && !tertiary.is_informational
-    {
-        return tertiary;
-    }
-    &snapshot.primary
-}
-
-fn render_tray_icon_for_settings(
-    settings: &Settings,
-    session_pct: f64,
-    weekly_pct: Option<f64>,
-    all_error: bool,
-) -> (Vec<u8>, u32, u32) {
-    if settings.menu_bar_shows_percent {
-        render_percent_icon_rgba(session_pct, all_error)
-    } else {
-        render_bar_icon_rgba(session_pct, weekly_pct, all_error)
-    }
-}
-
-/// Pick the provider whose usage the tray icon should render.
-///
-/// Exposed so that the unit tests can exercise both `highest` and `first`
-/// paths without needing a live Tauri app handle.
-fn pick_tray_provider<'a>(
-    ok_snapshots: &'a [&'a crate::commands::ProviderUsageSnapshot],
-    prefer_highest: bool,
-) -> Option<&'a crate::commands::ProviderUsageSnapshot> {
-    if ok_snapshots.is_empty() {
-        return None;
-    }
-    if prefer_highest {
-        ok_snapshots.iter().copied().max_by(|a, b| {
-            a.primary
-                .used_percent
-                .partial_cmp(&b.primary.used_percent)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-    } else {
-        Some(ok_snapshots[0])
-    }
-}
-
-fn selected_tray_percents(
-    snapshot: &crate::commands::ProviderUsageSnapshot,
-    settings: &Settings,
-) -> (f64, Option<f64>) {
-    let (selected, companion) =
-        crate::usage_metric::selected_usage_icon_windows(snapshot, settings);
-    (
-        display_metric_percent(&selected, settings.show_as_used),
-        companion
-            .as_ref()
-            .map(|window| display_metric_percent(window, settings.show_as_used)),
-    )
-}
-
-fn display_metric_percent(window: &crate::commands::RateWindowSnapshot, show_as_used: bool) -> f64 {
-    if window.is_informational {
-        return 0.0;
-    }
-    if window.is_exhausted || window.used_percent >= 100.0 {
-        return if show_as_used { 100.0 } else { 0.0 };
-    }
-
-    let used_percent = window.used_percent;
-    let used = used_percent.clamp(0.0, 100.0);
-    if show_as_used { used } else { 100.0 - used }
 }
 
 /// Build a compact multi-line tooltip string from provider snapshots.
 fn build_tooltip(
     snapshots: &[crate::commands::ProviderUsageSnapshot],
     lang: codexbar::settings::Language,
+    hide_personal_info: bool,
 ) -> String {
     use codexbar::locale::{LocaleKey, get_text};
 
@@ -715,7 +434,13 @@ fn build_tooltip(
     let mut lines = Vec::with_capacity(snapshots.len() + 1);
     for s in snapshots {
         let status = if let Some(ref err) = s.error {
-            let short = truncate_tooltip_text(err, 36);
+            // Provider errors can quote the signed-in email.
+            let err = codexbar::core::PersonalInfoRedactor::hide_emails_in_text(
+                Some(err),
+                hide_personal_info,
+            )
+            .unwrap_or_default();
+            let short = truncate_tooltip_text(&err, 36);
             format!("{}: {} ({})", s.display_name, error_label, short)
         } else {
             let label = crate::commands::compact_tray_status_label(headline_window(s), lang);
@@ -818,17 +543,26 @@ fn build_native_menu_entry(
 mod tests {
     use super::*;
 
+    use crate::surface::SurfaceMode;
+    use crate::tray_presentation::{
+        codex_lane_headline_window, pick_tray_provider, selected_tray_percents,
+    };
+    use codexbar::core::ProviderId;
+    use codexbar::settings::MetricPreference;
+
     fn sample_provider_catalog() -> Vec<ProviderCatalogEntry> {
         vec![
             ProviderCatalogEntry {
                 id: "codex".into(),
                 display_name: "Codex".into(),
                 cookie_domain: None,
+                cli_aliases: Vec::new(),
             },
             ProviderCatalogEntry {
                 id: "claude".into(),
                 display_name: "Claude".into(),
                 cookie_domain: None,
+                cli_aliases: Vec::new(),
             },
         ]
     }
@@ -869,101 +603,22 @@ mod tests {
     }
 
     #[test]
-    fn provider_menu_routes_to_provider_popout_target() {
-        let action = resolve_menu_target("provider:codex").expect("provider target");
-        assert_eq!(action.mode, SurfaceMode::PopOut);
-        assert_eq!(
-            action.target,
-            SurfaceTarget::Provider {
-                provider_id: "codex".into()
-            }
-        );
-    }
-
-    #[test]
     fn pop_out_menu_routes_to_open_flyout_action() {
-        // "Pop Out Dashboard" opens the dedicated flyout window — not a
-        // `shell::ShellTransitionRequest` against the `main`-window surface
-        // machine — which is what lets it coexist with "Show Window"
-        // (SurfaceMode::PopOut, which stays on `main`) instead of the two
-        // being mutually-exclusive states of one window.
+        // "Pop Out Dashboard" opens the tray-panel flyout window, the only
+        // dashboard layout.
         let action = resolve_menu_action("pop_out").expect("pop_out action");
         assert!(matches!(action, MenuAction::OpenFlyout));
 
-        // resolve_menu_target no longer resolves "pop_out" at all — it is
-        // intercepted earlier in resolve_menu_action.
-        assert!(resolve_menu_target("pop_out").is_none());
-
-        let show_window = resolve_menu_target("show_panel").expect("show_panel target");
-        assert_eq!(show_window.mode, SurfaceMode::PopOut);
-
-        // SurfaceMode::TrayPanel is retained purely as a data key (geometry
-        // key / window_properties source / panel-size reference) for the
-        // flyout window's builder — the properties themselves are unchanged.
         let props = SurfaceMode::TrayPanel.window_properties();
-        assert!(props.resizable && props.blur_dismiss && props.skip_taskbar);
+        assert!(!props.resizable && props.blur_dismiss && props.skip_taskbar);
     }
 
     #[test]
-    fn show_panel_menu_reopens_popout_dashboard_with_default_position_chain() {
-        let request = resolve_menu_target("show_panel").expect("show_panel target");
-        assert_eq!(request.mode, SurfaceMode::PopOut);
-        assert_eq!(request.target, SurfaceTarget::Dashboard);
-
-        let dispatch = resolve_menu_transition_dispatch(
-            "show_panel",
-            shell::ShellTransitionRequest {
-                mode: SurfaceMode::PopOut,
-                target: SurfaceTarget::Dashboard,
-                position: Some((320, 240)),
-            },
-        );
-
-        match dispatch {
-            MenuTransitionDispatch::Reopen(request) => {
-                assert_eq!(request.mode, SurfaceMode::PopOut);
-                assert_eq!(request.target, SurfaceTarget::Dashboard);
-                assert_eq!(request.position, None);
-            }
-            MenuTransitionDispatch::Transition(_) => {
-                panic!("show_panel should reopen via default PopOut positioning")
-            }
-        }
-    }
-
-    #[test]
-    fn non_show_panel_menu_keeps_explicit_position() {
-        // "pop_out" no longer reaches resolve_menu_transition_dispatch at all
-        // (it's intercepted as MenuAction::OpenFlyout in resolve_menu_action
-        // before falling through to resolve_menu_target); a provider deep
-        // link is the realistic surviving non-"show_panel" caller of this
-        // dispatch function today.
-        let dispatch = resolve_menu_transition_dispatch(
-            "provider:codex",
-            shell::ShellTransitionRequest {
-                mode: SurfaceMode::PopOut,
-                target: SurfaceTarget::Provider {
-                    provider_id: "codex".into(),
-                },
-                position: Some((320, 240)),
-            },
-        );
-
-        match dispatch {
-            MenuTransitionDispatch::Transition(request) => {
-                assert_eq!(request.mode, SurfaceMode::PopOut);
-                assert_eq!(
-                    request.target,
-                    SurfaceTarget::Provider {
-                        provider_id: "codex".into()
-                    }
-                );
-                assert_eq!(request.position, Some((320, 240)));
-            }
-            MenuTransitionDispatch::Reopen(_) => {
-                panic!("non-show-panel actions should use direct transitions")
-            }
-        }
+    fn legacy_popout_menu_ids_no_longer_route_anywhere() {
+        // "show_panel" ("Show Window") and "provider:<id>" used to open the
+        // retired PopOut layout on `main`.
+        assert!(resolve_menu_action("show_panel").is_none());
+        assert!(resolve_menu_action("provider:codex").is_none());
     }
 
     #[test]
@@ -1045,10 +700,14 @@ mod tests {
                 is_exhausted: false,
                 is_informational: false,
                 reserve_percent: None,
-                over_percent: None,
                 reserve_description: None,
                 reserve_will_last_to_reset: false,
                 reserve_eta_seconds: None,
+                pace: None,
+                monthly_limit_block: None,
+                description_is_detail: false,
+                reset_regenerates: false,
+                hidden_on_card: false,
             },
             primary_label: None,
             secondary: secondary_percent.map(|pct| crate::commands::RateWindowSnapshot {
@@ -1060,12 +719,17 @@ mod tests {
                 is_exhausted: false,
                 is_informational: false,
                 reserve_percent: None,
-                over_percent: None,
                 reserve_description: None,
                 reserve_will_last_to_reset: false,
                 reserve_eta_seconds: None,
+                pace: None,
+                monthly_limit_block: None,
+                description_is_detail: false,
+                reset_regenerates: false,
+                hidden_on_card: false,
             }),
             secondary_label: None,
+            secondary_label_key: None,
             model_specific: None,
             tertiary: tertiary_percent.map(|pct| crate::commands::RateWindowSnapshot {
                 used_percent: pct,
@@ -1076,13 +740,19 @@ mod tests {
                 is_exhausted: false,
                 is_informational: false,
                 reserve_percent: None,
-                over_percent: None,
                 reserve_description: None,
                 reserve_will_last_to_reset: false,
                 reserve_eta_seconds: None,
+                pace: None,
+                monthly_limit_block: None,
+                description_is_detail: false,
+                reset_regenerates: false,
+                hidden_on_card: false,
             }),
             tertiary_label: None,
             extra_rate_windows: Vec::new(),
+            inventory: Vec::new(),
+            display_details: Vec::new(),
             cost: cost.map(|(used, limit)| crate::commands::CostSnapshotBridge {
                 used,
                 limit: Some(limit),
@@ -1099,9 +769,12 @@ mod tests {
                 account_id: None,
                 daily: Vec::new(),
                 always_visible: false,
+                folded_into_primary: false,
+                title_key: None,
             }),
             plan_name: None,
             account_email: None,
+            account_label: None,
             subscription: None,
             source_label: String::new(),
             has_successful_claude_cli_quota: false,
@@ -1109,10 +782,14 @@ mod tests {
             error: None,
             error_state: codexbar::core::ProviderStateKind::Ready,
             pace: None,
+            pace_authoritative: true,
             account_organization: None,
             tray_status_label: None,
             fetch_duration_ms: None,
             wayfinder_usage: None,
+            quota_burndown: None,
+            open_ai_api_usage: None,
+            throughput: None,
             session_equivalent_forecast: None,
         }
     }
@@ -1125,10 +802,19 @@ mod tests {
         fake_snapshot_with(id, display, used_percent, None, None, None)
     }
 
+    fn used_view_settings() -> Settings {
+        Settings {
+            show_as_used: true,
+            ..Settings::default()
+        }
+    }
+
     fn fake_extra_window(percent: f64) -> crate::commands::NamedRateWindowSnapshot {
         crate::commands::NamedRateWindowSnapshot {
             id: "additional_budget".to_string(),
             title: "Additional Budget".to_string(),
+            fallback_lane: false,
+            icon_fallback: None,
             window: crate::commands::RateWindowSnapshot {
                 used_percent: percent,
                 remaining_percent: 100.0 - percent,
@@ -1138,118 +824,42 @@ mod tests {
                 is_exhausted: false,
                 is_informational: false,
                 reserve_percent: None,
-                over_percent: None,
                 reserve_description: None,
                 reserve_will_last_to_reset: false,
                 reserve_eta_seconds: None,
+                pace: None,
+                description_is_detail: false,
+                reset_regenerates: false,
+                hidden_on_card: false,
+                monthly_limit_block: None,
             },
         }
     }
-
     #[test]
     fn pick_tray_provider_highest_picks_max_primary() {
         let a = fake_snapshot("codex", "Codex", 30.0);
         let b = fake_snapshot("claude", "Claude", 72.5);
         let c = fake_snapshot("gemini", "Gemini", 50.0);
         let refs: Vec<&crate::commands::ProviderUsageSnapshot> = vec![&a, &b, &c];
-
         let picked = pick_tray_provider(&refs, /* prefer_highest = */ true)
             .expect("highest mode should pick a provider");
         assert_eq!(picked.provider_id, "claude");
     }
-
     #[test]
     fn pick_tray_provider_first_preserves_catalog_order() {
         let a = fake_snapshot("codex", "Codex", 30.0);
         let b = fake_snapshot("claude", "Claude", 72.5);
         let refs: Vec<&crate::commands::ProviderUsageSnapshot> = vec![&a, &b];
-
         let picked = pick_tray_provider(&refs, /* prefer_highest = */ false)
             .expect("non-highest mode should still pick the first entry");
         assert_eq!(picked.provider_id, "codex");
     }
-
     #[test]
     fn pick_tray_provider_none_when_empty() {
         let refs: Vec<&crate::commands::ProviderUsageSnapshot> = vec![];
         assert!(pick_tray_provider(&refs, true).is_none());
         assert!(pick_tray_provider(&refs, false).is_none());
     }
-
-    #[test]
-    fn status_labels_per_provider_mode_lists_each_healthy_provider() {
-        let settings = Settings {
-            tray_icon_mode: TrayIconMode::PerProvider,
-            provider_order: codexbar::settings::normalize_provider_order(&[
-                "claude".to_string(),
-                "codex".to_string(),
-            ]),
-            ..Settings::default()
-        };
-        let snapshots = vec![
-            fake_snapshot("codex", "Codex", 30.0),
-            fake_snapshot("claude", "Claude", 72.0),
-        ];
-
-        let labels = status_labels_for_settings(
-            &settings,
-            &snapshots,
-            codexbar::settings::Language::English,
-        );
-
-        assert_eq!(
-            labels,
-            vec![
-                ("claude".to_string(), "Claude 72%".to_string()),
-                ("codex".to_string(), "Codex 30%".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn status_labels_single_mode_collapses_to_selected_provider() {
-        let settings = Settings {
-            tray_icon_mode: TrayIconMode::Single,
-            menu_bar_shows_highest_usage: true,
-            ..Settings::default()
-        };
-        let snapshots = vec![
-            fake_snapshot("codex", "Codex", 30.0),
-            fake_snapshot("claude", "Claude", 72.0),
-        ];
-
-        let labels = status_labels_for_settings(
-            &settings,
-            &snapshots,
-            codexbar::settings::Language::English,
-        );
-
-        assert_eq!(
-            labels,
-            vec![("status_summary".to_string(), "Claude 72%".to_string())]
-        );
-    }
-
-    #[test]
-    fn tray_icon_renderer_uses_percent_mode_when_enabled() {
-        let bar_settings = Settings {
-            menu_bar_shows_percent: false,
-            ..Settings::default()
-        };
-        let percent_settings = Settings {
-            menu_bar_shows_percent: true,
-            ..Settings::default()
-        };
-
-        let (bar, bar_w, bar_h) =
-            render_tray_icon_for_settings(&bar_settings, 72.0, Some(40.0), false);
-        let (percent, pct_w, pct_h) =
-            render_tray_icon_for_settings(&percent_settings, 72.0, Some(40.0), false);
-
-        assert_eq!((bar_w, bar_h), (pct_w, pct_h));
-        assert_ne!(bar, percent);
-    }
-
     #[test]
     fn tooltip_uses_compact_status_labels() {
         let mut claude = fake_snapshot("claude", "Claude", 13.0);
@@ -1257,7 +867,11 @@ mod tests {
         let mut codex = fake_snapshot("codex", "Codex", 8.0);
         codex.primary.reset_description = Some("4h 10m".to_string());
 
-        let tooltip = build_tooltip(&[claude, codex], codexbar::settings::Language::English);
+        let tooltip = build_tooltip(
+            &[claude, codex],
+            codexbar::settings::Language::English,
+            false,
+        );
 
         assert_eq!(
             tooltip,
@@ -1275,7 +889,7 @@ mod tests {
         codex.primary.reset_description = Some("No active 5h session".to_string());
         codex.secondary.as_mut().unwrap().reset_description = Some("3d 17h".to_string());
 
-        let tooltip = build_tooltip(&[codex], codexbar::settings::Language::English);
+        let tooltip = build_tooltip(&[codex], codexbar::settings::Language::English, false);
 
         assert_eq!(tooltip, "CodexBar\nCodex: 16% • Resets in 3d 17h");
     }
@@ -1286,7 +900,7 @@ mod tests {
         claude.primary.reset_description =
             Some("resets in Jun 10 at 3:00PM with extra noisy suffix".to_string());
 
-        let tooltip = build_tooltip(&[claude], codexbar::settings::Language::English);
+        let tooltip = build_tooltip(&[claude], codexbar::settings::Language::English, false);
 
         let line = tooltip.lines().nth(1).expect("provider tooltip line");
         assert!(line.starts_with("Claude: 13% • Resets in Jun 10 at 3:00PM"));
@@ -1295,11 +909,29 @@ mod tests {
     }
 
     #[test]
+    fn hidden_personal_info_removes_emails_from_tooltip_errors() {
+        let mut codex = fake_snapshot("codex", "Codex", 13.0);
+        codex.error = Some("proof@example.com: session expired".to_string());
+
+        let shown = build_tooltip(
+            &[codex.clone()],
+            codexbar::settings::Language::English,
+            false,
+        );
+        assert!(shown.contains("proof@example.com"), "{shown}");
+
+        let hidden = build_tooltip(&[codex], codexbar::settings::Language::English, true);
+        assert!(hidden.contains("session expired"), "{hidden}");
+        assert!(!hidden.contains('@'), "{hidden}");
+        assert!(!hidden.contains("example.com"), "{hidden}");
+    }
+
+    #[test]
     fn japanese_tooltip_localizes_error_status() {
         let mut claude = fake_snapshot("claude", "Claude", 13.0);
         claude.error = Some("network timeout".to_string());
 
-        let tooltip = build_tooltip(&[claude], codexbar::settings::Language::Japanese);
+        let tooltip = build_tooltip(&[claude], codexbar::settings::Language::Japanese, false);
 
         assert!(tooltip.contains("エラー"), "{tooltip}");
         assert!(!tooltip.contains(": error ("), "{tooltip}");
@@ -1311,10 +943,16 @@ mod tests {
         claude.primary.resets_at =
             Some((chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc3339());
 
-        let english_tooltip =
-            build_tooltip(&[claude.clone()], codexbar::settings::Language::English);
-        let japanese_tooltip =
-            build_tooltip(&[claude.clone()], codexbar::settings::Language::Japanese);
+        let english_tooltip = build_tooltip(
+            &[claude.clone()],
+            codexbar::settings::Language::English,
+            false,
+        );
+        let japanese_tooltip = build_tooltip(
+            &[claude.clone()],
+            codexbar::settings::Language::Japanese,
+            false,
+        );
 
         assert!(english_tooltip.contains("Resets in"), "{english_tooltip}");
         assert!(
@@ -1326,17 +964,22 @@ mod tests {
             "{japanese_tooltip}"
         );
 
-        let (_, english_label) =
-            provider_status_label(&claude, codexbar::settings::Language::English);
-        let (_, japanese_label) =
-            provider_status_label(&claude, codexbar::settings::Language::Japanese);
+        let settings = Settings::default();
+        let snapshots = vec![claude];
+        let rates_cache = None;
+        let plan = TrayPresentationPlan::resolve(&settings, &snapshots, rates_cache);
+        let english_label = plan.status_labels(codexbar::settings::Language::English)[0]
+            .1
+            .clone();
+        let japanese_label = plan.status_labels(codexbar::settings::Language::Japanese)[0]
+            .1
+            .clone();
         assert!(english_label.contains("Resets in"), "{english_label}");
         assert!(japanese_label.contains("リセットまで"), "{japanese_label}");
     }
-
     #[test]
     fn selected_tray_percent_uses_cursor_extra_usage_cost() {
-        let mut settings = Settings::default();
+        let mut settings = used_view_settings();
         settings.set_provider_metric(ProviderId::Cursor, MetricPreference::ExtraUsage);
         let snapshot = fake_snapshot_with(
             "cursor",
@@ -1346,37 +989,28 @@ mod tests {
             Some(72.0),
             Some((15.0, 100.0)),
         );
-
         let (primary, secondary) = selected_tray_percents(&snapshot, &settings);
-
         assert_eq!(primary, 15.0);
         assert_eq!(secondary, Some(20.0));
     }
-
     #[test]
     fn selected_tray_percent_tracks_extra_rate_window() {
-        let mut settings = Settings::default();
+        let mut settings = used_view_settings();
         settings.set_provider_metric(ProviderId::Copilot, MetricPreference::ExtraUsage);
         let mut snapshot = fake_snapshot("copilot", "Copilot", 20.0);
         snapshot.extra_rate_windows.push(fake_extra_window(42.0));
-
         let (primary, secondary) = selected_tray_percents(&snapshot, &settings);
-
         assert_eq!(primary, 42.0);
         assert_eq!(secondary, None);
     }
-
     #[test]
     fn copilot_automatic_tracks_highest_extra_rate_window() {
-        let settings = Settings::default();
+        let settings = used_view_settings();
         let mut snapshot = fake_snapshot("copilot", "Copilot", 20.0);
         snapshot.extra_rate_windows.push(fake_extra_window(42.0));
-
         let (primary, _) = selected_tray_percents(&snapshot, &settings);
-
         assert_eq!(primary, 42.0);
     }
-
     #[test]
     fn selected_tray_percent_respects_remaining_display_mode() {
         let mut settings = Settings {
@@ -1392,13 +1026,10 @@ mod tests {
             Some(72.0),
             Some((15.0, 100.0)),
         );
-
         let (primary, secondary) = selected_tray_percents(&snapshot, &settings);
-
         assert_eq!(primary, 85.0);
         assert_eq!(secondary, Some(80.0));
     }
-
     #[test]
     fn exhausted_automatic_window_never_renders_as_remaining_progress() {
         let mut settings = Settings {
@@ -1418,15 +1049,12 @@ mod tests {
             .as_mut()
             .expect("monthly quota")
             .is_exhausted = true;
-
         let (remaining, _) = selected_tray_percents(&snapshot, &settings);
         assert_eq!(remaining, 0.0);
-
         settings.show_as_used = true;
         let (used, _) = selected_tray_percents(&snapshot, &settings);
         assert_eq!(used, 100.0);
     }
-
     #[test]
     fn full_automatic_window_without_exhausted_flag_has_zero_remaining_progress() {
         let mut settings = Settings {
@@ -1446,15 +1074,12 @@ mod tests {
             .as_mut()
             .expect("monthly quota")
             .is_exhausted = false;
-
         let (remaining, _) = selected_tray_percents(&snapshot, &settings);
         assert_eq!(remaining, 0.0);
-
         settings.show_as_used = true;
         let (used, _) = selected_tray_percents(&snapshot, &settings);
         assert_eq!(used, 100.0);
     }
-
     #[test]
     fn missing_automatic_window_does_not_look_like_available_remaining_progress() {
         let settings = Settings {
@@ -1463,82 +1088,64 @@ mod tests {
         };
         let mut snapshot = fake_snapshot_with("opencodego", "OpenCode Go", 0.0, None, None, None);
         snapshot.primary.is_informational = true;
-
         let (remaining, _) = selected_tray_percents(&snapshot, &settings);
-
         assert_eq!(remaining, 0.0);
     }
-
     #[test]
     fn selected_tray_percent_falls_back_when_extra_usage_missing() {
-        let mut settings = Settings::default();
+        let mut settings = used_view_settings();
         settings.set_provider_metric(ProviderId::Cursor, MetricPreference::ExtraUsage);
         let snapshot = fake_snapshot_with("cursor", "Cursor", 10.0, Some(72.0), None, None);
-
         let (primary, _) = selected_tray_percents(&snapshot, &settings);
-
         assert_eq!(primary, 72.0);
     }
-
     #[test]
     fn single_meaningful_secondary_quota_uses_full_single_meter() {
-        let settings = Settings::default();
+        let settings = used_view_settings();
         let mut snapshot = fake_snapshot_with("claude", "Claude", 0.0, Some(42.0), None, None);
         snapshot.primary.is_informational = true;
-
         let (primary, secondary) = selected_tray_percents(&snapshot, &settings);
-
         assert_eq!(primary, 42.0);
         assert_eq!(secondary, None);
     }
-
     #[test]
     fn selected_secondary_quota_is_not_duplicated_when_tertiary_is_meaningful() {
-        let settings = Settings::default();
+        let settings = used_view_settings();
         let mut snapshot =
             fake_snapshot_with("claude", "Claude", 0.0, Some(42.0), Some(30.0), None);
         snapshot.primary.is_informational = true;
-
         let (primary, secondary) = selected_tray_percents(&snapshot, &settings);
-
         assert_eq!(primary, 42.0);
         assert_eq!(secondary, Some(30.0));
     }
-
     #[test]
     fn two_meaningful_quotas_keep_two_meter_layout() {
-        let mut settings = Settings::default();
+        let mut settings = used_view_settings();
         settings.set_provider_metric(ProviderId::Cursor, MetricPreference::Session);
         let snapshot = fake_snapshot_with("cursor", "Cursor", 15.0, Some(40.0), None, None);
-
         let (primary, secondary) = selected_tray_percents(&snapshot, &settings);
-
         assert_eq!(primary, 15.0);
         assert_eq!(secondary, Some(40.0));
     }
-
     #[test]
     fn informational_primary_skips_session_and_automatic_phantom_zero() {
-        let mut settings = Settings::default();
+        let mut settings = used_view_settings();
         settings.set_provider_metric(ProviderId::Claude, MetricPreference::Session);
         let mut snapshot = fake_snapshot_with("claude", "Claude", 0.0, Some(42.0), None, None);
         snapshot.primary.is_informational = true;
-
         // Session preference must not paint the synthetic 0% primary;
         // it falls through to Automatic which prefers weekly (42%).
         let (primary, _) = selected_tray_percents(&snapshot, &settings);
         assert_eq!(primary, 42.0);
         assert_ne!(primary, 0.0);
-
         // Automatic also prefers weekly over informational primary.
         settings.set_provider_metric(ProviderId::Claude, MetricPreference::Automatic);
         let (primary, _) = selected_tray_percents(&snapshot, &settings);
         assert_eq!(primary, 42.0);
     }
-
     #[test]
     fn claude_automatic_prefers_weekly_when_model_exhausted() {
-        let settings = Settings::default();
+        let settings = used_view_settings();
         let mut snapshot = fake_snapshot_with("claude", "Claude", 40.0, Some(22.0), None, None);
         snapshot.model_specific = Some(crate::commands::RateWindowSnapshot {
             used_percent: 100.0,
@@ -1549,40 +1156,38 @@ mod tests {
             is_exhausted: true,
             is_informational: false,
             reserve_percent: None,
-            over_percent: None,
             reserve_description: None,
             reserve_will_last_to_reset: false,
             reserve_eta_seconds: None,
+            pace: None,
+            description_is_detail: false,
+            reset_regenerates: false,
+            hidden_on_card: false,
+            monthly_limit_block: None,
         });
-
         let (primary, _) = selected_tray_percents(&snapshot, &settings);
         assert_eq!(primary, 22.0);
-
         // Explicit model override is untouched.
         let mut overridden = settings.clone();
         overridden.set_provider_metric(ProviderId::Claude, MetricPreference::Model);
         let (primary, _) = selected_tray_percents(&snapshot, &overridden);
         assert_eq!(primary, 100.0);
     }
-
     #[test]
     fn automatic_prefers_exhausted_weekly_over_low_session() {
-        let settings = Settings::default();
+        let settings = used_view_settings();
         let snapshot = fake_snapshot_with("codex", "Codex", 20.0, Some(100.0), None, None);
-
         let (primary, _) = selected_tray_percents(&snapshot, &settings);
         assert_eq!(primary, 100.0);
-
         // Explicit session override still wins.
         let mut overridden = settings.clone();
         overridden.set_provider_metric(ProviderId::Codex, MetricPreference::Session);
         let (primary, _) = selected_tray_percents(&snapshot, &overridden);
         assert_eq!(primary, 20.0);
     }
-
     #[test]
     fn automatic_picks_highest_among_model_and_extra_windows() {
-        let settings = Settings::default();
+        let settings = used_view_settings();
         let mut snapshot =
             fake_snapshot_with("gemini", "Gemini", 10.0, Some(30.0), Some(40.0), None);
         snapshot.model_specific = Some(crate::commands::RateWindowSnapshot {
@@ -1594,24 +1199,25 @@ mod tests {
             is_exhausted: false,
             is_informational: false,
             reserve_percent: None,
-            over_percent: None,
             reserve_description: None,
             reserve_will_last_to_reset: false,
             reserve_eta_seconds: None,
+            pace: None,
+            description_is_detail: false,
+            reset_regenerates: false,
+            hidden_on_card: false,
+            monthly_limit_block: None,
         });
         snapshot.extra_rate_windows.push(fake_extra_window(90.0));
-
         let (primary, _) = selected_tray_percents(&snapshot, &settings);
         assert_eq!(primary, 90.0);
     }
-
     #[test]
     fn f5_headline_prefers_non_informational_primary() {
         let snapshot = fake_snapshot_with("codex", "Codex", 50.0, Some(20.0), Some(30.0), None);
         let headline = codex_lane_headline_window(&snapshot);
         assert!((headline.used_percent - 50.0).abs() < f64::EPSILON);
     }
-
     #[test]
     fn f5_headline_falls_back_to_secondary_when_primary_informational() {
         let mut snapshot = fake_snapshot_with("codex", "Codex", 0.0, Some(25.0), Some(30.0), None);
@@ -1619,7 +1225,6 @@ mod tests {
         let headline = codex_lane_headline_window(&snapshot);
         assert!((headline.used_percent - 25.0).abs() < f64::EPSILON);
     }
-
     #[test]
     fn f5_headline_falls_back_to_tertiary_when_primary_and_secondary_informational() {
         let mut snapshot = fake_snapshot_with("codex", "Codex", 0.0, Some(0.0), Some(35.0), None);
@@ -1628,7 +1233,6 @@ mod tests {
         let headline = codex_lane_headline_window(&snapshot);
         assert!((headline.used_percent - 35.0).abs() < f64::EPSILON);
     }
-
     #[test]
     fn f5_headline_returns_primary_when_all_informational() {
         let mut snapshot = fake_snapshot_with("codex", "Codex", 0.0, Some(0.0), Some(0.0), None);

@@ -91,6 +91,35 @@ pub struct RateWindow {
     /// Whether this row is an informational value rather than a quota.
     #[serde(default)]
     pub is_informational: bool,
+
+    /// Whether `reset_description` is a detail line (for example spend
+    /// amounts) rather than reset wording. Renderers show it as its own
+    /// secondary line and never as a reset time. Provider-owned; kept out of
+    /// serialized output so CLI JSON is unchanged.
+    #[serde(default, skip_serializing)]
+    pub description_is_detail: bool,
+
+    /// The card counts down to the next quota regeneration ("Regenerates in
+    /// 45m", upstream `syntheticRegenDetail`) instead of a reset.
+    /// Provider-owned; kept out of serialized output so CLI JSON is unchanged.
+    #[serde(default, skip_serializing)]
+    pub reset_regenerates: bool,
+
+    /// Not drawn as a card row: the window only carries a value for the tray
+    /// and float bar, and the card shows that value elsewhere (a provider whose
+    /// upstream snapshot has no window). Provider-owned; not serialized.
+    #[serde(default, skip_serializing)]
+    pub hidden_on_card: bool,
+
+    /// Whether the provider explicitly supplied the usage percentage.
+    /// Internal-only metadata prevents a missing value normalized to zero from
+    /// becoming an exported quota measurement.
+    #[serde(default = "rate_window_usage_known_default", skip_serializing)]
+    pub(crate) usage_known: bool,
+}
+
+fn rate_window_usage_known_default() -> bool {
+    true
 }
 
 impl RateWindow {
@@ -102,6 +131,10 @@ impl RateWindow {
             resets_at: None,
             reset_description: None,
             is_informational: false,
+            description_is_detail: false,
+            reset_regenerates: false,
+            hidden_on_card: false,
+            usage_known: true,
         }
     }
 
@@ -110,6 +143,7 @@ impl RateWindow {
         Self {
             reset_description: Some(description.into()),
             is_informational: true,
+            usage_known: false,
             ..Self::new(0.0)
         }
     }
@@ -140,7 +174,38 @@ impl RateWindow {
             resets_at,
             reset_description,
             is_informational: false,
+            description_is_detail: false,
+            reset_regenerates: false,
+            hidden_on_card: false,
+            usage_known: true,
         }
+    }
+
+    /// Mark `reset_description` as a detail line instead of reset wording.
+    pub fn with_description_as_detail(mut self) -> Self {
+        self.description_is_detail = true;
+        self
+    }
+
+    /// The reset is the next quota regeneration ("Regenerates in ...").
+    pub fn with_regenerating_reset(mut self) -> Self {
+        self.reset_regenerates = true;
+        self
+    }
+
+    /// Keep the window for the tray and float bar but off the card.
+    pub fn hidden_on_card(mut self) -> Self {
+        self.hidden_on_card = true;
+        self
+    }
+
+    pub(crate) fn with_usage_known(mut self, usage_known: bool) -> Self {
+        self.usage_known = usage_known;
+        self
+    }
+
+    pub(crate) fn usage_known(&self) -> bool {
+        self.usage_known
     }
 
     /// Real UTC Gregorian month length ending at `resets_at`, in minutes.
@@ -187,26 +252,7 @@ impl RateWindow {
 
     /// Format the reset time as a countdown string
     pub fn format_countdown(&self) -> Option<String> {
-        let resets_at = self.resets_at?;
-        let now = Utc::now();
-
-        if resets_at <= now {
-            return Some("now".to_string());
-        }
-
-        let duration = resets_at - now;
-        let hours = duration.num_hours();
-        let total_minutes = ((duration.num_seconds() + 59) / 60).max(1);
-        let minutes = total_minutes % 60;
-
-        if hours > 24 {
-            let days = hours / 24;
-            Some(format!("{}d {}h", days, hours % 24))
-        } else if hours > 0 {
-            Some(format!("{}h {}m", hours, minutes))
-        } else {
-            Some(format!("{}m", minutes))
-        }
+        Some(format_countdown_until(self.resets_at?, Utc::now()))
     }
 
     fn finite_percent(value: f64) -> f64 {
@@ -225,11 +271,9 @@ fn subtract_one_calendar_month(dt: DateTime<Utc>) -> Option<DateTime<Utc>> {
     let (py, pm) = if m == 1 { (y - 1, 12) } else { (y, m - 1) };
     let max_day = days_in_month(py, pm);
     let day = dt.day().min(max_day);
-    dt.date_naive()
-        .with_year(py)?
-        .with_month(pm)?
-        .with_day(day)
-        .map(|d| d.and_time(dt.time()).and_utc())
+    // Build the date in one step: chaining `with_month` on the 29th-31st fails
+    // when the previous month is shorter (Mar 31 -> Feb 31).
+    chrono::NaiveDate::from_ymd_opt(py, pm, day).map(|d| d.and_time(dt.time()).and_utc())
 }
 
 fn days_in_month(year: i32, month: u32) -> u32 {
@@ -253,6 +297,32 @@ impl Default for RateWindow {
     }
 }
 
+/// Canonical countdown formatting for any future deadline (`{d}d {h}h`,
+/// `{h}h {m}m`, `{m}m`, or `"now"` once elapsed).
+///
+/// [`RateWindow::format_countdown`] delegates here so every surface (tray,
+/// CLI, inventory rows) renders one countdown dialect; the 24-hour boundary
+/// is intentionally `> 24` (exactly 24h renders `"24h 0m"`).
+pub fn format_countdown_until(until: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    if until <= now {
+        return "now".to_string();
+    }
+
+    let duration = until - now;
+    let hours = duration.num_hours();
+    let total_minutes = ((duration.num_seconds() + 59) / 60).max(1);
+    let minutes = total_minutes % 60;
+
+    if hours > 24 {
+        let days = hours / 24;
+        format!("{}d {}h", days, hours % 24)
+    } else if hours > 0 {
+        format!("{}h {}m", hours, minutes)
+    } else {
+        format!("{}m", minutes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,6 +340,16 @@ mod tests {
         );
         assert_eq!(window.used_percent, 0.0);
         assert_eq!(window.resets_at, None);
+        assert!(!window.usage_known());
+    }
+
+    #[test]
+    fn internal_usage_known_metadata_is_not_serialized() {
+        let window = RateWindow::with_details(0.0, Some(300), None, None).with_usage_known(false);
+        let json = serde_json::to_value(window).expect("rate window JSON");
+
+        assert!(json.get("usage_known").is_none());
+        assert!(json.get("usageKnown").is_none());
     }
 
     #[test]
@@ -320,6 +400,28 @@ mod tests {
             Some(31 * 24 * 60)
         );
         assert_eq!(RateWindow::monthly_window_minutes(None), None);
+    }
+
+    #[test]
+    fn calendar_month_window_clamps_the_day_into_a_shorter_month() {
+        // Mar 31 minus one month is Feb 28 (Foundation clamps the day): 31 days.
+        let resets = Utc.with_ymd_and_hms(2026, 3, 31, 0, 0, 0).unwrap();
+        assert_eq!(
+            RateWindow::calendar_month_window_minutes(resets),
+            Some(44_640)
+        );
+        // May 31 minus one month is Apr 30: 31 days.
+        let resets = Utc.with_ymd_and_hms(2026, 5, 31, 12, 0, 0).unwrap();
+        assert_eq!(
+            RateWindow::calendar_month_window_minutes(resets),
+            Some(44_640)
+        );
+        // Mar 30 2028 minus one month is Feb 29 (leap year): 30 days.
+        let resets = Utc.with_ymd_and_hms(2028, 3, 30, 0, 0, 0).unwrap();
+        assert_eq!(
+            RateWindow::calendar_month_window_minutes(resets),
+            Some(43_200)
+        );
     }
 
     #[test]
@@ -394,5 +496,21 @@ mod tests {
         assert_eq!(RateWindowCadence::Weekly.label_key(), "weekly");
         assert_eq!(RateWindowCadence::Monthly.label_key(), "monthly");
         assert_eq!(RateWindowCadence::Unknown.label_key(), "unknown");
+    }
+
+    #[test]
+    fn countdown_exactly_24h_renders_hours_not_days() {
+        let now = Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap();
+        let until = now + chrono::Duration::hours(24);
+
+        assert_eq!(format_countdown_until(until, now), "24h 0m");
+    }
+
+    #[test]
+    fn countdown_elapsed_deadline_renders_now() {
+        let now = Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap();
+        let until = now - chrono::Duration::seconds(5);
+
+        assert_eq!(format_countdown_until(until, now), "now");
     }
 }
