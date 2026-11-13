@@ -14,7 +14,7 @@ use std::os::windows::process::CommandExt;
 
 use crate::core::{
     FetchContext, Provider, ProviderDisplayDetail, ProviderError, ProviderFetchResult, ProviderId,
-    ProviderMetadata, ResetCreditsObservation, SourceMode,
+    ResetCreditsObservation, SourceMode,
 };
 
 pub use api::CodexApi;
@@ -32,28 +32,23 @@ pub(crate) const LIMIT_RESET_POLICY: crate::core::ProviderLimitResetPolicy =
         missing_identity: crate::core::MissingIdentityRule::Skip,
     };
 
+/// Upstream `CodexProviderDescriptor.pace` (#4766): a window reported with a
+/// fixed 30-day length (`limit_window_seconds: 2592000`, seen on the Free
+/// plan) gets reset-window pace. The reported length is kept; calendar-month
+/// inference would change the pace.
+pub(crate) const PACE_CAPABILITY: crate::core::ProviderPaceCapability =
+    crate::core::ProviderPaceCapability::reset_window(crate::core::PaceWindowRule::WindowDuration(
+        crate::core::MONTHLY_WINDOW_SENTINEL_MINUTES,
+    ));
+
 /// Codex provider for fetching AI usage limits
 pub struct CodexProvider {
-    metadata: ProviderMetadata,
     api: CodexApi,
 }
 
 impl CodexProvider {
     pub fn new() -> Self {
         Self {
-            metadata: ProviderMetadata {
-                id: ProviderId::Codex,
-                display_name: "Codex",
-                session_label: "Session",
-                weekly_label: "Weekly",
-                supports_opus: false,
-                supports_credits: true,
-                default_enabled: true,
-                is_primary: true,
-                dashboard_url: Some("https://chatgpt.com/codex/cloud/settings/analytics#usage"),
-                status_page_url: Some("https://status.openai.com"),
-                tertiary_label_key: None,
-            },
             api: CodexApi::new(),
         }
     }
@@ -197,10 +192,6 @@ impl Provider for CodexProvider {
         ProviderId::Codex
     }
 
-    fn metadata(&self) -> &ProviderMetadata {
-        &self.metadata
-    }
-
     fn retains_last_good_on_transport_failure(&self) -> bool {
         true
     }
@@ -245,10 +236,6 @@ impl Provider for CodexProvider {
     }
 
     fn supports_oauth(&self) -> bool {
-        true
-    }
-
-    fn supports_cli(&self) -> bool {
         true
     }
 
@@ -479,10 +466,10 @@ mod credits_detail_tests {
 mod descriptor_tests {
     use super::*;
 
-    /// Upstream 0.68.0 (#4005): the Usage Dashboard resolves the Codex cloud
-    /// analytics page, not the retired `codex/settings/usage` route.
+    /// Upstream 0.79 (#4607): the Usage Dashboard opens the ChatGPT usage
+    /// overview tab, not the legacy cloud analytics redirect.
     #[test]
-    fn usage_dashboard_resolves_the_registered_codex_analytics_usage_url() {
+    fn usage_dashboard_resolves_the_codex_usage_overview_tab() {
         let provider = CodexProvider::new();
         let dashboard_url = provider
             .metadata()
@@ -491,10 +478,12 @@ mod descriptor_tests {
         let url = reqwest::Url::parse(dashboard_url).expect("dashboard URL parses");
         assert_eq!(
             url.as_str(),
-            "https://chatgpt.com/codex/cloud/settings/analytics#usage"
+            "https://chatgpt.com/settings/usage?tab=overview"
         );
         assert_eq!(url.scheme(), "https");
         assert_eq!(url.host_str(), Some("chatgpt.com"));
-        assert_eq!(url.fragment(), Some("usage"));
+        assert_eq!(url.path(), "/settings/usage");
+        assert_eq!(url.query(), Some("tab=overview"));
+        assert_eq!(url.fragment(), None);
     }
 }

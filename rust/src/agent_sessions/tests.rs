@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::Settings;
     use chrono::TimeZone;
     use std::fs;
     use std::io;
@@ -509,6 +510,74 @@ bad line
     }
 
     #[test]
+    fn claude_desktop_cost_discovery_admits_cowork_audit_files_only_for_cost() {
+        let app_data = tempfile::tempdir().expect("tempdir");
+        let session = app_data
+            .path()
+            .join("local-agent-mode-sessions")
+            .join("account")
+            .join("workspace")
+            .join("session");
+        fs::create_dir_all(&session).expect("session dir");
+        let audit = session.join("audit.jsonl");
+        fs::write(&audit, "{}\n").expect("audit file");
+        let projects = app_data
+            .path()
+            .join("claude-code-sessions")
+            .join("account")
+            .join(".claude")
+            .join("projects");
+        fs::create_dir_all(&projects).expect("desktop projects");
+        let roots_input = [app_data.path().to_path_buf()];
+
+        let mut budget = pi_family::DirectoryScanBudget::new(512, 4, Duration::from_secs(5));
+        let cost = claude_desktop::ClaudeDesktopProjectsLocator::cost_roots_under(
+            &roots_input,
+            &mut budget,
+        );
+        let mut expected = vec![
+            pi_family::canonicalize_for_scan(&audit),
+            pi_family::canonicalize_for_scan(&projects),
+        ];
+        expected.sort();
+        assert_eq!(
+            cost,
+            claude_desktop::ClaudeDesktopCostRoots {
+                paths: expected,
+                complete: true,
+            }
+        );
+
+        // Live-session discovery keeps its project-only output.
+        let mut live_budget = pi_family::DirectoryScanBudget::new(512, 4, Duration::from_secs(5));
+        let live = claude_desktop::ClaudeDesktopProjectsLocator::roots_under(
+            app_data.path(),
+            &mut live_budget,
+        );
+        assert_eq!(live, vec![pi_family::canonicalize_for_scan(&projects)]);
+
+        // An expired clock and an exhausted entry cap both report incomplete.
+        let mut expired_budget = pi_family::DirectoryScanBudget::new_with_deadline_for_test(
+            512,
+            4,
+            Instant::now(),
+        );
+        let expired = claude_desktop::ClaudeDesktopProjectsLocator::cost_roots_under(
+            &roots_input,
+            &mut expired_budget,
+        );
+        assert!(expired.paths.is_empty());
+        assert!(!expired.complete);
+
+        let mut capped_budget = pi_family::DirectoryScanBudget::new(1, 4, Duration::from_secs(5));
+        let capped = claude_desktop::ClaudeDesktopProjectsLocator::cost_roots_under(
+            &roots_input,
+            &mut capped_budget,
+        );
+        assert!(!capped.complete);
+    }
+
+    #[test]
     fn focus_rejects_remote_and_file_only_targets_explicitly() {
         let remote = AgentSession {
             id: "remote".to_string(),
@@ -588,7 +657,15 @@ bad line
         let bundled_v2 = shell.rfind("sessions --json-v2").expect("bundled v2 fallback");
         assert!(v2 < v1, "v2 negotiated before legacy PATH fallback");
         assert!(v1 < bundled_v2, "PATH fallback before bundled CLI");
-        assert!(shell.ends_with("sessions --json"), "bundled legacy fallback present");
+        assert!(shell.ends_with("sessions --json'"), "bundled legacy fallback present");
+        assert!(
+            shell.starts_with("'codexbar sessions --json-v2 || "),
+            "the whole chain reaches sh -lc as one shell word"
+        );
+        assert!(
+            shell.contains("'\\''/Applications/CodexBar.app/Contents/Helpers/CodexBarCLI'\\'' sessions"),
+            "bundled path quoting survives the outer quotes"
+        );
     }
 
     #[tokio::test]
@@ -606,10 +683,10 @@ bad line
                     let barrier = Arc::clone(&barrier);
                     async move {
                         if host == "broken" {
-                            return AgentSessionHostResult::failed(host, "unreachable");
+                            return Some(AgentSessionHostResult::failed(host, "unreachable"));
                         }
                         barrier.wait().await;
-                        AgentSessionHostResult::success(host, Vec::new())
+                        Some(AgentSessionHostResult::success(host, Vec::new()))
                     }
                 },
             ),
@@ -641,5 +718,423 @@ bad line
             .await;
 
         assert_eq!(result, AgentSessionDiscoveryResult::Disabled);
+    }
+
+    type SpawnResponse = Result<CommandResult, CommandError>;
+
+    /// Records every process the remote path asks to start, and answers from `respond`.
+    struct RecordingSpawner {
+        spawns: std::sync::Mutex<Vec<(String, Vec<String>)>>,
+        respond: Box<dyn Fn(&str) -> SpawnResponse + Send + Sync>,
+    }
+
+    impl RecordingSpawner {
+        fn new(respond: impl Fn(&str) -> SpawnResponse + Send + Sync + 'static) -> Arc<Self> {
+            Arc::new(Self {
+                spawns: std::sync::Mutex::new(Vec::new()),
+                respond: Box::new(respond),
+            })
+        }
+
+        fn binaries(&self) -> Vec<String> {
+            self.spawns
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(binary, _)| binary.clone())
+                .collect()
+        }
+
+        /// Host argument of every recorded `ssh` spawn (the word after `--`).
+        fn ssh_hosts(&self) -> Vec<String> {
+            self.spawns
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(binary, _)| binary == "ssh")
+                .filter_map(|(_, args)| {
+                    let index = args.iter().position(|arg| arg == "--")?;
+                    args.get(index + 1).cloned()
+                })
+                .collect()
+        }
+    }
+
+    impl super::remote::RemoteProcessSpawner for RecordingSpawner {
+        fn spawn(
+            &self,
+            binary: &str,
+            options: &CommandOptions,
+        ) -> Result<CommandResult, CommandError> {
+            self.spawns
+                .lock()
+                .unwrap()
+                .push((binary.to_string(), options.extra_args.clone()));
+            (self.respond)(binary)
+        }
+    }
+
+    fn ok_output(text: &str) -> Result<CommandResult, CommandError> {
+        Ok(CommandResult {
+            text: text.to_string(),
+            stderr: String::new(),
+            timed_out: false,
+            exit_code: Some(0),
+        })
+    }
+
+    const TAILSCALE_STATUS_WITH_AUTO_PEER: &str = r#"{
+        "Self": {"DNSName": "this-pc.tailnet.ts.net."},
+        "Peer": {"one": {"DNSName": "auto.example.invalid.", "Online": true}}
+    }"#;
+
+    /// A temp dir holding a standalone Tailscale CLI, plus a `PATH` that finds only it.
+    fn tailscale_on_path() -> (tempfile::TempDir, std::ffi::OsString) {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(super::remote::TAILSCALE_CLI_FILE_NAME),
+            b"MZ\x90\x00",
+        )
+        .unwrap();
+        let path = std::env::join_paths([dir.path()]).unwrap();
+        (dir, path)
+    }
+
+    fn remote_context(
+        gate: super::remote::RemoteDiscoveryGate,
+        spawner: Arc<RecordingSpawner>,
+        path_var: Option<std::ffi::OsString>,
+    ) -> super::remote::RemoteContext {
+        super::remote::RemoteContext {
+            gate,
+            spawner,
+            path_var,
+        }
+    }
+
+    fn gate_from(open: &Arc<std::sync::atomic::AtomicBool>) -> super::remote::RemoteDiscoveryGate {
+        let open = Arc::clone(open);
+        super::remote::RemoteDiscoveryGate::new(move || open.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    fn open_gate(value: bool) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::new(std::sync::atomic::AtomicBool::new(value))
+    }
+
+    #[tokio::test]
+    async fn local_only_discovery_never_probes_tailscale_or_fetches_ssh() {
+        let (_dir, path) = tailscale_on_path();
+        let spawner = RecordingSpawner::new(|_| ok_output(TAILSCALE_STATUS_WITH_AUTO_PEER));
+        let ctx = remote_context(
+            super::remote::RemoteDiscoveryGate::new(|| true),
+            spawner.clone(),
+            Some(path),
+        );
+
+        let result = AgentSessionDiscovery::default()
+            .scan_guarded(AgentSessionDiscoveryMode::LocalOnly, &ctx)
+            .await;
+
+        assert!(spawner.binaries().is_empty(), "no remote process may start");
+        let AgentSessionDiscoveryResult::Hosts(hosts) = result else {
+            panic!("local-only discovery should return the local host result");
+        };
+        assert_eq!(hosts.len(), 1);
+        assert!(
+            hosts
+                .iter()
+                .all(|host| host.host != "auto.example.invalid" && host.host != "tailscale")
+        );
+    }
+
+    #[tokio::test]
+    async fn enabled_discovery_merges_manual_and_tailscale_hosts_through_the_spawner() {
+        let (_dir, path) = tailscale_on_path();
+        let spawner = RecordingSpawner::new(|binary| {
+            if binary == "ssh" {
+                ok_output("[]")
+            } else {
+                ok_output(TAILSCALE_STATUS_WITH_AUTO_PEER)
+            }
+        });
+        let ctx = remote_context(
+            super::remote::RemoteDiscoveryGate::new(|| true),
+            spawner.clone(),
+            Some(path),
+        );
+
+        let result = AgentSessionDiscovery::default()
+            .scan_guarded(
+                AgentSessionDiscoveryMode::Enabled {
+                    ssh_hosts: vec!["manual.example.invalid".to_string()],
+                },
+                &ctx,
+            )
+            .await;
+
+        let mut ssh_hosts = spawner.ssh_hosts();
+        ssh_hosts.sort();
+        assert_eq!(
+            ssh_hosts,
+            vec![
+                "auto.example.invalid".to_string(),
+                "manual.example.invalid".to_string()
+            ]
+        );
+        let AgentSessionDiscoveryResult::Hosts(hosts) = result else {
+            panic!("enabled discovery should return host results");
+        };
+        assert_eq!(hosts.len(), 3, "local plus both remote hosts");
+    }
+
+    #[tokio::test]
+    async fn enabled_mode_read_before_local_only_was_turned_on_spawns_nothing() {
+        // The command read `Enabled` before the setting was written; by spawn time the gate is closed.
+        let (_dir, path) = tailscale_on_path();
+        let spawner = RecordingSpawner::new(|_| ok_output(TAILSCALE_STATUS_WITH_AUTO_PEER));
+        let ctx = remote_context(
+            super::remote::RemoteDiscoveryGate::new(|| false),
+            spawner.clone(),
+            Some(path),
+        );
+
+        let result = AgentSessionDiscovery::default()
+            .scan_guarded(
+                AgentSessionDiscoveryMode::Enabled {
+                    ssh_hosts: vec!["manual.example.invalid".to_string()],
+                },
+                &ctx,
+            )
+            .await;
+
+        assert!(spawner.binaries().is_empty(), "no ssh or tailscale spawn");
+        let AgentSessionDiscoveryResult::Hosts(hosts) = result else {
+            panic!("expected local-only host results");
+        };
+        assert_eq!(hosts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn turning_local_only_on_mid_discovery_stops_later_spawns() {
+        use std::sync::atomic::Ordering;
+
+        // Enabled at start. Tailscale runs; the user turns Local-only on during that probe.
+        let open = open_gate(true);
+        let (_dir, path) = tailscale_on_path();
+        let flip = Arc::clone(&open);
+        let spawner = RecordingSpawner::new(move |binary| {
+            if binary.ends_with(super::remote::TAILSCALE_CLI_FILE_NAME) {
+                flip.store(false, Ordering::SeqCst);
+            }
+            ok_output(TAILSCALE_STATUS_WITH_AUTO_PEER)
+        });
+        let ctx = remote_context(gate_from(&open), spawner.clone(), Some(path));
+
+        let result = AgentSessionDiscovery::default()
+            .scan_guarded(
+                AgentSessionDiscoveryMode::Enabled {
+                    ssh_hosts: vec!["manual.example.invalid".to_string()],
+                },
+                &ctx,
+            )
+            .await;
+
+        let binaries = spawner.binaries();
+        assert_eq!(binaries.len(), 1, "only the Tailscale probe ran: {binaries:?}");
+        assert!(binaries[0].ends_with(super::remote::TAILSCALE_CLI_FILE_NAME));
+        assert!(spawner.ssh_hosts().is_empty(), "no ssh after the toggle");
+        let AgentSessionDiscoveryResult::Hosts(hosts) = result else {
+            panic!("expected local-only host results");
+        };
+        assert_eq!(hosts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ssh_results_gathered_before_local_only_turns_on_are_discarded() {
+        use std::sync::atomic::Ordering;
+
+        // The ssh child has already run and answered when the toggle lands. Its row must not appear.
+        let open = open_gate(true);
+        let flip = Arc::clone(&open);
+        let spawner = RecordingSpawner::new(move |_| {
+            flip.store(false, Ordering::SeqCst);
+            ok_output("[]")
+        });
+        let ctx = remote_context(gate_from(&open), spawner.clone(), None);
+
+        let result = AgentSessionDiscovery::default()
+            .scan_guarded(
+                AgentSessionDiscoveryMode::Enabled {
+                    ssh_hosts: vec!["manual.example.invalid".to_string()],
+                },
+                &ctx,
+            )
+            .await;
+
+        assert_eq!(spawner.ssh_hosts(), vec!["manual.example.invalid".to_string()]);
+        let AgentSessionDiscoveryResult::Hosts(hosts) = result else {
+            panic!("expected local-only host results");
+        };
+        assert_eq!(hosts.len(), 1, "remote rows dropped once local-only is on");
+    }
+
+    #[tokio::test]
+    async fn spawn_remote_starts_nothing_while_the_gate_is_closed() {
+        use std::sync::atomic::Ordering;
+
+        let open = open_gate(false);
+        let spawner = RecordingSpawner::new(|_| ok_output("[]"));
+        let ctx = remote_context(gate_from(&open), spawner.clone(), None);
+
+        let closed = super::remote::spawn_remote(&ctx, "ssh".to_string(), CommandOptions::default())
+            .await;
+        assert!(closed.is_none());
+        assert!(spawner.binaries().is_empty());
+
+        open.store(true, Ordering::SeqCst);
+        let opened = super::remote::spawn_remote(&ctx, "ssh".to_string(), CommandOptions::default())
+            .await;
+        assert!(matches!(opened, Some(Ok(_))));
+        assert_eq!(spawner.binaries(), vec!["ssh".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn cli_explicit_request_runs_remote_discovery_with_desktop_setting_off() {
+        // `codexbar sessions --ssh-host` uses the explicit gate. Desktop settings are
+        // off or missing here, and the requested host and Tailscale peer still run.
+        let (_dir, path) = tailscale_on_path();
+        let spawner = RecordingSpawner::new(|binary| {
+            if binary == "ssh" {
+                ok_output("[]")
+            } else {
+                ok_output(TAILSCALE_STATUS_WITH_AUTO_PEER)
+            }
+        });
+        let ctx = remote_context(
+            super::remote::RemoteDiscoveryGate::explicit_request(),
+            spawner.clone(),
+            Some(path),
+        );
+        assert!(!Settings::default().agent_sessions_remote_allowed());
+
+        let result = AgentSessionDiscovery::default()
+            .scan_guarded(
+                AgentSessionDiscoveryMode::Enabled {
+                    ssh_hosts: vec!["manual.example.invalid".to_string()],
+                },
+                &ctx,
+            )
+            .await;
+
+        let binaries = spawner.binaries();
+        assert_eq!(
+            binaries.len(),
+            3,
+            "one Tailscale probe plus one ssh per host: {binaries:?}"
+        );
+        assert_eq!(
+            binaries
+                .iter()
+                .filter(|binary| binary.ends_with(super::remote::TAILSCALE_CLI_FILE_NAME))
+                .count(),
+            1
+        );
+        let mut ssh_hosts = spawner.ssh_hosts();
+        ssh_hosts.sort();
+        assert_eq!(
+            ssh_hosts,
+            vec![
+                "auto.example.invalid".to_string(),
+                "manual.example.invalid".to_string()
+            ]
+        );
+        let AgentSessionDiscoveryResult::Hosts(hosts) = result else {
+            panic!("CLI discovery should return host results");
+        };
+        assert_eq!(hosts.len(), 3, "local plus both remote hosts");
+    }
+
+    #[tokio::test]
+    async fn desktop_discovery_stays_blocked_while_the_setting_is_off_or_missing() {
+        // Desktop gate: `Settings::default()` is what a missing or unreadable settings.json
+        // resolves to, and it has Agent sessions off.
+        let (_dir, path) = tailscale_on_path();
+        let spawner = RecordingSpawner::new(|_| ok_output(TAILSCALE_STATUS_WITH_AUTO_PEER));
+        let ctx = remote_context(
+            super::remote::RemoteDiscoveryGate::new(|| {
+                Settings::default().agent_sessions_remote_allowed()
+            }),
+            spawner.clone(),
+            Some(path),
+        );
+
+        let result = AgentSessionDiscovery::default()
+            .scan_guarded(
+                AgentSessionDiscoveryMode::Enabled {
+                    ssh_hosts: vec!["manual.example.invalid".to_string()],
+                },
+                &ctx,
+            )
+            .await;
+
+        assert!(spawner.binaries().is_empty(), "no ssh or tailscale spawn");
+        let AgentSessionDiscoveryResult::Hosts(hosts) = result else {
+            panic!("expected local-only host results");
+        };
+        assert_eq!(hosts.len(), 1);
+    }
+
+    #[test]
+    fn tailscale_cli_resolution_skips_gui_client_launchers_and_scripts() {
+        let gui_dir = tempfile::tempdir().unwrap();
+        let script_dir = tempfile::tempdir().unwrap();
+        let cli_dir = tempfile::tempdir().unwrap();
+        fs::write(gui_dir.path().join("tailscale-ipn.exe"), b"MZ\x90\x00").unwrap();
+        fs::write(gui_dir.path().join("tailscale.cmd"), b"@echo off\r\n").unwrap();
+        fs::write(
+            script_dir.path().join(super::remote::TAILSCALE_CLI_FILE_NAME),
+            b"#!/bin/sh\nexec tailscale-ipn \"$@\"\n",
+        )
+        .unwrap();
+        let cli = cli_dir.path().join(super::remote::TAILSCALE_CLI_FILE_NAME);
+        fs::write(&cli, b"MZ\x90\x00").unwrap();
+
+        let path_var = std::env::join_paths([gui_dir.path(), script_dir.path(), cli_dir.path()])
+            .unwrap();
+        let resolved = super::remote::tailscale_cli_path(Some(path_var.as_os_str()));
+
+        assert_eq!(resolved.as_deref(), cli.to_str());
+        assert_eq!(super::remote::tailscale_cli_path(None), None);
+    }
+
+    #[test]
+    fn tailscale_cli_resolution_returns_none_without_a_standalone_cli() {
+        let gui_dir = tempfile::tempdir().unwrap();
+        fs::write(gui_dir.path().join("tailscale-ipn.exe"), b"MZ\x90\x00").unwrap();
+        let path_var = std::env::join_paths([gui_dir.path()]).unwrap();
+
+        assert_eq!(
+            super::remote::tailscale_cli_path(Some(path_var.as_os_str())),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tailscale_cli_resolution_rejects_symlinks_into_other_binaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real-tailscale");
+        fs::write(&target, b"MZ\x90\x00").unwrap();
+        std::os::unix::fs::symlink(
+            &target,
+            dir.path().join(super::remote::TAILSCALE_CLI_FILE_NAME),
+        )
+        .unwrap();
+        let path_var = std::env::join_paths([dir.path()]).unwrap();
+
+        assert_eq!(
+            super::remote::tailscale_cli_path(Some(path_var.as_os_str())),
+            None
+        );
     }
 }

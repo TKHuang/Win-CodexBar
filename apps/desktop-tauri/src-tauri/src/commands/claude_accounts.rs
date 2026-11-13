@@ -1,10 +1,13 @@
+use super::claude_swap_usage::{
+    PoolObservation, begin_pool_read, observe_list, record_observation,
+};
 use super::{claude_reconciliation, invalidate_account_usage};
 use crate::state::AppState;
 use codexbar::core::ProviderId;
 use codexbar::providers::claude::accounts::{self, AccountManager, ClaudeAccount};
 use codexbar::providers::claude::claude_swap::{
     self, ClaudeSwapAccount, ClaudeSwapAccountAction, ClaudeSwapAccountList, ClaudeSwapAccountRow,
-    ClaudeSwapUsageStatus,
+    ClaudeSwapAccountSource, ClaudeSwapUsageStatus,
 };
 use serde::Serialize;
 use std::sync::Mutex;
@@ -15,7 +18,6 @@ use tauri::Manager;
 static MUTATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const AMBIENT_RECONCILIATION_GRACE: Duration = Duration::from_secs(5);
 
-#[tauri::command]
 pub fn claude_accounts_list() -> Result<Vec<ClaudeAccount>, String> {
     AccountManager::new()
         .and_then(|m| m.list())
@@ -27,6 +29,7 @@ pub fn claude_accounts_list() -> Result<Vec<ClaudeAccount>, String> {
 #[serde(rename_all = "camelCase")]
 pub struct ClaudeSwapAccountsState {
     pub enabled: bool,
+    pub source: ClaudeSwapAccountSource,
     pub executable_configured: bool,
     pub accounts: Vec<ClaudeSwapAccount>,
     pub error: Option<String>,
@@ -36,7 +39,9 @@ pub struct ClaudeSwapAccountsState {
 struct ClaudeSwapConfig {
     enabled: bool,
     executable_path: String,
+    source: ClaudeSwapAccountSource,
     hide_personal_info: bool,
+    weekly_progress_work_days: Option<u8>,
 }
 
 impl ClaudeSwapConfig {
@@ -45,7 +50,9 @@ impl ClaudeSwapConfig {
         Self {
             enabled: settings.claude_swap_enabled(),
             executable_path: settings.claude_swap_executable_path().to_string(),
+            source: settings.claude_swap_source(),
             hide_personal_info: settings.hide_personal_info,
+            weekly_progress_work_days: settings.weekly_progress_work_days,
         }
     }
 
@@ -55,39 +62,66 @@ impl ClaudeSwapConfig {
             return Err("claude-swap integration is disabled.".to_string());
         }
         if config.executable_path.trim().is_empty() {
-            return Err("No claude-swap executable path is configured.".to_string());
+            return Err(format!(
+                "No {} executable path is configured.",
+                config.source.label()
+            ));
         }
         Ok(config)
     }
 }
 
-fn claude_swap_accounts_state() -> ClaudeSwapAccountsState {
+/// Read the pool for the settings list. Also returns what the read saw, for the
+/// Overview usage cache: `Inactive` when no pool can be read, and `None` when
+/// the read failed, so the last good cache is kept.
+fn claude_swap_accounts_state() -> (ClaudeSwapAccountsState, Option<PoolObservation>) {
     let config = ClaudeSwapConfig::load();
     let enabled = config.enabled;
     let executable_configured = !config.executable_path.trim().is_empty();
     if !enabled || !executable_configured {
-        return ClaudeSwapAccountsState {
-            enabled,
-            executable_configured,
-            accounts: Vec::new(),
-            error: None,
-        };
+        return (
+            ClaudeSwapAccountsState {
+                enabled,
+                source: config.source,
+                executable_configured,
+                accounts: Vec::new(),
+                error: None,
+            },
+            Some(PoolObservation::Inactive),
+        );
     }
-    match claude_swap::read_account_list(&config.executable_path) {
-        Ok(list) => ClaudeSwapAccountsState {
-            enabled,
-            executable_configured,
-            accounts: claude_swap::project_accounts(&list, config.hide_personal_info),
-            error: None,
-        },
+    match claude_swap::read_account_list(&config.executable_path, config.source) {
+        Ok(list) => {
+            let observation = observe_list(&list, config.source);
+            let mut accounts =
+                claude_swap::project_accounts(&list, config.source, config.hide_personal_info);
+            let now = chrono::Utc::now();
+            claude_swap::attach_session_forecasts(&list, &mut accounts, now, |sample| {
+                claude_swap::record_and_forecast(sample, now, config.weekly_progress_work_days)
+            });
+            (
+                ClaudeSwapAccountsState {
+                    enabled,
+                    source: config.source,
+                    executable_configured,
+                    accounts,
+                    error: None,
+                },
+                Some(observation),
+            )
+        }
         // Adapter failures are isolated from ambient Claude usage: the last
         // built-in account list still renders and the error is surfaced inline.
-        Err(error) => ClaudeSwapAccountsState {
-            enabled,
-            executable_configured,
-            accounts: Vec::new(),
-            error: Some(error.to_string()),
-        },
+        Err(error) => (
+            ClaudeSwapAccountsState {
+                enabled,
+                source: config.source,
+                executable_configured,
+                accounts: Vec::new(),
+                error: Some(error.to_string()),
+            },
+            None,
+        ),
     }
 }
 
@@ -191,6 +225,7 @@ impl ClaudeSwapMutationOutcome {
 
 fn validate_claude_swap_operation(
     operation: ClaudeSwapAccountOperation,
+    source: ClaudeSwapAccountSource,
     list: &ClaudeSwapAccountList,
     account: &ClaudeSwapAccountRow,
 ) -> Result<(), String> {
@@ -198,8 +233,14 @@ fn validate_claude_swap_operation(
         ClaudeSwapAccountOperation::Switch => ClaudeSwapAccountAction::Switch,
         ClaudeSwapAccountOperation::Reauthenticate => ClaudeSwapAccountAction::Reauthenticate,
     };
-    if claude_swap::action_for_account(list, account) == Some(expected_action) {
+    if claude_swap::action_for_account(list, account, source) == Some(expected_action) {
         return Ok(());
+    }
+    if !source.supports_switching() {
+        return Err(format!(
+            "{} picks the account for each request; CodexBar does not switch its accounts.",
+            source.label()
+        ));
     }
     if !list.supports_account_switching {
         return Err(
@@ -234,17 +275,17 @@ fn run_claude_swap_operation(
     operation: ClaudeSwapAccountOperation,
 ) -> Result<ClaudeSwapMutationOutcome, String> {
     let _credentials = accounts::CREDENTIAL_OPERATION.blocking_lock();
-    let before = claude_swap::read_account_list(&config.executable_path)
+    let before = claude_swap::read_account_list(&config.executable_path, config.source)
         .map_err(|error| error.to_string())?;
     let account = account_row_for_slot(&before, slot)?;
-    validate_claude_swap_operation(operation, &before, account)?;
+    validate_claude_swap_operation(operation, config.source, &before, account)?;
 
     let result = claude_swap::switch_account(&config.executable_path, slot)
         .map_err(|error| error.to_string())?;
     if !result.switched {
         return Err(result.reason);
     }
-    let after = match claude_swap::read_account_list(&config.executable_path) {
+    let after = match claude_swap::read_account_list(&config.executable_path, config.source) {
         Ok(list) => list,
         Err(error) => {
             return Ok(ClaudeSwapMutationOutcome::applied_unconfirmed(format!(
@@ -286,10 +327,19 @@ async fn finish_claude_swap_mutation(
 }
 
 #[tauri::command]
-pub async fn claude_swap_accounts_list() -> Result<ClaudeSwapAccountsState, String> {
-    tauri::async_runtime::spawn_blocking(claude_swap_accounts_state)
+pub async fn claude_swap_accounts_list(
+    app: tauri::AppHandle,
+) -> Result<ClaudeSwapAccountsState, String> {
+    // The read number is taken before the subprocess runs, so an older read that
+    // finishes late cannot overwrite a newer one in the Overview cache.
+    let read = begin_pool_read(&app);
+    let (state, observation) = tauri::async_runtime::spawn_blocking(claude_swap_accounts_state)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    if let Some(observation) = observation {
+        record_observation(&app, read, &observation);
+    }
+    Ok(state)
 }
 
 #[tauri::command]
@@ -394,6 +444,7 @@ pub async fn claude_account_remove(app: tauri::AppHandle, id: String) -> Result<
     AccountManager::new()
         .and_then(|m| m.remove(&id))
         .map_err(|e| e.to_string())?;
+    super::forget_managed_account(&app, &id);
     crate::auto_resume::clear(&app, ProviderId::Claude);
     changed(&app);
     Ok(())
@@ -457,6 +508,7 @@ mod tests {
         assert!(
             validate_claude_swap_operation(
                 ClaudeSwapAccountOperation::Switch,
+                ClaudeSwapAccountSource::ClaudeSwap,
                 &switchable,
                 &switchable.accounts[0]
             )
@@ -467,6 +519,7 @@ mod tests {
         assert_eq!(
             validate_claude_swap_operation(
                 ClaudeSwapAccountOperation::Switch,
+                ClaudeSwapAccountSource::ClaudeSwap,
                 &blocked,
                 &blocked.accounts[0]
             ),
@@ -484,6 +537,7 @@ mod tests {
         assert_eq!(
             validate_claude_swap_operation(
                 ClaudeSwapAccountOperation::Switch,
+                ClaudeSwapAccountSource::ClaudeSwap,
                 &inactive,
                 &inactive.accounts[0]
             ),
@@ -493,6 +547,7 @@ mod tests {
         assert_eq!(
             validate_claude_swap_operation(
                 ClaudeSwapAccountOperation::Reauthenticate,
+                ClaudeSwapAccountSource::ClaudeSwap,
                 &foreign,
                 &foreign.accounts[0]
             ),
@@ -503,10 +558,41 @@ mod tests {
         assert!(
             validate_claude_swap_operation(
                 ClaudeSwapAccountOperation::Reauthenticate,
+                ClaudeSwapAccountSource::ClaudeSwap,
                 &switching,
                 &switching.accounts[0]
             )
             .is_ok()
+        );
+    }
+
+    /// tcr is refused even when a list claims switching support, so a switch
+    /// can never run `cswap` arguments against the tcr executable.
+    #[test]
+    fn tcr_source_rejects_switch_and_reauthenticate() {
+        let expected = Err(
+            "tcr picks the account for each request; CodexBar does not switch its accounts."
+                .to_string(),
+        );
+        let switchable = account_list(false, "ok", true);
+        assert_eq!(
+            validate_claude_swap_operation(
+                ClaudeSwapAccountOperation::Switch,
+                ClaudeSwapAccountSource::Tcr,
+                &switchable,
+                &switchable.accounts[0]
+            ),
+            expected
+        );
+        let foreign = account_list(true, "foreign_credential", true);
+        assert_eq!(
+            validate_claude_swap_operation(
+                ClaudeSwapAccountOperation::Reauthenticate,
+                ClaudeSwapAccountSource::Tcr,
+                &foreign,
+                &foreign.accounts[0]
+            ),
+            expected
         );
     }
 

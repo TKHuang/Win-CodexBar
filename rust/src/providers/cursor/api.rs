@@ -4,12 +4,19 @@
 
 use super::team_budget::CursorMemberBudget;
 use crate::core::{CostSnapshot, NamedRateWindow, ProviderError, RateWindow};
-use crate::providers::browser_cookie_header;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 const BASE_URL: &str = "https://cursor.com";
-const COOKIE_DOMAINS: [&str; 2] = ["cursor.com", "cursor.sh"];
+pub(super) const GROK_BOT_WINDOW_ID: &str = "cursor-grok-bot";
+pub(super) const GROK_BOT_TITLE: &str = "Grok Bot";
+/// Optional monthly additional spend for unified personal memberships.
+const UNIFIED_USAGE_PATH: &str = "/api/dashboard/v2/usage-status";
+const UNIFIED_USAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// A 7-day shared pool; monthly billing cycles never span exactly this length.
+const WEEKLY_POOL_WINDOW_MINUTES: u32 = 7 * 24 * 60;
+/// Primary label once the shared weekly pool drives the main meter (upstream `"Weekly"`).
+pub(super) const SHARED_WEEKLY_POOL_LABEL: &str = "Weekly";
 
 #[derive(Debug)]
 pub struct CursorUsageResult {
@@ -20,6 +27,28 @@ pub struct CursorUsageResult {
     pub(super) email: Option<String>,
     pub(super) plan_type: Option<String>,
     pub(super) grok_bot: Option<NamedRateWindow>,
+    /// Overrides the primary label; `None` keeps the shared spec label.
+    pub(super) primary_label: Option<&'static str>,
+}
+
+/// Applies the sand usage feed to a built result. The Grok Bot allowance is
+/// best-effort. A usable unified weekly pool replaces the monthly primary,
+/// Auto and API lanes, and the Grok Bot extra it would duplicate. On-demand
+/// cost is untouched.
+fn apply_sand_usage(
+    result: &mut CursorUsageResult,
+    sand: Option<&SandUsageStatus>,
+    now: DateTime<Utc>,
+) {
+    result.grok_bot = sand.and_then(|status| status.to_window(now));
+    let Some(pool) = sand.and_then(|status| status.shared_weekly_pool(now)) else {
+        return;
+    };
+    result.primary = pool;
+    result.secondary = None;
+    result.model_specific = None;
+    result.grok_bot = None;
+    result.primary_label = Some(SHARED_WEEKLY_POOL_LABEL);
 }
 
 /// Cursor API client
@@ -56,13 +85,6 @@ impl CursorApi {
         &self.base_url
     }
 
-    /// Fetch usage information from Cursor API
-    pub async fn fetch_usage(&self) -> Result<CursorUsageResult, ProviderError> {
-        // Try to get cookies from browser
-        let cookie_header = self.get_cookie_header()?;
-        self.fetch_usage_with_cookie_header(&cookie_header).await
-    }
-
     /// Fetch usage information with an already resolved Cookie header.
     pub async fn fetch_usage_with_cookie_header(
         &self,
@@ -76,18 +98,46 @@ impl CursorApi {
         );
 
         let usage_summary = usage_result?;
+        let unified_personal = usage_summary.uses_unified_personal_billing();
         let user_info = user_result.ok();
         let team_budget = self
             .resolve_team_budget(&usage_summary, user_info.as_ref(), cookie_header)
             .await;
-        let mut result =
-            self.build_result_with_team_budget(usage_summary, user_info, team_budget)?;
-        result.grok_bot = sand_result.ok().flatten();
+        let mut result = self.build_result_with_team_budget(usage_summary, user_info, team_budget);
+        apply_sand_usage(&mut result, sand_result.ok().flatten().as_ref(), Utc::now());
+        if unified_personal && let Some(cost) = self.fetch_unified_monthly_cost(cookie_header).await
+        {
+            // Upstream #4593: the monthly billing read replaces the summary's
+            // spend, cap and reset. Without a valid read the summary values stay.
+            result.cost = Some(cost);
+        }
         Ok(result)
     }
 
-    fn get_cookie_header(&self) -> Result<String, ProviderError> {
-        browser_cookie_header(&COOKIE_DOMAINS)
+    /// Optional monthly additional spend for unified personal memberships.
+    /// Every failure collapses to `None` so the usage-summary values remain.
+    async fn fetch_unified_monthly_cost(&self, cookie_header: &str) -> Option<CostSnapshot> {
+        let url = format!("{}{UNIFIED_USAGE_PATH}", self.base_url);
+        let status = self
+            .client
+            .get(&url)
+            .query(&[("scope", "user")])
+            .header("Cookie", cookie_header)
+            .header("Accept", "application/json")
+            .timeout(UNIFIED_USAGE_TIMEOUT)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .ok()?
+            .json::<UnifiedUsageStatus>()
+            .await;
+        match status {
+            Ok(status) => unified_monthly_cost(&status, Utc::now()),
+            Err(err) => {
+                tracing::debug!("Cursor unified additional spend unavailable: {err}");
+                None
+            }
+        }
     }
 
     async fn fetch_usage_summary(
@@ -133,7 +183,7 @@ impl CursorApi {
     async fn fetch_sand_usage(
         &self,
         cookie_header: &str,
-    ) -> Result<Option<NamedRateWindow>, ProviderError> {
+    ) -> Result<Option<SandUsageStatus>, ProviderError> {
         let url = format!("{}/api/dashboard/get-sand-usage-status", self.base_url);
         let response = self
             .client
@@ -153,7 +203,7 @@ impl CursorApi {
             .json()
             .await
             .map_err(|e| ProviderError::Parse(e.to_string()))?;
-        Ok(status.to_window(Utc::now()))
+        Ok(Some(status))
     }
 
     async fn fetch_user_info(&self, cookie_header: &str) -> Result<UserInfo, ProviderError> {
@@ -185,7 +235,7 @@ impl CursorApi {
         summary: UsageSummary,
         user_info: Option<UserInfo>,
         team_budget: Option<CursorMemberBudget>,
-    ) -> Result<CursorUsageResult, ProviderError> {
+    ) -> CursorUsageResult {
         let billing_end = summary
             .billing_cycle_end
             .as_ref()
@@ -203,20 +253,7 @@ impl CursorApi {
         let (percent_used, secondary, model_specific, cost_snapshot) =
             if let Some(team_budget) = team_budget {
                 let percent = clamp_percent(team_budget.used_usd / team_budget.limit_usd * 100.0);
-                let cost = Self::on_demand_cost(
-                    summary
-                        .individual_usage
-                        .as_ref()
-                        .and_then(|individual| individual.on_demand.as_ref()),
-                    billing_end,
-                )
-                .or_else(|| {
-                    summary
-                        .team_usage
-                        .as_ref()
-                        .and_then(|team| Self::on_demand_cost(team.on_demand.as_ref(), billing_end))
-                })
-                .or_else(|| {
+                let cost = Self::summary_on_demand_cost(&summary, billing_end).or_else(|| {
                     Some(Self::plan_cost(
                         team_budget.used_usd,
                         team_budget.limit_usd,
@@ -251,13 +288,8 @@ impl CursorApi {
                         RateWindow::with_details(clamp_percent(v), cycle_minutes, billing_end, None)
                     });
 
-                    let cost = Self::on_demand_cost(individual.on_demand.as_ref(), billing_end)
-                        .or_else(|| {
-                            summary.team_usage.as_ref().and_then(|team| {
-                                Self::on_demand_cost(team.on_demand.as_ref(), billing_end)
-                            })
-                        })
-                        .unwrap_or_else(|| {
+                    let cost =
+                        Self::summary_on_demand_cost(&summary, billing_end).unwrap_or_else(|| {
                             // Plan-included spend (cents → USD) when on-demand is off.
                             Self::plan_cost(
                                 used_cents / 100.0,
@@ -302,7 +334,7 @@ impl CursorApi {
 
         let email = user_info.as_ref().and_then(|u| u.email.clone());
 
-        Ok(CursorUsageResult {
+        CursorUsageResult {
             primary,
             secondary,
             model_specific,
@@ -310,7 +342,8 @@ impl CursorApi {
             email,
             plan_type,
             grok_bot: None,
-        })
+            primary_label: None,
+        }
     }
 
     fn plan_cost(
@@ -329,6 +362,23 @@ impl CursorApi {
         cost
     }
 
+    /// Individual on-demand spend, else the team's.
+    fn summary_on_demand_cost(
+        summary: &UsageSummary,
+        billing_end: Option<DateTime<Utc>>,
+    ) -> Option<CostSnapshot> {
+        let individual = summary
+            .individual_usage
+            .as_ref()
+            .and_then(|individual| individual.on_demand.as_ref());
+        Self::on_demand_cost(individual, billing_end).or_else(|| {
+            summary
+                .team_usage
+                .as_ref()
+                .and_then(|team| Self::on_demand_cost(team.on_demand.as_ref(), billing_end))
+        })
+    }
+
     fn on_demand_cost(
         on_demand: Option<&OnDemandUsage>,
         billing_end: Option<DateTime<Utc>>,
@@ -338,15 +388,7 @@ impl CursorApi {
             return None;
         }
 
-        let used_cents = usage.used.unwrap_or(0) as f64;
-        let limit_cents = usage
-            .limit
-            .or_else(|| {
-                usage
-                    .remaining
-                    .map(|remaining| remaining + usage.used.unwrap_or(0))
-            })
-            .unwrap_or(0) as f64;
+        let (used_cents, limit_cents) = usage.used_and_limit_cents();
 
         if used_cents <= 0.0 && limit_cents <= 0.0 {
             return None;
@@ -365,15 +407,7 @@ impl CursorApi {
     }
 
     fn usage_percent(usage: &OnDemandUsage) -> Option<f64> {
-        let used = usage.used.unwrap_or(0) as f64;
-        let limit = usage
-            .limit
-            .or_else(|| {
-                usage
-                    .remaining
-                    .map(|remaining| remaining + usage.used.unwrap_or(0))
-            })
-            .unwrap_or(0) as f64;
+        let (used, limit) = usage.used_and_limit_cents();
         (limit > 0.0).then_some(clamp_percent(used / limit * 100.0))
     }
 }
@@ -415,6 +449,18 @@ pub(super) struct UsageSummary {
 }
 
 impl UsageSummary {
+    /// Upstream `usesUnifiedPersonalBilling`: unified membership with a
+    /// user-level limit. Team budgets keep their own path.
+    pub(super) fn uses_unified_personal_billing(&self) -> bool {
+        self.membership_type
+            .as_deref()
+            .is_some_and(|membership| membership.to_ascii_lowercase().starts_with("unified_"))
+            && self
+                .limit_type
+                .as_deref()
+                .is_some_and(|limit_type| limit_type.eq_ignore_ascii_case("user"))
+    }
+
     pub(super) fn is_team_plan(&self) -> bool {
         matches!(
             self.membership_type
@@ -467,6 +513,18 @@ struct OnDemandUsage {
     remaining: Option<i64>,
 }
 
+impl OnDemandUsage {
+    /// (used, limit) in cents; a missing limit falls back to remaining + used.
+    fn used_and_limit_cents(&self) -> (f64, f64) {
+        let used = self.used.unwrap_or(0);
+        let limit = self
+            .limit
+            .or_else(|| self.remaining.map(|remaining| remaining + used))
+            .unwrap_or(0);
+        (used as f64, limit as f64)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct TeamUsage {
@@ -483,9 +541,25 @@ struct SandUsageStatus {
     has_non_zero_included_limit: Option<bool>,
     included_limit_zero: Option<bool>,
     sand_trial_expires_at: Option<String>,
+    /// The X Subscription shares this weekly pool across Cursor and Grok products.
+    is_unified: Option<bool>,
 }
 
 impl SandUsageStatus {
+    /// Upstream `CursorStatusSnapshot.toUsageSnapshot` (#4695): a unified pool
+    /// with a 7-day window and a reset still in the future becomes the main
+    /// meter. Trial-only, expired, non-unified and other-length pools return
+    /// `None`, so the monthly layout stays.
+    fn shared_weekly_pool(&self, now: DateTime<Utc>) -> Option<RateWindow> {
+        if self.is_unified != Some(true) {
+            return None;
+        }
+        let window = self.to_window(now)?.window;
+        (window.window_minutes == Some(WEEKLY_POOL_WINDOW_MINUTES)
+            && window.resets_at.is_some_and(|reset| reset > now))
+        .then_some(window)
+    }
+
     fn to_window(&self, now: DateTime<Utc>) -> Option<NamedRateWindow> {
         let has_limit = self
             .included_limit_zero
@@ -524,11 +598,54 @@ impl SandUsageStatus {
             (minutes > 0).then_some(minutes_u32)
         });
         Some(NamedRateWindow::new(
-            "cursor-grok-bot",
-            "Grok Bot",
+            GROK_BOT_WINDOW_ID,
+            GROK_BOT_TITLE,
             RateWindow::with_details(used, minutes, reset, None),
         ))
     }
+}
+
+/// `/api/dashboard/v2/usage-status?scope=user`. Fields stay optional so a
+/// missing or null value makes the response invalid instead of a zero.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UnifiedUsageStatus {
+    availability: Option<String>,
+    monthly_usage: Option<UnifiedMonthlyUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UnifiedMonthlyUsage {
+    used_cents: Option<f64>,
+    limit_cents: Option<f64>,
+    period_start: Option<String>,
+    resets_at: Option<String>,
+}
+
+/// Monthly additional spend as a cost snapshot, or `None` when the response is
+/// unavailable, malformed, or outside its period. A valid zero stays zero.
+fn unified_monthly_cost(status: &UnifiedUsageStatus, now: DateTime<Utc>) -> Option<CostSnapshot> {
+    if status.availability.as_deref() != Some("available") {
+        return None;
+    }
+    let usage = status.monthly_usage.as_ref()?;
+    let used_cents = usage.used_cents?;
+    let limit_cents = usage.limit_cents?;
+    if !used_cents.is_finite() || used_cents < 0.0 || !limit_cents.is_finite() || limit_cents < 0.0
+    {
+        return None;
+    }
+    let start = parse_iso_date(usage.period_start.as_deref()?)?;
+    let reset = parse_iso_date(usage.resets_at.as_deref()?)?;
+    if start > now || now >= reset {
+        return None;
+    }
+    let mut cost = CostSnapshot::new(used_cents / 100.0, "USD", "On-demand (monthly)");
+    if limit_cents > 0.0 {
+        cost = cost.with_limit(limit_cents / 100.0);
+    }
+    Some(cost.with_resets_at(reset))
 }
 
 #[derive(Debug, Deserialize)]
@@ -571,17 +688,9 @@ fn billing_cycle_window_minutes(
 }
 
 fn parse_iso_date(s: &str) -> Option<DateTime<Utc>> {
-    // Try with fractional seconds
-    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-        return Some(dt.with_timezone(&Utc));
-    }
-
-    // Try without fractional seconds
-    if let Ok(dt) = chrono::DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%SZ") {
-        return Some(dt.with_timezone(&Utc));
-    }
-
-    None
+    DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
 }
 
 fn capitalize(s: &str) -> String {
@@ -593,442 +702,4 @@ fn capitalize(s: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn api() -> CursorApi {
-        CursorApi::new()
-    }
-
-    fn parse_summary(json: &str) -> UsageSummary {
-        serde_json::from_str(json).expect("fixture should parse")
-    }
-
-    #[test]
-    fn sand_usage_maps_to_weekly_extra_window() {
-        let status = SandUsageStatus {
-            current_period_start: Some("2026-08-18T00:00:00Z".into()),
-            next_reset_timestamp_utc: Some("2026-08-25T00:00:00Z".into()),
-            usage_percent: Some(37.5),
-            has_non_zero_included_limit: Some(true),
-            included_limit_zero: None,
-            sand_trial_expires_at: None,
-        };
-        let row = status
-            .to_window("2026-08-20T00:00:00Z".parse().unwrap())
-            .expect("grok bot window");
-        assert_eq!(row.id, "cursor-grok-bot");
-        assert_eq!(row.title, "Grok Bot");
-        assert!((row.window.used_percent - 37.5).abs() < 0.001);
-        assert_eq!(row.window.window_minutes, Some(10080));
-    }
-
-    #[test]
-    fn sand_usage_hides_accounts_without_included_allowance() {
-        let status = SandUsageStatus {
-            current_period_start: None,
-            next_reset_timestamp_utc: None,
-            usage_percent: Some(0.0),
-            has_non_zero_included_limit: Some(false),
-            included_limit_zero: None,
-            sand_trial_expires_at: None,
-        };
-        assert!(
-            status
-                .to_window("2026-08-20T00:00:00Z".parse().unwrap())
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn sand_usage_maps_paid_allowance_from_explicit_zero_flag() {
-        let status = SandUsageStatus {
-            current_period_start: Some("2026-08-18T00:00:00Z".into()),
-            next_reset_timestamp_utc: Some("2026-08-25T00:00:00Z".into()),
-            usage_percent: Some(37.5),
-            has_non_zero_included_limit: Some(false),
-            included_limit_zero: Some(false),
-            sand_trial_expires_at: None,
-        };
-        let row = status
-            .to_window("2026-08-20T00:00:00Z".parse().unwrap())
-            .expect("paid Grok Bot window");
-        assert_eq!(row.window.window_minutes, Some(10080));
-        assert_eq!(
-            row.window.resets_at,
-            Some("2026-08-25T00:00:00Z".parse().unwrap())
-        );
-    }
-
-    #[test]
-    fn sand_usage_maps_an_active_trial_without_a_recurring_reset() {
-        let status = SandUsageStatus {
-            current_period_start: Some("2026-08-18T00:00:00Z".into()),
-            next_reset_timestamp_utc: Some("2026-08-25T00:00:00Z".into()),
-            usage_percent: Some(12.5),
-            has_non_zero_included_limit: Some(false),
-            included_limit_zero: Some(true),
-            sand_trial_expires_at: Some("2026-08-28T00:00:00Z".into()),
-        };
-        let row = status
-            .to_window("2026-08-20T00:00:00Z".parse().unwrap())
-            .expect("active trial window");
-        assert_eq!(row.window.resets_at, None);
-        assert_eq!(row.window.window_minutes, None);
-        assert!((row.window.used_percent - 12.5).abs() < 0.001);
-    }
-
-    #[test]
-    fn sand_usage_hides_expired_trial() {
-        let status = SandUsageStatus {
-            current_period_start: None,
-            next_reset_timestamp_utc: None,
-            usage_percent: Some(12.5),
-            has_non_zero_included_limit: Some(false),
-            included_limit_zero: Some(true),
-            sand_trial_expires_at: Some("2026-08-19T00:00:00Z".into()),
-        };
-        assert!(
-            status
-                .to_window("2026-08-20T00:00:00Z".parse().unwrap())
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn test_cursor_build_result_with_lanes() {
-        let json = r#"{
-            "billingCycleStart": "2026-03-01T00:00:00Z",
-            "billingCycleEnd": "2026-04-01T00:00:00Z",
-            "membershipType": "pro",
-            "individualUsage": {
-                "plan": {
-                    "used": 1500,
-                    "limit": 5000,
-                    "totalPercentUsed": 30.0,
-                    "autoPercentUsed": 20.0,
-                    "apiPercentUsed": 10.0
-                }
-            }
-        }"#;
-
-        let summary = parse_summary(json);
-        let result = api()
-            .build_result_with_team_budget(summary, None, None)
-            .unwrap();
-
-        assert!((result.primary.used_percent - 30.0).abs() < 0.01);
-
-        let sec = result.secondary.expect("secondary should be present");
-        assert!((sec.used_percent - 20.0).abs() < 0.01);
-        assert!(sec.resets_at.is_some());
-
-        let ms = result
-            .model_specific
-            .expect("model_specific should be present");
-        assert!((ms.used_percent - 10.0).abs() < 0.01);
-        assert!(ms.resets_at.is_some());
-
-        assert!(result.cost.is_some());
-        assert_eq!(result.plan_type.as_deref(), Some("Cursor Pro"));
-    }
-
-    /// Upstream `CursorSandUsageStatus.windowMinutes(start:end:)`: the plan
-    /// bars carry the billing-cycle length so reset-window pace can score them.
-    #[test]
-    fn plan_lanes_carry_the_billing_cycle_length() {
-        let json = r#"{
-            "billingCycleStart": "2026-02-01T00:00:00Z",
-            "billingCycleEnd": "2026-03-01T00:00:00Z",
-            "membershipType": "pro",
-            "individualUsage": {
-                "plan": {
-                    "used": 1500,
-                    "limit": 5000,
-                    "totalPercentUsed": 30.0,
-                    "autoPercentUsed": 20.0,
-                    "apiPercentUsed": 10.0
-                }
-            }
-        }"#;
-        let result = api()
-            .build_result_with_team_budget(parse_summary(json), None, None)
-            .unwrap();
-        assert_eq!(result.primary.window_minutes, Some(40_320));
-        assert_eq!(result.secondary.expect("auto").window_minutes, Some(40_320));
-        assert_eq!(
-            result.model_specific.expect("api").window_minutes,
-            Some(40_320)
-        );
-    }
-
-    #[test]
-    fn billing_cycle_length_rounds_to_the_nearest_minute_and_needs_both_ends() {
-        let start = parse_iso_date("2026-02-01T00:00:00Z");
-        let end = parse_iso_date("2026-03-01T00:00:31Z");
-        assert_eq!(billing_cycle_window_minutes(start, end), Some(40_321));
-        let end = parse_iso_date("2026-03-01T00:00:29Z");
-        assert_eq!(billing_cycle_window_minutes(start, end), Some(40_320));
-        assert_eq!(billing_cycle_window_minutes(None, end), None);
-        assert_eq!(billing_cycle_window_minutes(start, None), None);
-        // A cycle that ends before it starts has no length.
-        assert_eq!(billing_cycle_window_minutes(end, start), None);
-    }
-
-    #[test]
-    fn plan_lanes_without_a_cycle_start_have_no_length() {
-        let json = r#"{
-            "billingCycleEnd": "2026-03-01T00:00:00Z",
-            "membershipType": "pro",
-            "individualUsage": { "plan": { "used": 1500, "limit": 5000 } }
-        }"#;
-        let result = api()
-            .build_result_with_team_budget(parse_summary(json), None, None)
-            .unwrap();
-        assert_eq!(result.primary.window_minutes, None);
-    }
-
-    #[test]
-    fn clamps_plan_usage_percent_at_100_when_over_limit() {
-        // Upstream #2255: included usage past limit must not paint >100%.
-        let json = r#"{
-            "membershipType": "pro",
-            "individualUsage": {
-                "plan": {
-                    "used": 6000,
-                    "limit": 5000,
-                    "totalPercentUsed": 120.0,
-                    "autoPercentUsed": 110.0,
-                    "apiPercentUsed": 105.0
-                }
-            }
-        }"#;
-        let summary = parse_summary(json);
-        let result = api()
-            .build_result_with_team_budget(summary, None, None)
-            .unwrap();
-        assert!((result.primary.used_percent - 100.0).abs() < 0.01);
-        assert!((result.secondary.unwrap().used_percent - 100.0).abs() < 0.01);
-        assert!((result.model_specific.unwrap().used_percent - 100.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_cursor_build_result_prefers_api_percent_fields() {
-        let json = r#"{
-            "membershipType": "pro",
-            "autoModelSelectedDisplayMessage": "You've used 13% of your included total usage",
-            "individualUsage": {
-                "plan": {
-                    "used": 2000,
-                    "limit": 2000,
-                    "breakdown": {
-                        "included": 2000,
-                        "bonus": 580,
-                        "total": 2580
-                    },
-                    "autoPercentUsed": 17.2,
-                    "apiPercentUsed": 0,
-                    "totalPercentUsed": 13.230769230769232
-                }
-            }
-        }"#;
-
-        let summary = parse_summary(json);
-        let result = api()
-            .build_result_with_team_budget(summary, None, None)
-            .unwrap();
-
-        assert!((result.primary.used_percent - 13.230769230769232).abs() < 0.01);
-        assert!((result.secondary.unwrap().used_percent - 17.2).abs() < 0.01);
-        assert!((result.model_specific.unwrap().used_percent - 0.0).abs() < 0.01);
-
-        let cost = result
-            .cost
-            .expect("plan usage should still produce cost snapshot");
-        assert!((cost.used - 20.0).abs() < 0.01);
-        assert_eq!(cost.limit, Some(20.0));
-        assert_eq!(result.plan_type.as_deref(), Some("Cursor Pro"));
-    }
-
-    #[test]
-    fn test_cursor_build_result_cents_only() {
-        let json = r#"{
-            "billingCycleEnd": "2026-04-01T00:00:00Z",
-            "membershipType": "pro",
-            "individualUsage": {
-                "plan": {
-                    "used": 2500,
-                    "limit": 5000
-                }
-            }
-        }"#;
-
-        let summary = parse_summary(json);
-        let result = api()
-            .build_result_with_team_budget(summary, None, None)
-            .unwrap();
-
-        assert!((result.primary.used_percent - 50.0).abs() < 0.01);
-        assert!(result.secondary.is_none(), "no autoPercentUsed in payload");
-        assert!(
-            result.model_specific.is_none(),
-            "no apiPercentUsed in payload"
-        );
-        assert!(result.cost.is_some());
-    }
-
-    #[test]
-    fn test_cursor_build_result_missing_plan() {
-        let json = r#"{
-            "membershipType": "hobby",
-            "individualUsage": {}
-        }"#;
-
-        let summary = parse_summary(json);
-        let result = api()
-            .build_result_with_team_budget(summary, None, None)
-            .unwrap();
-
-        assert!((result.primary.used_percent).abs() < 0.01);
-        assert!(result.secondary.is_none());
-        assert!(result.model_specific.is_none());
-        assert!(result.cost.is_none());
-    }
-
-    #[test]
-    fn test_cursor_on_demand_as_cost() {
-        let json = r#"{
-            "billingCycleEnd": "2026-04-01T00:00:00Z",
-            "membershipType": "pro",
-            "individualUsage": {
-                "plan": {
-                    "used": 800,
-                    "limit": 5000,
-                    "totalPercentUsed": 16.0
-                },
-                "onDemand": {
-                    "enabled": true,
-                    "used": 350,
-                    "limit": 1000
-                }
-            }
-        }"#;
-
-        let summary = parse_summary(json);
-        let result = api()
-            .build_result_with_team_budget(summary, None, None)
-            .unwrap();
-
-        assert!((result.primary.used_percent - 16.0).abs() < 0.01);
-        let cost = result.cost.expect("cost should exist from on-demand usage");
-        assert!((cost.used - 3.5).abs() < 0.01);
-        assert_eq!(cost.limit, Some(10.0));
-        assert_eq!(cost.period, "On-demand (billing cycle)");
-    }
-
-    #[test]
-    fn plan_cost_period_uses_billing_cycle_start() {
-        let json = r#"{
-            "billingCycleStart": "2026-03-01T00:00:00Z",
-            "billingCycleEnd": "2026-04-01T00:00:00Z",
-            "membershipType": "pro",
-            "individualUsage": {
-                "plan": {
-                    "used": 2500,
-                    "limit": 5000
-                }
-            }
-        }"#;
-        let summary = parse_summary(json);
-        let result = api()
-            .build_result_with_team_budget(summary, None, None)
-            .unwrap();
-        let cost = result.cost.expect("plan cost");
-        assert!((cost.used - 25.0).abs() < 0.01);
-        assert_eq!(cost.limit, Some(50.0));
-        assert_eq!(
-            cost.period,
-            "Cursor and Third Party (since 2026-03-01T00:00:00Z)"
-        );
-    }
-
-    #[test]
-    fn test_cursor_individual_overall_fallback() {
-        let summary =
-            parse_summary(r#"{"individualUsage":{"overall":{"used":2500,"limit":10000}}}"#);
-        let result = api()
-            .build_result_with_team_budget(summary, None, None)
-            .unwrap();
-        assert!((result.primary.used_percent - 25.0).abs() < 0.01);
-        assert_eq!(result.cost.unwrap().limit, Some(100.0));
-    }
-
-    #[test]
-    fn test_cursor_team_pooled_fallback() {
-        let summary = parse_summary(r#"{"teamUsage":{"pooled":{"used":5000,"limit":10000}}}"#);
-        let result = api()
-            .build_result_with_team_budget(summary, None, None)
-            .unwrap();
-        assert!((result.primary.used_percent - 50.0).abs() < 0.01);
-        assert_eq!(result.cost.unwrap().used, 50.0);
-    }
-
-    #[test]
-    fn member_lookup_requires_nonempty_authenticated_email() {
-        for email in [None, Some(String::new()), Some("  ".to_string())] {
-            let user = UserInfo {
-                email,
-                email_verified: None,
-                name: None,
-                sub: None,
-                created_at: None,
-                updated_at: None,
-                picture: None,
-            };
-            assert!(user.verified_email().is_none());
-        }
-    }
-
-    #[test]
-    fn verified_team_budget_replaces_summary_plan_and_keeps_zero_summary_fallback() {
-        let summary = parse_summary(
-            r#"{
-                "billingCycleStart":"2026-09-01T00:00:00Z",
-                "billingCycleEnd":"2026-10-01T00:00:00Z",
-                "membershipType":"enterprise",
-                "individualUsage":{"plan":{"used":0,"limit":2000,"totalPercentUsed":0}}
-            }"#,
-        );
-        let result = api()
-            .build_result_with_team_budget(
-                summary,
-                None,
-                Some(CursorMemberBudget {
-                    used_usd: 13.12,
-                    limit_usd: 150.0,
-                }),
-            )
-            .unwrap();
-        assert!((result.primary.used_percent - 8.7466666667).abs() < 0.00001);
-        let cost = result.cost.expect("verified member budget cost");
-        assert!((cost.used - 13.12).abs() < 0.00001);
-        assert_eq!(cost.limit, Some(150.0));
-
-        let fallback_summary = parse_summary(
-            r#"{
-                "billingCycleStart":"2026-09-01T00:00:00Z",
-                "billingCycleEnd":"2026-10-01T00:00:00Z",
-                "membershipType":"enterprise",
-                "individualUsage":{"plan":{"used":0,"limit":2000,"totalPercentUsed":0}}
-            }"#,
-        );
-        let fallback = api()
-            .build_result_with_team_budget(fallback_summary, None, None)
-            .unwrap();
-        assert_eq!(fallback.primary.used_percent, 0.0);
-        assert_eq!(
-            fallback.cost.expect("summary fallback cost").limit,
-            Some(20.0)
-        );
-    }
-}
+mod tests;

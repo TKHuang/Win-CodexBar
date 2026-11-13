@@ -5,6 +5,7 @@
 //! gRPC-web endpoint. Browser cookies use the gRPC-web endpoint only.
 
 pub mod accounts;
+mod acp;
 mod billing;
 mod credits_proxy;
 pub mod local_sessions;
@@ -22,7 +23,7 @@ use std::os::windows::process::CommandExt;
 
 use crate::core::{
     CostSnapshot, FetchContext, Provider, ProviderError, ProviderFetchResult, ProviderId,
-    ProviderInventoryItem, ProviderMetadata, RateWindow, SourceMode, UsageSnapshot,
+    ProviderInventoryItem, RateWindow, SourceMode, UsageSnapshot,
 };
 
 use self::accounts::{GrokAuthKind, ParsedGrokAuthFile};
@@ -36,6 +37,9 @@ const REMAINING_RESETS_ENDPOINT: &str =
 const CLI_SETTINGS_ENDPOINT: &str = "https://cli-chat-proxy.grok.com/v1/settings";
 const RESET_CREDITS_TIMEOUT: Duration = Duration::from_secs(2);
 const RESET_CREDITS_JOIN_GRACE: Duration = Duration::from_millis(250);
+const GROK_CLI_ACP_ARGS: [&str; 2] = ["agent", "stdio"];
+/// Shown to the user when no usable Grok login is left after every auto step.
+const GROK_SIGN_IN_HINT: &str = "Grok sign-in required. Run `grok login`, then refresh CodexBar.";
 
 /// Reset-window pace (upstream `GrokProviderDescriptor.pace`, v0.70.0): weekly
 /// windows inside their length, see [`reset_window_pace_matches`].
@@ -45,34 +49,64 @@ pub(crate) const PACE_CAPABILITY: crate::core::ProviderPaceCapability =
     ));
 
 pub struct GrokProvider {
-    metadata: ProviderMetadata,
     client: Client,
     billing_endpoint: String,
     credits_proxy_endpoint: String,
+    cli_billing: CliBillingRunner,
+}
+
+/// Where the ACP billing fallback gets its answer. `Installed` runs the Grok
+/// CLI; tests substitute a scripted child process or a fake to pin the
+/// fallback ordering.
+#[derive(Clone)]
+enum CliBillingRunner {
+    Installed,
+    #[cfg(test)]
+    Process {
+        program: PathBuf,
+        args: Vec<String>,
+        timeouts: acp::AcpTimeouts,
+    },
+    #[cfg(test)]
+    Fake(std::sync::Arc<dyn Fn() -> Result<BearerBilling, ProviderError> + Send + Sync>),
+}
+
+impl CliBillingRunner {
+    async fn fetch(&self) -> Result<BearerBilling, ProviderError> {
+        match self {
+            Self::Installed => {
+                // The native installer puts grok under ~/.grok/bin, which is
+                // often not on PATH. The login flow's resolver checks that
+                // location first, so the ACP fallback uses the same answer.
+                let program = accounts::login::executable()
+                    .map_err(|_| ProviderError::NotInstalled(acp::CLI_NOT_FOUND.to_string()))?;
+                acp::fetch_billing(&program, &GROK_CLI_ACP_ARGS, acp::AcpTimeouts::default()).await
+            }
+            #[cfg(test)]
+            Self::Process {
+                program,
+                args,
+                timeouts,
+            } => {
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                acp::fetch_billing(program, &args, *timeouts).await
+            }
+            #[cfg(test)]
+            Self::Fake(run) => run(),
+        }
+    }
 }
 
 impl GrokProvider {
     pub fn new() -> Self {
         Self {
-            metadata: ProviderMetadata {
-                id: ProviderId::Grok,
-                display_name: "Grok",
-                session_label: "Credits",
-                weekly_label: "On-demand",
-                supports_opus: false,
-                supports_credits: false,
-                default_enabled: false,
-                is_primary: false,
-                dashboard_url: Some("https://grok.com/?_s=usage"),
-                status_page_url: Some("https://status.x.ai"),
-                tertiary_label_key: None,
-            },
             client: crate::core::credentialed_http_client_builder()
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
             billing_endpoint: BILLING_ENDPOINT.to_string(),
             credits_proxy_endpoint: CREDITS_PROXY_ENDPOINT.to_string(),
+            cli_billing: CliBillingRunner::Installed,
         }
     }
 
@@ -99,6 +133,30 @@ impl GrokProvider {
     #[cfg(test)]
     fn with_credits_proxy_endpoint_for_tests(mut self, endpoint: String) -> Self {
         self.credits_proxy_endpoint = endpoint;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_acp_process_for_tests(
+        mut self,
+        program: PathBuf,
+        args: Vec<String>,
+        timeouts: acp::AcpTimeouts,
+    ) -> Self {
+        self.cli_billing = CliBillingRunner::Process {
+            program,
+            args,
+            timeouts,
+        };
+        self
+    }
+
+    #[cfg(test)]
+    fn with_cli_billing_for_tests(
+        mut self,
+        run: impl Fn() -> Result<BearerBilling, ProviderError> + Send + Sync + 'static,
+    ) -> Self {
+        self.cli_billing = CliBillingRunner::Fake(std::sync::Arc::new(run));
         self
     }
 
@@ -138,7 +196,7 @@ impl GrokProvider {
         };
         let credentials = GrokCredentials::parse_for_kind(text, kind)?;
         let result = self
-            .fetch_with_auth(&credentials, kind, &FetchContext::default())
+            .fetch_with_auth(&credentials, kind, &saved_account_usage_context())
             .await?;
         Ok(account_usage_from_result(&result))
     }
@@ -163,7 +221,10 @@ impl GrokProvider {
             billing,
             subscription_tier,
             prepaid_balance_usd,
-        } = match self.fetch_bearer_billing(credentials).await {
+        } = match self
+            .fetch_bearer_or_cli_billing(credentials, kind, ctx)
+            .await
+        {
             Ok(bearer) => bearer,
             Err(error) => {
                 reset_lookup.abort();
@@ -198,6 +259,65 @@ impl GrokProvider {
             Some(credits) => result.with_inventory_item(credits),
             None => result,
         })
+    }
+
+    /// Current billing for a credential. The bearer path (credits proxy, then
+    /// grok.com gRPC-web) runs first. Only when it fails, for the ambient Grok
+    /// CLI login, is the installed CLI asked over ACP (upstream #4595). An
+    /// isolated fetch never reaches the ambient login, so it gets the bearer
+    /// error unchanged.
+    async fn fetch_bearer_or_cli_billing(
+        &self,
+        credentials: &GrokCredentials,
+        kind: GrokAuthKind,
+        ctx: &FetchContext,
+    ) -> Result<BearerBilling, ProviderError> {
+        let error = match self.fetch_bearer_billing(credentials).await {
+            Ok(bearer) => return Ok(bearer),
+            Err(error) => error,
+        };
+        if kind != GrokAuthKind::Cli || ctx.token_account_isolated {
+            return Err(error);
+        }
+        match self.cli_billing.fetch().await {
+            Ok(bearer) => {
+                tracing::debug!("Grok billing answered by the CLI ACP fallback");
+                // A wallet-only ACP answer gets the same bounded percent
+                // enrichment as the credits proxy (upstream #4679).
+                Ok(self.resolve_cli_unknown_usage(bearer, credentials).await)
+            }
+            Err(acp_error) => {
+                // The original error stays the answer, so auto mode still
+                // moves to its next step exactly as before.
+                tracing::debug!("Grok CLI ACP billing fallback failed: {acp_error}");
+                Err(error)
+            }
+        }
+    }
+
+    /// The ambient Grok CLI login is missing or expired, so no credential can
+    /// be sent. The installed CLI may still hold its own valid session, so it
+    /// is asked over ACP as a fallback. Isolated fetches never reach the
+    /// ambient login. When ACP also fails, the original login error is
+    /// returned, not an ACP error.
+    async fn fetch_cli_acp_without_login(
+        &self,
+        login_error: ProviderError,
+        ctx: &FetchContext,
+    ) -> Result<ProviderFetchResult, ProviderError> {
+        if ctx.token_account_isolated || !is_missing_or_expired_login(&login_error) {
+            return Err(login_error);
+        }
+        match self.cli_billing.fetch().await {
+            Ok(bearer) => {
+                tracing::debug!("Grok billing answered by the CLI ACP fallback without a login");
+                Ok(result_from_acp_billing(bearer))
+            }
+            Err(acp_error) => {
+                tracing::debug!("Grok CLI ACP billing fallback failed: {acp_error}");
+                Err(login_error)
+            }
+        }
     }
 
     async fn fetch_cli_subscription_tier(&self, credentials: &GrokCredentials) -> Option<String> {
@@ -260,6 +380,27 @@ impl GrokProvider {
         })
     }
 
+    /// A token-account row may be routed to Cli/OAuth by its usage source
+    /// even though the account only carries a cookie. Ambient ~/.grok
+    /// credentials belong to whichever account is switched in, so never
+    /// read them here.
+    async fn fetch_isolated_account(
+        &self,
+        ctx: &FetchContext,
+    ) -> Result<ProviderFetchResult, ProviderError> {
+        match grok_isolated_route(ctx) {
+            GrokIsolatedRoute::Bearer(token) => {
+                let credentials = GrokCredentials::from_bearer(token);
+                self.fetch_with_auth(&credentials, GrokAuthKind::OAuth, ctx)
+                    .await
+            }
+            GrokIsolatedRoute::Cookie(cookie_header) => {
+                self.fetch_with_cookie(cookie_header, ctx).await
+            }
+            GrokIsolatedRoute::Missing => Err(isolated_account_missing_credential()),
+        }
+    }
+
     async fn fetch_with_oauth_fallback(
         &self,
         credentials: &GrokCredentials,
@@ -285,7 +426,7 @@ impl GrokProvider {
 
     async fn fetch_auto(&self, ctx: &FetchContext) -> Result<ProviderFetchResult, ProviderError> {
         let allow_browser_cookie_fallback = !ctx.auto_prefer_web;
-        for step in grok_auto_steps(
+        for step in grok_steps_for_context(
             ctx.api_key
                 .as_deref()
                 .is_some_and(|token| !token.trim().is_empty()),
@@ -293,6 +434,7 @@ impl GrokProvider {
                 .as_deref()
                 .is_some_and(|cookie| !cookie.trim().is_empty()),
             allow_browser_cookie_fallback,
+            ctx.token_account_isolated,
         ) {
             match step {
                 GrokAutoStep::AmbientOAuth => {
@@ -331,7 +473,29 @@ impl GrokProvider {
         kind: GrokAuthKind,
         ctx: &FetchContext,
     ) -> Option<Result<ProviderFetchResult, ProviderError>> {
-        let credentials = Self::load_credentials(kind).await.ok()?;
+        let loaded = Self::load_credentials(kind).await;
+        self.try_ambient_loaded(kind, loaded, ctx).await
+    }
+
+    /// Auto-mode step for an ambient login that has already been loaded (or
+    /// failed to load). A missing or expired Cli login may still be answered by
+    /// the CLI over ACP; if that fails, the step yields `None` as before.
+    async fn try_ambient_loaded(
+        &self,
+        kind: GrokAuthKind,
+        loaded: Result<GrokCredentials, ProviderError>,
+        ctx: &FetchContext,
+    ) -> Option<Result<ProviderFetchResult, ProviderError>> {
+        let credentials = match loaded {
+            Ok(credentials) => credentials,
+            Err(error) if kind == GrokAuthKind::Cli => {
+                return match self.fetch_cli_acp_without_login(error, ctx).await {
+                    Ok(result) => Some(Ok(result)),
+                    Err(_) => None,
+                };
+            }
+            Err(_) => return None,
+        };
         match self.fetch_with_auth(&credentials, kind, ctx).await {
             Ok(result) => Some(Ok(result)),
             Err(ProviderError::AuthRequired) => None,
@@ -499,7 +663,7 @@ impl GrokProvider {
     }
 
     fn detect_cli_version() -> Option<String> {
-        let mut command = std::process::Command::new("grok");
+        let mut command = std::process::Command::new(accounts::login::executable().ok()?);
         command.arg("--version");
         hide_windows_console(&mut command);
         let output = command.output().ok()?;
@@ -576,38 +740,59 @@ impl Provider for GrokProvider {
         ProviderId::Grok
     }
 
-    fn metadata(&self) -> &ProviderMetadata {
-        &self.metadata
-    }
-
     async fn fetch_usage(&self, ctx: &FetchContext) -> Result<ProviderFetchResult, ProviderError> {
-        match ctx.source_mode {
-            SourceMode::Auto => self.fetch_auto(ctx).await,
-            SourceMode::Web => {
-                if let Some(cookie_header) = &ctx.manual_cookie_header {
-                    return self.fetch_with_cookie(cookie_header, ctx).await;
-                }
-                self.fetch_with_cookie_refresh(ctx).await
-            }
-            SourceMode::Cli => {
-                let credentials = Self::load_credentials(GrokAuthKind::Cli).await?;
-                self.fetch_with_auth(&credentials, GrokAuthKind::Cli, ctx)
-                    .await
-            }
-            SourceMode::OAuth => {
-                // Prefer the switched ~/.grok/auth.json over a leftover token
-                // account so Weekly/notifications follow Grok account Switch.
-                let credentials = match Self::load_credentials(GrokAuthKind::OAuth).await {
-                    Ok(credentials) => credentials,
-                    Err(error) => {
-                        let Some(token) = ctx.api_key.as_deref() else {
-                            return Err(error);
-                        };
-                        GrokCredentials::from_bearer(token)
+        // The sign-in hint is applied to the final result only: auto steps
+        // inside the block still match on `AuthRequired` to fall through.
+        let result: Result<ProviderFetchResult, ProviderError> = async {
+            match ctx.source_mode {
+                SourceMode::Auto => self.fetch_auto(ctx).await,
+                SourceMode::Web if ctx.token_account_isolated => {
+                    match ctx
+                        .manual_cookie_header
+                        .as_deref()
+                        .filter(|cookie| !cookie.trim().is_empty())
+                    {
+                        Some(cookie_header) => self.fetch_with_cookie(cookie_header, ctx).await,
+                        None => Err(isolated_account_missing_credential()),
                     }
-                };
-                self.fetch_with_oauth_fallback(&credentials, ctx).await
+                }
+                SourceMode::Web => {
+                    if let Some(cookie_header) = &ctx.manual_cookie_header {
+                        return self.fetch_with_cookie(cookie_header, ctx).await;
+                    }
+                    self.fetch_with_cookie_refresh(ctx).await
+                }
+                SourceMode::Cli | SourceMode::OAuth if ctx.token_account_isolated => {
+                    self.fetch_isolated_account(ctx).await
+                }
+                SourceMode::Cli => match Self::load_credentials(GrokAuthKind::Cli).await {
+                    Ok(credentials) => {
+                        self.fetch_with_auth(&credentials, GrokAuthKind::Cli, ctx)
+                            .await
+                    }
+                    Err(error) => self.fetch_cli_acp_without_login(error, ctx).await,
+                },
+                SourceMode::OAuth => {
+                    // Prefer the switched ~/.grok/auth.json over a leftover token
+                    // account so Weekly/notifications follow Grok account Switch.
+                    let credentials = match Self::load_credentials(GrokAuthKind::OAuth).await {
+                        Ok(credentials) => credentials,
+                        Err(error) => {
+                            let Some(token) = ctx.api_key.as_deref() else {
+                                return Err(error);
+                            };
+                            GrokCredentials::from_bearer(token)
+                        }
+                    };
+                    self.fetch_with_oauth_fallback(&credentials, ctx).await
+                }
             }
+        }
+        .await;
+        if sign_in_hint_applies(ctx) {
+            result.map_err(sign_in_hint_for_terminal_error)
+        } else {
+            result
         }
     }
 
@@ -618,14 +803,6 @@ impl Provider for GrokProvider {
             SourceMode::OAuth,
             SourceMode::Web,
         ]
-    }
-
-    fn supports_web(&self) -> bool {
-        true
-    }
-
-    fn supports_cli(&self) -> bool {
-        true
     }
 
     fn detect_version(&self) -> Option<String> {
@@ -662,6 +839,65 @@ fn grok_auto_steps(
         steps.push(GrokAutoStep::CookieRefresh);
     }
     steps
+}
+
+/// An isolated token-account fetch (one row per configured account) must
+/// read only that account's credential: the ambient ~/.grok login and the
+/// browser session belong to whichever account is switched in.
+fn grok_steps_for_context(
+    has_api_key: bool,
+    has_manual_cookie: bool,
+    allow_browser_cookie_fallback: bool,
+    token_account_isolated: bool,
+) -> Vec<GrokAutoStep> {
+    let mut steps = grok_auto_steps(
+        has_api_key,
+        has_manual_cookie,
+        allow_browser_cookie_fallback,
+    );
+    if token_account_isolated {
+        steps.retain(|step| matches!(step, GrokAutoStep::ApiKey | GrokAutoStep::ManualCookie));
+    }
+    steps
+}
+
+/// A saved account row is one principal. Its auth text may not be the account
+/// switched into `~/.grok`, so the fetch is marked isolated: it must never
+/// reach the ambient CLI login, including over ACP.
+fn saved_account_usage_context() -> FetchContext {
+    FetchContext {
+        token_account_isolated: true,
+        ..FetchContext::default()
+    }
+}
+
+fn isolated_account_missing_credential() -> ProviderError {
+    ProviderError::Other(
+        "This Grok account has no saved token or cookie. Add one in Settings.".to_string(),
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrokIsolatedRoute<'a> {
+    Bearer(&'a str),
+    Cookie(&'a str),
+    Missing,
+}
+
+fn grok_isolated_route(ctx: &FetchContext) -> GrokIsolatedRoute<'_> {
+    fn non_empty(value: &Option<String>) -> Option<&str> {
+        value
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
+    if let Some(token) = non_empty(&ctx.api_key) {
+        return GrokIsolatedRoute::Bearer(token);
+    }
+    if let Some(cookie_header) = non_empty(&ctx.manual_cookie_header) {
+        return GrokIsolatedRoute::Cookie(cookie_header);
+    }
+    GrokIsolatedRoute::Missing
 }
 
 #[derive(Debug, Clone)]
@@ -900,6 +1136,64 @@ fn result_from_billing(
         )
 }
 
+/// Result for a CLI login-less ACP answer. The CLI answered from its own
+/// login, so no account identity is known and no reset-credit lookup runs
+/// (that lookup needs the token CodexBar does not have).
+fn result_from_acp_billing(bearer: BearerBilling) -> ProviderFetchResult {
+    let BearerBilling {
+        billing,
+        subscription_tier,
+        prepaid_balance_usd,
+    } = bearer;
+    attach_prepaid_balance(
+        result_from_billing(billing, "grok-cli", None, None, subscription_tier),
+        prepaid_balance_usd,
+    )
+}
+
+/// A Cli login that is absent (no auth file or no Cli entry) or expired.
+/// Parse errors are a malformed file, not a missing login, so they do not
+/// qualify for the ACP fallback.
+fn is_missing_or_expired_login(err: &ProviderError) -> bool {
+    matches!(
+        err,
+        ProviderError::AuthRequired | ProviderError::NotInstalled(_)
+    )
+}
+
+/// Maps a sign-in failure that reaches the caller to an error that names the
+/// fix. `OAuth` keeps the NeedsAuthentication state and the auth error
+/// category (the shape Claude uses for a missing login), unlike `NotInstalled`.
+fn sign_in_hint_for_terminal_error(error: ProviderError) -> ProviderError {
+    match error {
+        ProviderError::AuthRequired => ProviderError::OAuth(GROK_SIGN_IN_HINT.to_string()),
+        other => other,
+    }
+}
+
+/// Whether a terminal `AuthRequired` came from the ambient Grok login, so
+/// `grok login` is the fix. A supplied API key or manual cookie answers last on
+/// its route (auto steps return its result; OAuth falls back to the key), and
+/// an isolated account never reads the ambient login, so those keep the
+/// original error. The presence checks mirror each route's own checks.
+fn sign_in_hint_applies(ctx: &FetchContext) -> bool {
+    if ctx.token_account_isolated {
+        return false;
+    }
+    let has_api_key = || ctx.api_key.as_deref().is_some();
+    let has_trimmed = |value: &Option<String>| {
+        value
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+    };
+    match ctx.source_mode {
+        SourceMode::Cli => true,
+        SourceMode::OAuth => !has_api_key(),
+        SourceMode::Web => ctx.manual_cookie_header.is_none(),
+        SourceMode::Auto => !has_trimmed(&ctx.api_key) && !has_trimmed(&ctx.manual_cookie_header),
+    }
+}
+
 /// Whether a cookie-path error should invalidate the cached browser session.
 fn is_cookie_authentication_failure(err: &ProviderError) -> bool {
     matches!(err, ProviderError::AuthRequired)
@@ -938,3 +1232,7 @@ mod credits_proxy_tests;
 #[cfg(test)]
 #[path = "product_usage_tests.rs"]
 mod product_usage_tests;
+
+#[cfg(test)]
+#[path = "cli_fallback_tests.rs"]
+mod cli_fallback_tests;

@@ -1,31 +1,95 @@
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
+use serde_json::Value;
 use std::collections::HashSet;
 
 use crate::core::{NamedRateWindow, RateWindow};
 
 use super::cli_reset::slug_claude_model;
 
-#[derive(Debug, Deserialize)]
+/// Id prefix shared by every model-scoped weekly window (`claude-weekly-scoped-<model>`).
+pub(super) const SCOPED_WEEKLY_ID_PREFIX: &str = "claude-weekly-scoped-";
+
+/// One entry of the `limits` array. Entries are read field by field (see
+/// [`ScopedWeeklyLimit::from_value`]), so a field of the wrong type reads as
+/// missing and cannot drop the entry or its siblings.
+#[derive(Debug, Default)]
 pub(super) struct ScopedWeeklyLimit {
     kind: Option<String>,
     group: Option<String>,
     percent: Option<f64>,
-    #[serde(alias = "resetsAt")]
     resets_at: Option<String>,
     scope: Option<ScopedWeeklyScope>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 struct ScopedWeeklyScope {
     model: Option<ScopedWeeklyModel>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 struct ScopedWeeklyModel {
     id: Option<String>,
-    #[serde(alias = "displayName")]
     display_name: Option<String>,
+}
+
+impl ScopedWeeklyLimit {
+    /// Upstream `ClaudeWebExtraRateWindowParser.scopedWeeklyLimits`: a JSON
+    /// Boolean is never a percentage, and a non-object entry carries no limit
+    /// (every field reads as missing, so no window is built from it).
+    fn from_value(entry: &Value) -> Self {
+        let text = |object: &serde_json::Map<String, Value>, key: &str| {
+            object.get(key).and_then(Value::as_str).map(str::to_owned)
+        };
+        let Some(object) = entry.as_object() else {
+            return Self::default();
+        };
+        let scope = object.get("scope").and_then(Value::as_object).map(|scope| {
+            let model =
+                scope
+                    .get("model")
+                    .and_then(Value::as_object)
+                    .map(|model| ScopedWeeklyModel {
+                        id: text(model, "id"),
+                        display_name: text(model, "display_name")
+                            .or_else(|| text(model, "displayName")),
+                    });
+            ScopedWeeklyScope { model }
+        });
+        Self {
+            kind: text(object, "kind"),
+            group: text(object, "group"),
+            percent: object.get("percent").and_then(Value::as_f64),
+            resets_at: text(object, "resets_at").or_else(|| text(object, "resetsAt")),
+            scope,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ScopedWeeklyLimit {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self::from_value(&Value::deserialize(deserializer)?))
+    }
+}
+
+/// Reads a `limits` value entry by entry. A value that is not an array reads
+/// as no limits; non-object entries are skipped.
+pub(super) fn limits_from_value(value: Value) -> Vec<ScopedWeeklyLimit> {
+    match value {
+        Value::Array(entries) => entries
+            .iter()
+            .filter(|entry| entry.is_object())
+            .map(ScopedWeeklyLimit::from_value)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Serde adapter for the `limits` field: lenient per entry and per field.
+pub(super) fn deserialize_limits<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<ScopedWeeklyLimit>, D::Error> {
+    Ok(limits_from_value(Value::deserialize(deserializer)?))
 }
 
 pub(super) fn scoped_weekly_windows(limits: &[ScopedWeeklyLimit]) -> Vec<NamedRateWindow> {
@@ -56,7 +120,7 @@ pub(super) fn scoped_weekly_windows(limits: &[ScopedWeeklyLimit]) -> Vec<NamedRa
             }
             let resets_at = limit_resets_at(limit);
             Some(NamedRateWindow::new(
-                format!("claude-weekly-scoped-{slug}"),
+                format!("{SCOPED_WEEKLY_ID_PREFIX}{slug}"),
                 format!("{title} only"),
                 RateWindow::with_details(percent, Some(7 * 24 * 60), resets_at, None),
             ))
@@ -77,14 +141,7 @@ pub(super) fn weekly_all_window(limits: &[ScopedWeeklyLimit]) -> Option<RateWind
         if limit.group.as_deref().is_some_and(|g| g != "weekly") {
             return None;
         }
-        let percent = limit.percent.filter(|value| value.is_finite())?;
-        let resets_at = limit_resets_at(limit);
-        Some(RateWindow::with_details(
-            percent.clamp(0.0, 100.0),
-            Some(7 * 24 * 60),
-            resets_at,
-            None,
-        ))
+        limit_window(limit, 7 * 24 * 60)
     })
 }
 
@@ -101,15 +158,19 @@ pub(super) fn session_window(limits: &[ScopedWeeklyLimit]) -> Option<RateWindow>
         if limit.group.as_deref().is_some_and(|g| g != "session") {
             return None;
         }
-        let percent = limit.percent.filter(|value| value.is_finite())?;
-        let resets_at = limit_resets_at(limit);
-        Some(RateWindow::with_details(
-            percent.clamp(0.0, 100.0),
-            Some(5 * 60),
-            resets_at,
-            None,
-        ))
+        limit_window(limit, 5 * 60)
     })
+}
+
+/// A finite `percent`, clamped, as a window of `minutes`.
+fn limit_window(limit: &ScopedWeeklyLimit, minutes: u32) -> Option<RateWindow> {
+    let percent = limit.percent.filter(|value| value.is_finite())?;
+    Some(RateWindow::with_details(
+        percent.clamp(0.0, 100.0),
+        Some(minutes),
+        limit_resets_at(limit),
+        None,
+    ))
 }
 
 fn limit_resets_at(limit: &ScopedWeeklyLimit) -> Option<DateTime<Utc>> {

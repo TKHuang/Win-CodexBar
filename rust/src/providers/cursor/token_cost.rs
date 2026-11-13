@@ -447,10 +447,8 @@ fn estimated_list_price_cents(
         return None;
     }
     let (input, output, cache_write, cache_read) = usage.validated_counts()?;
-    let pricing_day = Utc
-        .timestamp_millis_opt(timestamp_ms)
-        .single()?
-        .date_naive();
+    let event_at = Utc.timestamp_millis_opt(timestamp_ms).single()?;
+    let pricing_day = event_at.date_naive();
 
     let codex_input = input.checked_add(cache_read)?.checked_add(cache_write)?;
     if let Some(usd) = CostUsagePricing::codex_cost_usd_at_date(
@@ -469,12 +467,18 @@ fn estimated_list_price_cents(
     let output = i32::try_from(output).ok()?;
     let cache_write = i32::try_from(cache_write).ok()?;
     let cache_read = i32::try_from(cache_read).ok()?;
-    CostUsagePricing::claude_cost_usd(&alias, input, cache_read, cache_write, output).and_then(
-        |usd| {
-            let cents = usd * 100.0;
-            cents.is_finite().then_some(cents)
-        },
+    CostUsagePricing::claude_cost_usd_at_date(
+        &alias,
+        Some(event_at),
+        input,
+        cache_read,
+        cache_write,
+        output,
     )
+    .and_then(|usd| {
+        let cents = usd * 100.0;
+        cents.is_finite().then_some(cents)
+    })
 }
 
 fn cursor_claude_catalog_model(model: &str) -> String {
@@ -644,33 +648,34 @@ mod tests {
         ));
     }
 
+    /// One event with no cache tokens.
+    fn event(
+        timestamp_ms: i64,
+        model: &str,
+        input_tokens: i64,
+        output_tokens: i64,
+        cost: EventCost,
+        charged_cents: Option<f64>,
+    ) -> UsageEvent {
+        UsageEvent {
+            timestamp_ms: Some(timestamp_ms),
+            model: Some(model.into()),
+            token_usage: Some(EventTokenUsage {
+                input_tokens,
+                output_tokens,
+                cache_write_tokens: 0,
+                cache_read_tokens: 0,
+                cost,
+            }),
+            charged_cents,
+        }
+    }
+
     #[test]
     fn summarizes_per_model_and_metered() {
         let events = vec![
-            UsageEvent {
-                timestamp_ms: Some(1),
-                model: Some("gpt-5".into()),
-                token_usage: Some(EventTokenUsage {
-                    input_tokens: 10,
-                    output_tokens: 5,
-                    cache_write_tokens: 0,
-                    cache_read_tokens: 0,
-                    cost: EventCost::Valid(25.0),
-                }),
-                charged_cents: Some(10.0),
-            },
-            UsageEvent {
-                timestamp_ms: Some(2),
-                model: Some("claude-4".into()),
-                token_usage: Some(EventTokenUsage {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                    cache_write_tokens: 0,
-                    cache_read_tokens: 0,
-                    cost: EventCost::Valid(75.0),
-                }),
-                charged_cents: Some(40.0),
-            },
+            event(1, "gpt-5", 10, 5, EventCost::Valid(25.0), Some(10.0)),
+            event(2, "claude-4", 1, 1, EventCost::Valid(75.0), Some(40.0)),
         ];
         let report = summarize_events(&events);
         assert!((report.api_rate_usd - 1.0).abs() < 0.001);
@@ -684,30 +689,8 @@ mod tests {
     #[test]
     fn missing_model_cost_keeps_priced_siblings() {
         let events = vec![
-            UsageEvent {
-                timestamp_ms: Some(1),
-                model: Some("gpt-5".into()),
-                token_usage: Some(EventTokenUsage {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                    cache_write_tokens: 0,
-                    cache_read_tokens: 0,
-                    cost: EventCost::Valid(25.0),
-                }),
-                charged_cents: Some(0.0),
-            },
-            UsageEvent {
-                timestamp_ms: Some(2),
-                model: Some("gpt-5".into()),
-                token_usage: Some(EventTokenUsage {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                    cache_write_tokens: 0,
-                    cache_read_tokens: 0,
-                    cost: EventCost::Omitted,
-                }),
-                charged_cents: Some(0.0),
-            },
+            event(1, "gpt-5", 1, 1, EventCost::Valid(25.0), Some(0.0)),
+            event(2, "gpt-5", 1, 1, EventCost::Omitted, Some(0.0)),
         ];
         let report = summarize_events(&events);
         assert!(report.api_rate_usd > 0.25);
@@ -719,30 +702,8 @@ mod tests {
     #[test]
     fn invalid_model_cost_latches_and_cannot_revive() {
         let events = vec![
-            UsageEvent {
-                timestamp_ms: Some(1),
-                model: Some("gpt-5".into()),
-                token_usage: Some(EventTokenUsage {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                    cache_write_tokens: 0,
-                    cache_read_tokens: 0,
-                    cost: EventCost::Invalid,
-                }),
-                charged_cents: Some(0.0),
-            },
-            UsageEvent {
-                timestamp_ms: Some(2),
-                model: Some("gpt-5".into()),
-                token_usage: Some(EventTokenUsage {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                    cache_write_tokens: 0,
-                    cache_read_tokens: 0,
-                    cost: EventCost::Valid(50.0),
-                }),
-                charged_cents: Some(0.0),
-            },
+            event(1, "gpt-5", 1, 1, EventCost::Invalid, Some(0.0)),
+            event(2, "gpt-5", 1, 1, EventCost::Valid(50.0), Some(0.0)),
         ];
         let report = summarize_events(&events);
         assert_eq!(report.api_rate_usd, 0.0);
@@ -751,18 +712,7 @@ mod tests {
 
     #[test]
     fn incomplete_metered_is_none() {
-        let events = vec![UsageEvent {
-            timestamp_ms: Some(1),
-            model: Some("gpt-5".into()),
-            token_usage: Some(EventTokenUsage {
-                input_tokens: 1,
-                output_tokens: 1,
-                cache_write_tokens: 0,
-                cache_read_tokens: 0,
-                cost: EventCost::Valid(10.0),
-            }),
-            charged_cents: None,
-        }];
+        let events = vec![event(1, "gpt-5", 1, 1, EventCost::Valid(10.0), None)];
         let report = summarize_events(&events);
         assert!(report.metered_usd.is_none());
         assert!((report.api_rate_usd - 0.1).abs() < 0.001);
@@ -803,30 +753,15 @@ mod tests {
     fn omitted_known_cost_is_estimated_but_unknown_model_stays_unpriced() {
         let timestamp = 1_700_000_000_000;
         let events = vec![
-            UsageEvent {
-                timestamp_ms: Some(timestamp),
-                model: Some("gpt-5".into()),
-                token_usage: Some(EventTokenUsage {
-                    input_tokens: 200,
-                    output_tokens: 20,
-                    cache_write_tokens: 0,
-                    cache_read_tokens: 0,
-                    cost: EventCost::Omitted,
-                }),
-                charged_cents: Some(10.0),
-            },
-            UsageEvent {
-                timestamp_ms: Some(timestamp + 1),
-                model: Some("fixture-model".into()),
-                token_usage: Some(EventTokenUsage {
-                    input_tokens: 7,
-                    output_tokens: 0,
-                    cache_write_tokens: 0,
-                    cache_read_tokens: 0,
-                    cost: EventCost::Omitted,
-                }),
-                charged_cents: Some(10.0),
-            },
+            event(timestamp, "gpt-5", 200, 20, EventCost::Omitted, Some(10.0)),
+            event(
+                timestamp + 1,
+                "fixture-model",
+                7,
+                0,
+                EventCost::Omitted,
+                Some(10.0),
+            ),
         ];
         let report = summarize_events(&events);
         assert!((report.api_rate_usd - 0.00045).abs() < 1e-9);
@@ -851,6 +786,27 @@ mod tests {
             .unwrap()
             * 100.0;
         assert!((cents - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn cursor_claude_alias_long_context_is_priced_at_the_event_time() {
+        // Upstream full-context standard pricing cutoff, in milliseconds.
+        const CUTOFF_MS: i64 = 1_773_360_000_000;
+        let usage = EventTokenUsage {
+            input_tokens: 240_000,
+            output_tokens: 1_000,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
+            cost: EventCost::Omitted,
+        };
+        // claude-4.6-sonnet resolves to claude-sonnet-4-6: $6/$22.5 per million before the
+        // cutoff, $3/$15 from it.
+        let tiered = estimated_list_price_cents(&usage, "claude-4.6-sonnet", CUTOFF_MS - 1)
+            .expect("dated Cursor Sonnet 4.6 price");
+        let standard = estimated_list_price_cents(&usage, "claude-4.6-sonnet", CUTOFF_MS)
+            .expect("current Cursor Sonnet 4.6 price");
+        assert!((tiered - 146.25).abs() < 1e-9, "{tiered}");
+        assert!((standard - 73.5).abs() < 1e-9, "{standard}");
     }
 
     #[test]

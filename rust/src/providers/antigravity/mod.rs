@@ -16,9 +16,11 @@ mod local_sqlite;
 mod local_step_resolver;
 mod offline_reason;
 mod quota_summary;
+mod remote;
 
-use legacy_status::{UserStatus, UserStatusResponse};
+use legacy_status::UserStatusResponse;
 use offline_reason::LiveFailure;
+use remote::{RemoteError, RemoteFetcher, RemoteTransport};
 
 #[cfg(windows)]
 use crate::managed_process::{ManagedProcess, ManagedProcessConfig, ManagedProcessError};
@@ -31,6 +33,8 @@ use std::ffi::OsString;
 use std::future::Future;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+#[cfg(windows)]
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::LazyLock;
 #[cfg(windows)]
@@ -39,8 +43,8 @@ use std::time::Duration;
 use std::time::Instant;
 
 use crate::core::{
-    FetchContext, Provider, ProviderError, ProviderFetchResult, ProviderId, ProviderMetadata,
-    RateWindow, SourceMode, UsageSnapshot,
+    FetchContext, Provider, ProviderError, ProviderFetchResult, ProviderId, RateWindow, SourceMode,
+    UsageSnapshot,
 };
 
 const AGY_NOT_FOUND_MESSAGE: &str =
@@ -72,14 +76,14 @@ impl From<ManagedProcessError> for ProviderError {
 }
 
 /// Antigravity provider
-pub struct AntigravityProvider {
-    metadata: ProviderMetadata,
-}
+#[derive(Default)]
+pub struct AntigravityProvider;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AntigravityStrategyId {
     Local,
     Cli,
+    OAuth,
     Offline,
 }
 
@@ -88,6 +92,7 @@ impl AntigravityStrategyId {
         match self {
             Self::Local => "local",
             Self::Cli => "cli",
+            Self::OAuth => "oauth",
             Self::Offline => "offline",
         }
     }
@@ -97,6 +102,7 @@ pub(crate) fn strategy_from_source_label(source_label: &str) -> Option<Antigravi
     match source_label {
         "local" => Some(AntigravityStrategyId::Local),
         "cli" => Some(AntigravityStrategyId::Cli),
+        "oauth" => Some(AntigravityStrategyId::OAuth),
         "offline" => Some(AntigravityStrategyId::Offline),
         _ => None,
     }
@@ -105,6 +111,59 @@ pub(crate) fn strategy_from_source_label(source_label: &str) -> Option<Antigravi
 /// Return a regex that matches `--<flag> <value>` or `--<flag>=<value>`.
 fn flag_re(flag: &str) -> Regex {
     Regex::new(&format!("--{f}(?:\\s+|\\s*=\\s*)(\\S+)", f = flag)).expect("valid flag pattern")
+}
+
+fn flag_value<'a>(re: &Regex, line: &'a str) -> Option<&'a str> {
+    re.captures(line).and_then(|c| c.get(1)).map(|m| m.as_str())
+}
+
+/// Client for the loopback language server.
+///
+/// SECURITY: TLS verification is disabled because the local language server
+/// uses a self-signed certificate; this client only talks to 127.0.0.1. It also
+/// bypasses the app-wide outbound proxy.
+fn loopback_client(timeout: std::time::Duration) -> Result<reqwest::Client, ProviderError> {
+    crate::core::credentialed_http_client_builder()
+        .no_proxy()
+        .timeout(timeout)
+        .danger_accept_invalid_certs(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| ProviderError::Other(e.to_string()))
+}
+
+fn user_status_body() -> serde_json::Value {
+    serde_json::json!({
+        "metadata": {
+            "ideName": "antigravity",
+            "extensionName": "antigravity",
+            "ideVersion": "unknown",
+            "locale": "en"
+        }
+    })
+}
+
+/// A Connect-protocol JSON POST to the local language server.
+fn local_post(
+    client: &reqwest::Client,
+    url: &str,
+    body: &serde_json::Value,
+    timeout: std::time::Duration,
+) -> reqwest::RequestBuilder {
+    client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .header("Connect-Protocol-Version", "1")
+        .timeout(timeout)
+        .json(body)
+}
+
+async fn response_bytes(response: reqwest::Response) -> Result<Vec<u8>, LiveFailure> {
+    response
+        .bytes()
+        .await
+        .map(|bytes| bytes.to_vec())
+        .map_err(|e| LiveFailure::request("Failed to read response", &e))
 }
 
 /// The kind of local Antigravity process a `ProcessInfo` was derived from.
@@ -142,21 +201,7 @@ fn is_agy_cli_command(command_line: &str) -> bool {
 
 impl AntigravityProvider {
     pub fn new() -> Self {
-        Self {
-            metadata: ProviderMetadata {
-                id: ProviderId::Antigravity,
-                display_name: "Antigravity",
-                session_label: "Claude",
-                weekly_label: "Gemini Pro",
-                supports_opus: true,
-                supports_credits: false,
-                default_enabled: false,
-                is_primary: false,
-                dashboard_url: None,
-                status_page_url: None,
-                tertiary_label_key: None,
-            },
-        }
+        Self
     }
 
     /// Detect running Antigravity language server and extract connection info
@@ -215,25 +260,12 @@ impl AntigravityProvider {
                 None => (None, line),
             };
 
-            let csrf_token = csrf_re
-                .captures(line)
-                .and_then(|c| c.get(1))
-                .map(|m| m.as_str().to_string());
-
-            let ext_csrf_token = ext_csrf_re
-                .captures(line)
-                .and_then(|c| c.get(1))
-                .map(|m| m.as_str().to_string());
-
-            let port = port_re
-                .captures(line)
-                .and_then(|c| c.get(1))
-                .and_then(|m| m.as_str().parse::<u16>().ok())
+            let csrf_token = flag_value(&csrf_re, line).map(str::to_string);
+            let ext_csrf_token = flag_value(&ext_csrf_re, line).map(str::to_string);
+            let port = flag_value(&port_re, line)
+                .and_then(|value| value.parse::<u16>().ok())
                 .or_else(|| {
-                    https_port_re
-                        .captures(line)
-                        .and_then(|c| c.get(1))
-                        .and_then(|m| m.as_str().parse::<u16>().ok())
+                    flag_value(&https_port_re, line).and_then(|value| value.parse::<u16>().ok())
                 });
 
             // Desktop IDE/app language server: requires --csrf_token.
@@ -273,20 +305,9 @@ impl AntigravityProvider {
         // real gRPC/Connect API port is not guaranteed to be within a small window above it.
         // Mirror the macOS/Linux probe (which uses `lsof`) by enumerating the language-server
         // process's own listening ports first, then fall back to a heuristic window above the
-        // extension port and a few historically-seen ports.
-        //
-        // SECURITY: TLS verification is disabled because the local language server uses a
-        // self-signed certificate. This is scoped to 127.0.0.1 only; we confirm a port by
-        // checking that it answers the expected gRPC endpoint.
-        // The language server is a local loopback endpoint. Do not route it
-        // through the app-wide outbound proxy.
-        let client = crate::core::credentialed_http_client_builder()
-            .no_proxy()
-            .timeout(std::time::Duration::from_secs(2))
-            .danger_accept_invalid_certs(true)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|e| ProviderError::Other(e.to_string()))?;
+        // extension port and a few historically-seen ports. A port is confirmed only when it
+        // answers the expected gRPC endpoint.
+        let client = loopback_client(std::time::Duration::from_secs(2))?;
 
         // Ordered candidate ports: the process's real listening ports first (Windows
         // equivalent of `lsof`), then the heuristic window above the extension port, then a
@@ -398,14 +419,7 @@ impl AntigravityProvider {
         process_info: &ProcessInfo,
         api_port: u16,
     ) -> Result<ProviderFetchResult, LiveFailure> {
-        // SECURITY: TLS verification disabled only for this loopback language server.
-        let client = crate::core::credentialed_http_client_builder()
-            .no_proxy()
-            .timeout(std::time::Duration::from_secs(8))
-            .danger_accept_invalid_certs(true)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|e| ProviderError::Other(e.to_string()))?;
+        let client = loopback_client(std::time::Duration::from_secs(8))?;
 
         let quota_body = serde_json::json!({ "forceRefresh": true });
         match Self::fetch_local_payload(
@@ -422,20 +436,12 @@ impl AntigravityProvider {
                 Ok(mut snapshot) => {
                     // Identity is best-effort enrichment and must not displace a
                     // successful quota-summary result.
-                    let identity_body = serde_json::json!({
-                        "metadata": {
-                            "ideName": "antigravity",
-                            "extensionName": "antigravity",
-                            "ideVersion": "unknown",
-                            "locale": "en"
-                        }
-                    });
                     if let Ok(identity_bytes) = Self::fetch_local_payload(
                         &client,
                         process_info,
                         api_port,
                         GET_USER_STATUS_PATH,
-                        &identity_body,
+                        &user_status_body(),
                         std::time::Duration::from_secs(1),
                     )
                     .await
@@ -457,26 +463,18 @@ impl AntigravityProvider {
             ),
         }
 
-        let body = serde_json::json!({
-            "metadata": {
-                "ideName": "antigravity",
-                "extensionName": "antigravity",
-                "ideVersion": "unknown",
-                "locale": "en"
-            }
-        });
         let bytes = Self::fetch_local_payload(
             &client,
             process_info,
             api_port,
             GET_USER_STATUS_PATH,
-            &body,
+            &user_status_body(),
             std::time::Duration::from_secs(8),
         )
         .await?;
         let response: UserStatusResponse = serde_json::from_slice(&bytes)
             .map_err(|e| ProviderError::Parse(format!("Failed to parse response: {e}")))?;
-        let usage = self.parse_user_status(response)?;
+        let usage = legacy_status::parse_user_status(response)?;
         Ok(Self::fetch_result(usage, AntigravityStrategyId::Local))
     }
 
@@ -522,26 +520,8 @@ impl AntigravityProvider {
         let Some(binary) = cli_resolution::locate_agy_binary()? else {
             return Ok(ManagedAgyOutcome::Missing);
         };
-        let probe_client = crate::core::credentialed_http_client_builder()
-            .no_proxy()
-            .timeout(AGY_PROBE_TIMEOUT)
-            .danger_accept_invalid_certs(true)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|error| ProviderError::Other(error.to_string()))?;
-        let config = ManagedProcessConfig {
-            program: binary,
-            args: Vec::new(),
-            env: vec![
-                (OsString::from("TERM"), OsString::from("xterm-256color")),
-                (OsString::from("COLORTERM"), OsString::from("truecolor")),
-            ]
-            .into(),
-            cwd: dirs::home_dir().filter(|path| path.is_dir()),
-            pty_rows: 30,
-            pty_cols: 120,
-            label: "agy".to_string(),
-        };
+        let probe_client = loopback_client(AGY_PROBE_TIMEOUT)?;
+        let config = managed_agy_config(binary);
         let mut managed = ManagedProcess::spawn(&config)?;
         let pid = managed.pid();
         let process_info = ProcessInfo {
@@ -733,6 +713,22 @@ impl AntigravityProvider {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Option<ProviderFetchResult>, LiveFailure>>,
     {
+        match self.resolve_live_runtime(local_result, cli_fallback).await {
+            Ok(result) => Ok(result),
+            Err(failure) => Self::resolve_probe_failure(failure, offline),
+        }
+    }
+
+    /// The live local/managed/CLI chain without the offline-history step.
+    async fn resolve_live_runtime<F, Fut>(
+        &self,
+        local_result: Result<Option<ProviderFetchResult>, LiveFailure>,
+        cli_fallback: F,
+    ) -> Result<ProviderFetchResult, LiveFailure>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Option<ProviderFetchResult>, LiveFailure>>,
+    {
         let (mut failure, allow_managed_runtime) = match local_result {
             Ok(Some(result)) => return Ok(result),
             Ok(None) => (None, true),
@@ -763,7 +759,7 @@ impl AntigravityProvider {
                             Ok(ManagedAgyOutcome::Missing) => {}
                             Err(error) => {
                                 if matches!(error, ProviderError::AuthRequired) {
-                                    return Err(error);
+                                    return Err(error.into());
                                 }
                                 tracing::debug!(%error, "managed Antigravity CLI probe failed");
                                 failure = Some(error.into());
@@ -795,7 +791,35 @@ impl AntigravityProvider {
             }
         }
 
-        Self::resolve_probe_failure(failure.unwrap_or_else(LiveFailure::not_running), offline)
+        Err(failure.unwrap_or_else(LiveFailure::not_running))
+    }
+
+    /// Auto-mode step between the live runtime chain and offline history.
+    ///
+    /// Upstream orders Antigravity's Auto pipeline local, then Google OAuth,
+    /// then offline. OAuth is only attempted when credentials exist; its
+    /// failure replaces the runtime failure because it is the more specific
+    /// account problem once the user has saved OAuth credentials.
+    async fn resolve_with_remote_fallback<T: RemoteTransport>(
+        live: Result<ProviderFetchResult, LiveFailure>,
+        remote: Option<&RemoteFetcher<T>>,
+        offline: Option<ProviderFetchResult>,
+    ) -> Result<ProviderFetchResult, ProviderError> {
+        let failure = match live {
+            Ok(result) => return Ok(result),
+            Err(failure) => failure,
+        };
+        let failure = match remote.filter(|fetcher| fetcher.has_credentials()) {
+            Some(fetcher) => match fetcher.fetch().await {
+                Ok(usage) => return Ok(Self::fetch_result(usage, AntigravityStrategyId::OAuth)),
+                Err(error) => {
+                    tracing::debug!(?error, "Antigravity OAuth fallback failed");
+                    LiveFailure::from(error)
+                }
+            },
+            None => failure,
+        };
+        Self::resolve_probe_failure(failure, offline)
     }
 
     async fn fetch_local_payload(
@@ -812,12 +836,7 @@ impl AntigravityProvider {
             .extension_server_csrf_token
             .as_deref()
             .unwrap_or(&process_info.csrf_token);
-        let mut request = client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .header("Connect-Protocol-Version", "1")
-            .timeout(timeout)
-            .json(body);
+        let mut request = local_post(client, &url, body, timeout);
         if requires_csrf {
             request = request.header("X-Codeium-Csrf-Token", csrf_token);
         }
@@ -826,42 +845,30 @@ impl AntigravityProvider {
             .await
             .map_err(|e| LiveFailure::request("API request failed", &e))?;
         if response.status().is_success() {
-            return response
-                .bytes()
-                .await
-                .map(|bytes| bytes.to_vec())
-                .map_err(|e| LiveFailure::request("Failed to read response", &e));
+            return response_bytes(response).await;
         }
 
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
         if requires_csrf && process_info.extension_server_csrf_token.is_some() {
-            let retry = client
-                .post(&url)
-                .header("Content-Type", "application/json")
-                .header("Connect-Protocol-Version", "1")
+            let retry = local_post(client, &url, body, timeout)
                 .header("X-Codeium-Csrf-Token", &process_info.csrf_token)
-                .timeout(timeout)
-                .json(body)
                 .send()
                 .await;
             if let Ok(retry) = retry
                 && retry.status().is_success()
             {
-                return retry
-                    .bytes()
-                    .await
-                    .map(|bytes| bytes.to_vec())
-                    .map_err(|e| LiveFailure::request("Failed to read response", &e));
+                return response_bytes(retry).await;
             }
         }
 
+        let lower = text.to_ascii_lowercase();
         if process_info.source == ProcessSource::Cli
             && (status == reqwest::StatusCode::UNAUTHORIZED
                 || status == reqwest::StatusCode::FORBIDDEN
-                || text.to_ascii_lowercase().contains("not logged")
-                || text.to_ascii_lowercase().contains("login method")
-                || text.to_ascii_lowercase().contains("keyring"))
+                || ["not logged", "login method", "keyring"]
+                    .iter()
+                    .any(|needle| lower.contains(needle)))
         {
             return Err(ProviderError::AuthRequired.into());
         }
@@ -869,23 +876,6 @@ impl AntigravityProvider {
             status.as_u16(),
             ProviderError::Other(format!("API error {status}: {text}")),
         ))
-    }
-
-    fn resolve_plan_name(status: &UserStatus) -> Option<String> {
-        legacy_status::resolve_plan_name(status)
-    }
-
-    fn parse_user_status(
-        &self,
-        response: UserStatusResponse,
-    ) -> Result<UsageSnapshot, ProviderError> {
-        legacy_status::parse_user_status(response)
-    }
-}
-
-impl Default for AntigravityProvider {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -899,31 +889,50 @@ impl Provider for AntigravityProvider {
         ProviderId::Antigravity
     }
 
-    fn metadata(&self) -> &ProviderMetadata {
-        &self.metadata
-    }
-
     async fn fetch_usage(&self, ctx: &FetchContext) -> Result<ProviderFetchResult, ProviderError> {
-        // `oauth` is not supported (no remote API path is ported yet); surface it
-        // explicitly instead of silently probing locally. Both `auto` and `cli`
-        // prefer an existing desktop/CLI language server. When neither is
-        // running, start a task-owned `agy` session for this fetch only.
+        // `oauth` only reads the Google OAuth remote quota API. Both `auto` and
+        // `cli` prefer an existing desktop/CLI language server. When neither is
+        // running, start a task-owned `agy` session for this fetch only. `auto`
+        // then tries saved OAuth credentials before offline history.
         if ctx.source_mode == SourceMode::OAuth {
-            return Err(ProviderError::UnsupportedSource(ctx.source_mode));
+            tracing::debug!("Fetching Antigravity usage via Google OAuth");
+            let fetcher = RemoteFetcher::from_environment()?;
+            return fetcher
+                .fetch()
+                .await
+                .map(|usage| Self::fetch_result(usage, AntigravityStrategyId::OAuth))
+                .map_err(RemoteError::into_provider_error);
         }
 
         tracing::debug!("Fetching Antigravity usage via local probe");
 
         let local_result = self.fetch_user_status().await;
-        self.resolve_runtime_fallback(local_result, || self.try_print_usage_fallback())
+        if ctx.source_mode != SourceMode::Auto {
+            return self
+                .resolve_runtime_fallback(local_result, || self.try_print_usage_fallback())
+                .await;
+        }
+        let live = self
+            .resolve_live_runtime(local_result, || self.try_print_usage_fallback())
+            .await;
+        let remote = if live.is_err() {
+            RemoteFetcher::from_environment()
+                .inspect_err(|error| {
+                    tracing::debug!(%error, "Antigravity OAuth client unavailable");
+                })
+                .ok()
+        } else {
+            None
+        };
+        Self::resolve_with_remote_fallback(live, remote.as_ref(), Self::offline_usage_result())
             .await
     }
 
     fn available_sources(&self) -> Vec<SourceMode> {
-        vec![SourceMode::Auto, SourceMode::Cli]
+        vec![SourceMode::Auto, SourceMode::Cli, SourceMode::OAuth]
     }
 
-    fn supports_cli(&self) -> bool {
+    fn supports_oauth(&self) -> bool {
         true
     }
 
@@ -961,6 +970,25 @@ enum ManagedAgyOutcome {
     Fetched(ProviderFetchResult),
     /// No configured `agy` executable exists, so offline history may be used.
     Missing,
+}
+
+/// Headless PTY session for one managed fetch. It carries the same agy
+/// child environment as the CLI probes, so the session never starts agy's
+/// background auto-updater.
+#[cfg(windows)]
+fn managed_agy_config(binary: PathBuf) -> ManagedProcessConfig {
+    let mut env = cli_fallback::child_environment();
+    env.push((OsString::from("TERM"), OsString::from("xterm-256color")));
+    env.push((OsString::from("COLORTERM"), OsString::from("truecolor")));
+    ManagedProcessConfig {
+        program: binary,
+        args: Vec::new(),
+        env: env.into(),
+        cwd: dirs::home_dir().filter(|path| path.is_dir()),
+        pty_rows: 30,
+        pty_cols: 120,
+        label: "agy".to_string(),
+    }
 }
 
 #[cfg(test)]

@@ -34,6 +34,7 @@ import {
 } from "../../../lib/costPeriod";
 import type { TabProps } from "../settingsTabs";
 import ProjectConversations from "./ProjectConversations";
+import SessionInspector from "./SessionInspector";
 import { UsageSpendProviderGroups } from "./UsageSpendProviderGroups";
 import { UsageSpendTrendPanel } from "./UsageSpendTrendPanel";
 import { TokenActivityGrid } from "./TokenActivityGrid";
@@ -428,7 +429,11 @@ function DashboardBody({
           (contract.conversations.length === 0 ? (
             <p className="settings-section__caption">{t("UsageSpendNoSessions")}</p>
           ) : (
-            <ProjectConversations conversations={contract.conversations} t={t} />
+            <SessionInspector
+              conversations={contract.conversations}
+              historyDays={contract.historyDays}
+              t={t}
+            />
           ))}
       </div>
 
@@ -527,6 +532,7 @@ function ProjectsPanel({
         <ProjectRowList
           rows={projectRows}
           conversations={contract.conversations}
+          historyDays={contract.historyDays}
           hidePersonalInfo={hidePersonalInfo}
           t={t}
         />
@@ -538,6 +544,7 @@ function ProjectsPanel({
           <ProjectRowList
             rows={chatRows}
             conversations={contract.conversations}
+            historyDays={contract.historyDays}
             hidePersonalInfo={hidePersonalInfo}
             independent
             t={t}
@@ -551,12 +558,14 @@ function ProjectsPanel({
 function ProjectRowList({
   rows,
   conversations,
+  historyDays,
   hidePersonalInfo,
   independent = false,
   t,
 }: {
   rows: CodexWorkspacesProjectUsage[];
   conversations: CodexWorkspacesSessionUsage[];
+  historyDays: number;
   hidePersonalInfo: boolean;
   independent?: boolean;
   t: Translate;
@@ -608,6 +617,7 @@ function ProjectRowList({
               {isExpanded && (
                 <ProjectConversations
                   conversations={conversations.filter((session) => session.projectId === project.id)}
+                  historyDays={historyDays}
                   t={t}
                 />
               )}

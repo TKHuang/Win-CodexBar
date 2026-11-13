@@ -16,14 +16,22 @@ use crate::agent_sessions::pi_family::roots::{
     EnvMap, PiProfile, omp_all_profile_roots, omp_default_profile_root, omp_named_profile_root,
     omp_profile_selector, pi_settings_session_directory,
 };
-use crate::core::CostUsagePricing;
-use crate::cost_scanner::{CostSummary, ModelPricingCompleteness};
+use crate::core::{CostUsagePricing, ModelsDevPricingSnapshot, pricing_snapshot};
+use crate::cost_scanner::CostSummary;
 
+/// The Pi backend that owns a row's pricing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PiMappedProvider {
     Codex,
     Claude,
+    /// Standalone Pi history on `amazon-bedrock`. Native Codex/Claude scans
+    /// never mirror these rows; they are priced from the models.dev
+    /// `amazon-bedrock` entry with an exact regional model-ID match.
+    Bedrock,
 }
+
+/// models.dev provider id that prices [`PiMappedProvider::Bedrock`] rows.
+const BEDROCK_MODELS_DEV_PROVIDER_ID: &str = "amazon-bedrock";
 
 #[derive(Debug, Default)]
 pub struct PiDailyScan {
@@ -136,6 +144,7 @@ pub fn scan_pi_compatible_into(
         seen_entries,
         pi_compatible_session_roots(scan_home()),
         Some(target),
+        &pricing_snapshot(),
     )
 }
 
@@ -158,19 +167,26 @@ pub fn scan_pi_into(
         seen_entries,
         pi_compatible_session_roots(scan_home()),
         None,
+        &pricing_snapshot(),
     )
 }
 
 /// Scan standalone Pi/OMP history into daily cost and token buckets.
 pub fn scan_pi_daily(days: u32, cancel: Option<&AtomicBool>) -> PiDailyScan {
     let cutoff = Utc::now() - Duration::days(days as i64);
-    scan_pi_daily_from_roots(cutoff, cancel, pi_compatible_session_roots(scan_home()))
+    scan_pi_daily_from_roots(
+        cutoff,
+        cancel,
+        pi_compatible_session_roots(scan_home()),
+        &pricing_snapshot(),
+    )
 }
 
 fn scan_pi_daily_from_roots(
     cutoff: DateTime<Utc>,
     cancel: Option<&AtomicBool>,
     roots: Vec<PathBuf>,
+    pricing: &ModelsDevPricingSnapshot,
 ) -> PiDailyScan {
     let mut result = PiDailyScan::default();
     let mut seen_entries = HashSet::new();
@@ -187,7 +203,7 @@ fn scan_pi_daily_from_roots(
             if cancelled(cancel) {
                 return false;
             }
-            let file = for_each_pi_entry(path, cutoff, None, &mut seen_entries, |entry| {
+            let file = for_each_pi_entry(path, cutoff, None, &mut seen_entries, pricing, |entry| {
                 let Some(timestamp) = entry.timestamp else {
                     missing_timestamp = true;
                     return;
@@ -227,6 +243,7 @@ fn scan_roots_into(
     seen_entries: &mut HashSet<String>,
     roots: Vec<PathBuf>,
     target: Option<PiMappedProvider>,
+    pricing: &ModelsDevPricingSnapshot,
 ) -> PiScanEvidence {
     let mut sessions = 0u32;
     let mut evidence = PiScanEvidence::default();
@@ -242,7 +259,7 @@ fn scan_roots_into(
                 return false;
             }
             let before = seen_entries.len();
-            let file = for_each_pi_entry(path, cutoff, target, seen_entries, |entry| {
+            let file = for_each_pi_entry(path, cutoff, target, seen_entries, pricing, |entry| {
                 apply_entry(summary, &entry);
             });
             if file.counted > 0 || seen_entries.len() > before {
@@ -259,7 +276,10 @@ fn scan_roots_into(
 
 struct PiEntry {
     timestamp: Option<DateTime<Utc>>,
-    provider: PiMappedProvider,
+    /// `None` for a backend without native pricing. Such a row is standalone
+    /// Pi history only: native Codex/Claude scans skip it.
+    provider: Option<PiMappedProvider>,
+    /// The model, or `backend/model` for a backend without native pricing.
     model: String,
     input: u64,
     output: u64,
@@ -272,18 +292,9 @@ struct PiEntry {
 fn apply_entry(summary: &mut CostSummary, entry: &PiEntry) {
     if !entry.pricing_known {
         summary.unknown_models.insert(entry.model.clone());
-        match &mut summary.model_pricing_completeness {
-            ModelPricingCompleteness::Complete => {
-                summary.model_pricing_completeness = ModelPricingCompleteness::Partial {
-                    unpriced_models: vec![entry.model.clone()],
-                };
-            }
-            ModelPricingCompleteness::Partial { unpriced_models } => {
-                if !unpriced_models.contains(&entry.model) {
-                    unpriced_models.push(entry.model.clone());
-                }
-            }
-        }
+        summary
+            .model_pricing_completeness
+            .mark_unpriced(&entry.model);
     }
     summary.input_tokens += entry.input;
     summary.output_tokens += entry.output;
@@ -345,6 +356,7 @@ fn for_each_pi_entry(
     cutoff: DateTime<Utc>,
     target: Option<PiMappedProvider>,
     seen: &mut HashSet<String>,
+    pricing: &ModelsDevPricingSnapshot,
     mut on_entry: impl FnMut(PiEntry),
 ) -> PiFileScanResult {
     let Ok(file) = File::open(path) else {
@@ -376,12 +388,21 @@ fn for_each_pi_entry(
                 .filter(|_| value.get("type").and_then(Value::as_str) == Some("session"))
                 .map(str::to_string);
         }
-        let Some(entry) = parse_pi_assistant_entry_any(&value) else {
-            if looks_like_usage_candidate(&value) {
+        let Some(entry) = parse_pi_assistant_entry_any(&value, pricing) else {
+            // Malformed rows from unsupported backends affect only standalone
+            // history, so a native scan keeps its completeness.
+            let unsupported_backend = assistant_backend_text(&value)
+                .is_some_and(|backend| map_provider(backend).is_none());
+            if looks_like_usage_candidate(&value) && !(target.is_some() && unsupported_backend) {
                 complete = false;
             }
             continue;
         };
+        // Unsupported backends affect only standalone history, so a native scan
+        // skips them without losing its completeness.
+        if target.is_some() && entry.provider.is_none() {
+            continue;
+        }
         if entry.timestamp.is_none() {
             complete = false;
         }
@@ -390,7 +411,7 @@ fn for_each_pi_entry(
         {
             continue;
         }
-        if target.is_some_and(|target| entry.provider != target) {
+        if target.is_some_and(|target| entry.provider != Some(target)) {
             continue;
         }
         let entry_id = entry_dedup_key(&value, path, ordinal, session_id.as_deref());
@@ -473,16 +494,29 @@ fn map_provider(raw: &str) -> Option<PiMappedProvider> {
     if n.contains("anthropic") || n.contains("claude") {
         return Some(PiMappedProvider::Claude);
     }
+    if n == BEDROCK_MODELS_DEV_PROVIDER_ID {
+        return Some(PiMappedProvider::Bedrock);
+    }
     None
 }
 
-#[cfg(test)]
-fn parse_pi_assistant_entry(value: &Value, target: PiMappedProvider) -> Option<PiEntry> {
-    let entry = parse_pi_assistant_entry_any(value)?;
-    (entry.provider == target).then_some(entry)
+/// The trimmed backend name of an assistant row, or `None` when it is absent or blank.
+fn assistant_backend_text(value: &Value) -> Option<&str> {
+    let message = value.get("message").unwrap_or(value);
+    message
+        .get("provider")
+        .or_else(|| value.get("provider"))
+        .or_else(|| message.get("api"))
+        .or_else(|| value.get("api"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
 }
 
-fn parse_pi_assistant_entry_any(value: &Value) -> Option<PiEntry> {
+fn parse_pi_assistant_entry_any(
+    value: &Value,
+    pricing: &ModelsDevPricingSnapshot,
+) -> Option<PiEntry> {
     // Accept either flat or nested { message: {...} } pi-compatible rows.
     let message = value.get("message").unwrap_or(value);
     let role = message
@@ -501,13 +535,9 @@ fn parse_pi_assistant_entry_any(value: &Value) -> Option<PiEntry> {
         }
     }
 
-    let provider_raw = message
-        .get("provider")
-        .or_else(|| value.get("provider"))
-        .or_else(|| message.get("api"))
-        .or_else(|| value.get("api"))
-        .and_then(|v| v.as_str())?;
-    let mapped = map_provider(provider_raw)?;
+    let backend = assistant_backend_text(value)?;
+    // A backend without native pricing keeps its usage as standalone history.
+    let mapped = map_provider(backend);
     let model = message
         .get("model")
         .or_else(|| message.get("modelId"))
@@ -558,12 +588,35 @@ fn parse_pi_assistant_entry_any(value: &Value) -> Option<PiEntry> {
     if input == 0 && output == 0 && cache_read == 0 && cache_create == 0 {
         return None;
     }
+    // The one-hour share of cache writes is priced at the one-hour rate on the
+    // Bedrock and Anthropic branches. Other rows ignore it.
+    let cache_write_1h = cache_write_1h_tokens(&usage).min(cache_create);
 
     let timestamp = entry_timestamp(value);
     let (cost, pricing_known) = match mapped {
+        // Unpriced backends never borrow another provider's rates.
+        None => (0.0, false),
+        // Provider-specific by design: Bedrock rows stay in Pi history and must
+        // match the full regional catalog ID. Unknown IDs stay unpriced.
+        Some(PiMappedProvider::Bedrock) => {
+            match pricing.lookup_exact(BEDROCK_MODELS_DEV_PROVIDER_ID, &model) {
+                Some(rates) => (
+                    CostUsagePricing::claude_models_dev_cost_usd_with_one_hour_writes(
+                        rates,
+                        input,
+                        cache_read,
+                        cache_create,
+                        cache_write_1h,
+                        output,
+                    ),
+                    true,
+                ),
+                None => (0.0, false),
+            }
+        }
         // Upstream prices each row at its timestamp, so usage from before a
         // model's repricing keeps the rates it was billed at.
-        PiMappedProvider::Codex => match timestamp.map_or_else(
+        Some(PiMappedProvider::Codex) => match timestamp.map_or_else(
             || {
                 CostUsagePricing::codex_cost_usd_with_cache_write(
                     &model,
@@ -588,36 +641,31 @@ fn parse_pi_assistant_entry_any(value: &Value) -> Option<PiEntry> {
             Some(cost) => (cost, true),
             None => (0.0, false),
         },
-        PiMappedProvider::Claude => {
-            // Token counts come from API usage records and fit within i32;
-            // the canonical Claude pricing table takes i32 per-token counts.
-            #[allow(
-                clippy::cast_possible_truncation,
-                reason = "token counts clamped to i32::MAX above"
-            )]
-            #[allow(
-                clippy::cast_possible_wrap,
-                reason = "token counts are non-negative; wrapping is impossible"
-            )]
-            let (input, cache_read, cache_create, output) = (
-                input.min(i32::MAX as u64) as i32,
-                cache_read.min(i32::MAX as u64) as i32,
-                cache_create.min(i32::MAX as u64) as i32,
-                output.min(i32::MAX as u64) as i32,
-            );
-            if let Some(cost) =
-                CostUsagePricing::claude_cost_usd(&model, input, cache_read, cache_create, output)
-            {
+        Some(PiMappedProvider::Claude) => {
+            // Same resolution and one-hour arithmetic as the Claude scanner.
+            if let Some(cost) = CostUsagePricing::claude_cost_usd_with_cache_ttl(
+                &model,
+                pricing,
+                timestamp,
+                input,
+                cache_read,
+                cache_create,
+                cache_write_1h,
+                output,
+            ) {
                 (cost, true)
             } else {
                 // Preserve the legacy fallback amount for continuity, while
                 // marking the model unknown so callers do not present it as
                 // canonical pricing.
-                let fallback = CostUsagePricing::claude_cost_usd(
+                let fallback = CostUsagePricing::claude_cost_usd_with_cache_ttl(
                     "claude-sonnet-4-6",
+                    pricing,
+                    timestamp,
                     input,
                     cache_read,
                     cache_create,
+                    cache_write_1h,
                     output,
                 )
                 .unwrap_or(0.0);
@@ -626,9 +674,13 @@ fn parse_pi_assistant_entry_any(value: &Value) -> Option<PiEntry> {
         }
     };
 
+    let (provider, model) = match mapped {
+        Some(provider) => (Some(provider), model),
+        None => (None, format!("{backend}/{model}")),
+    };
     Some(PiEntry {
         timestamp,
-        provider: mapped,
+        provider,
         model,
         input,
         output,
@@ -637,6 +689,18 @@ fn parse_pi_assistant_entry_any(value: &Value) -> Option<PiEntry> {
         cost,
         pricing_known,
     })
+}
+
+/// One-hour cache-write tokens. The first present flat spelling wins; the
+/// nested `cttl.ephemeral1h` form is read only when no flat key exists.
+fn cache_write_1h_tokens(usage: &Value) -> u64 {
+    let flat = ["cacheWrite1h", "cache_write_1h"];
+    if flat.iter().any(|key| usage.get(*key).is_some()) {
+        return num(usage, &flat);
+    }
+    usage
+        .get("cttl")
+        .map_or(0, |cttl| num(cttl, &["ephemeral1h", "ephemeral_1h"]))
 }
 
 fn num(usage: &Value, keys: &[&str]) -> u64 {
@@ -668,368 +732,4 @@ fn num(usage: &Value, keys: &[&str]) -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Write;
-    use tempfile::tempdir;
-
-    #[test]
-    fn maps_openai_codex_and_anthropic_providers() {
-        assert_eq!(
-            map_provider("openai-codex-responses"),
-            Some(PiMappedProvider::Codex)
-        );
-        assert_eq!(map_provider("anthropic"), Some(PiMappedProvider::Claude));
-        assert_eq!(map_provider("google"), None);
-    }
-
-    #[test]
-    fn parses_assistant_usage_row() {
-        let raw = serde_json::json!({
-            "id": "msg-1",
-            "role": "assistant",
-            "provider": "openai-codex",
-            "model": "gpt-5",
-            "timestamp": "2026-07-20T12:00:00Z",
-            "usage": { "input": 100, "output": 20, "cacheRead": 10 }
-        });
-        let entry = parse_pi_assistant_entry(&raw, PiMappedProvider::Codex).unwrap();
-        assert_eq!(entry.input, 100);
-        assert_eq!(entry.output, 20);
-        assert_eq!(entry.cache_read, 10);
-        assert_eq!(entry.model, "gpt-5");
-        assert!(entry.pricing_known);
-    }
-
-    #[test]
-    fn parses_astra_cache_write_and_prices_it() {
-        let raw = serde_json::json!({
-            "id": "astra-msg-1",
-            "role": "assistant",
-            "provider": "openai-codex",
-            "model": "gpt-6-astra",
-            "usage": {
-                "input": 1_000,
-                "output": 100,
-                "cacheRead": 200,
-                "cacheWrite": 300
-            }
-        });
-        let entry = parse_pi_assistant_entry(&raw, PiMappedProvider::Codex).unwrap();
-        let expected = 500.0 * 1e-5 + 200.0 * 1e-6 + 300.0 * 1.25e-5 + 100.0 * 5e-5;
-        assert_eq!(entry.cache_create, 300);
-        assert!((entry.cost - expected).abs() < 1e-12);
-        assert!(entry.pricing_known);
-    }
-
-    #[test]
-    fn prices_codex_rows_at_their_utc_timestamp() {
-        let cost = |timestamp: Option<&str>| {
-            let mut raw = serde_json::json!({
-                "id": "sol-1", "role": "assistant", "provider": "openai-codex",
-                "model": "gpt-5.6-sol",
-                "usage": { "input": 100, "output": 5, "cacheRead": 10, "cacheWrite": 20 }
-            });
-            if let Some(timestamp) = timestamp {
-                raw["timestamp"] = timestamp.into();
-            }
-            parse_pi_assistant_entry(&raw, PiMappedProvider::Codex)
-                .unwrap()
-                .cost
-        };
-        let historical = 70.0 * 5e-6 + 10.0 * 5e-7 + 20.0 * 6.25e-6 + 5.0 * 3e-5;
-        let current = 70.0 * 4e-6 + 10.0 * 4e-7 + 20.0 * 5e-6 + 5.0 * 2e-5;
-        for (timestamp, expected) in [
-            (Some("2026-07-10T12:00:00Z"), historical),
-            (Some("2026-08-20T23:59:59Z"), historical),
-            (Some("2026-08-21T00:00:00Z"), current),
-            (Some("2026-09-10T12:00:00Z"), current),
-            (None, current),
-        ] {
-            assert!((cost(timestamp) - expected).abs() < 1e-12, "{timestamp:?}");
-        }
-    }
-
-    #[test]
-    fn unknown_model_keeps_tokens_and_marks_pricing_incomplete() {
-        let raw = serde_json::json!({
-            "id": "unknown-model-1",
-            "role": "assistant",
-            "provider": "openai-codex",
-            "model": "future-model-without-a-rate",
-            "usage": { "input": 11, "output": 3 }
-        });
-        let entry = parse_pi_assistant_entry_any(&raw).unwrap();
-        assert!(!entry.pricing_known);
-        assert_eq!(entry.cost, 0.0);
-
-        let mut summary = CostSummary::default();
-        apply_entry(&mut summary, &entry);
-        assert_eq!(summary.input_tokens, 11);
-        assert_eq!(summary.output_tokens, 3);
-        assert!(
-            summary
-                .unknown_models
-                .contains("future-model-without-a-rate")
-        );
-        assert!(summary.model_pricing_completeness.is_partial());
-    }
-
-    #[test]
-    fn standalone_parser_keeps_the_mapped_provider_for_mixed_history() {
-        let codex = serde_json::json!({
-            "id": "codex-1",
-            "role": "assistant",
-            "provider": "openai-codex",
-            "model": "gpt-5",
-            "usage": { "input": 100, "output": 20 }
-        });
-        let claude = serde_json::json!({
-            "id": "claude-1",
-            "role": "assistant",
-            "provider": "anthropic",
-            "model": "claude-sonnet-4-6",
-            "usage": { "input": 100, "output": 20 }
-        });
-
-        assert_eq!(
-            parse_pi_assistant_entry_any(&codex)
-                .expect("Codex row should parse")
-                .provider,
-            PiMappedProvider::Codex
-        );
-        assert_eq!(
-            parse_pi_assistant_entry_any(&claude)
-                .expect("Claude row should parse")
-                .provider,
-            PiMappedProvider::Claude
-        );
-    }
-
-    #[test]
-    fn dedupes_shared_entry_ids_across_files() {
-        let dir = tempdir().unwrap();
-        let sessions = dir.path().join("agent").join("sessions");
-        std::fs::create_dir_all(&sessions).unwrap();
-        let header = r#"{"type":"session","id":"session-1"}"#;
-        let line = r#"{"id":"shared-1","role":"assistant","provider":"openai-codex","model":"gpt-5","timestamp":"2026-07-20T12:00:00Z","usage":{"input":50,"output":5}}"#;
-        for name in ["a.jsonl", "b.jsonl"] {
-            let mut f = File::create(sessions.join(name)).unwrap();
-            writeln!(f, "{header}").unwrap();
-            writeln!(f, "{line}").unwrap();
-        }
-
-        // Point home at temp so roots resolve under .omp
-        let home = dir.path().to_path_buf();
-        // Manually walk the sessions we created via for_each
-        let mut seen = HashSet::new();
-        let mut summary = CostSummary::default();
-        let mut total = 0u32;
-        for name in ["a.jsonl", "b.jsonl"] {
-            total += for_each_pi_entry(
-                &sessions.join(name),
-                DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
-                    .unwrap()
-                    .with_timezone(&Utc),
-                Some(PiMappedProvider::Codex),
-                &mut seen,
-                |entry| apply_entry(&mut summary, &entry),
-            )
-            .counted;
-        }
-        assert_eq!(seen.len(), 1);
-        assert_eq!(summary.input_tokens, 50);
-        assert_eq!(total, 1); // second file deduped
-        let _ = home;
-    }
-
-    #[test]
-    fn same_message_id_in_distinct_sessions_is_not_deduped() {
-        let dir = tempdir().unwrap();
-        let sessions = dir.path().join("agent").join("sessions");
-        std::fs::create_dir_all(&sessions).unwrap();
-        let line = r#"{"id":"reused-message","role":"assistant","provider":"openai-codex","model":"gpt-5","timestamp":"2026-07-20T12:00:00Z","usage":{"input":50,"output":5}}"#;
-        for session in ["session-a", "session-b"] {
-            let mut f = File::create(sessions.join(format!("{session}.jsonl"))).unwrap();
-            writeln!(f, "{{\"type\":\"session\",\"id\":\"{session}\"}}").unwrap();
-            writeln!(f, "{line}").unwrap();
-        }
-
-        let cutoff = DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let mut seen = HashSet::new();
-        let mut summary = CostSummary::default();
-        let mut total = 0u32;
-        for session in ["session-a", "session-b"] {
-            total += for_each_pi_entry(
-                &sessions.join(format!("{session}.jsonl")),
-                cutoff,
-                Some(PiMappedProvider::Codex),
-                &mut seen,
-                |entry| apply_entry(&mut summary, &entry),
-            )
-            .counted;
-        }
-        assert_eq!(total, 2);
-        assert_eq!(summary.input_tokens, 100);
-    }
-
-    #[test]
-    fn configured_roots_include_explicit_pi_and_omp_profile_sources() {
-        let home = tempdir().unwrap();
-        let cwd = home.path().join("project");
-        std::fs::create_dir_all(&cwd).unwrap();
-        let mut environment = EnvMap::new();
-        environment.insert(
-            "PI_CODING_AGENT_SESSION_DIR".to_string(),
-            "pi-sessions".to_string(),
-        );
-        environment.insert("PI_CONFIG_DIR".to_string(), "config".to_string());
-        environment.insert("OMP_PROFILE".to_string(), "work".to_string());
-
-        let roots = pi_compatible_session_roots_for(home.path(), &cwd, &environment);
-        let pi_root = cwd.join("pi-sessions");
-        let omp_root = home
-            .path()
-            .join("config")
-            .join("profiles")
-            .join("work")
-            .join("agent")
-            .join("sessions");
-        assert!(roots.iter().any(|root| root == &pi_root));
-        assert!(roots.iter().any(|root| root == &omp_root));
-
-        let duplicate = concat!(
-            r#"{"type":"session","id":"session-1"}"#,
-            "\n",
-            r#"{"id":"shared","role":"assistant","provider":"openai-codex","model":"gpt-5","timestamp":"2026-07-20T12:00:00Z","usage":{"input":50,"output":5}}"#,
-            "\n"
-        );
-        let unique = concat!(
-            r#"{"type":"session","id":"session-2"}"#,
-            "\n",
-            r#"{"id":"unique","role":"assistant","provider":"anthropic","model":"claude-sonnet-4-6","timestamp":"2026-07-20T13:00:00Z","usage":{"input":70,"output":7}}"#,
-            "\n"
-        );
-        std::fs::create_dir_all(&pi_root).unwrap();
-        std::fs::create_dir_all(&omp_root).unwrap();
-        std::fs::write(pi_root.join("session.jsonl"), duplicate).unwrap();
-        std::fs::write(omp_root.join("session.jsonl"), duplicate).unwrap();
-        std::fs::write(omp_root.join("unique.jsonl"), unique).unwrap();
-
-        let scan = scan_pi_daily_from_roots(
-            DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
-            None,
-            roots,
-        );
-        assert!(scan.history_coverage_established);
-        assert_eq!(scan.tokens.values().sum::<u64>(), 132);
-    }
-
-    #[test]
-    fn malformed_usage_input_keeps_valid_rows_but_marks_source_incomplete() {
-        let dir = tempdir().unwrap();
-        let sessions = dir.path().join("agent").join("sessions");
-        std::fs::create_dir_all(&sessions).unwrap();
-        let valid = r#"{"id":"valid","role":"assistant","provider":"openai-codex","model":"gpt-5","timestamp":"2026-07-20T12:00:00Z","usage":{"input":11,"output":3}}"#;
-        std::fs::write(
-            sessions.join("mixed.jsonl"),
-            format!("{valid}\n{{\"role\":\"assistant\",\"usage\":\n"),
-        )
-        .unwrap();
-
-        let scan = scan_pi_daily_from_roots(
-            DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
-            None,
-            vec![sessions.clone()],
-        );
-        assert!(!scan.history_coverage_established);
-        assert_eq!(scan.tokens.values().sum::<u64>(), 14);
-
-        let mut summary = CostSummary::default();
-        let mut seen = HashSet::new();
-        let evidence = scan_roots_into(
-            &mut summary,
-            Utc::now() - Duration::days(365),
-            None,
-            &mut seen,
-            vec![sessions],
-            None,
-        );
-        assert!(!evidence.complete);
-        assert_eq!(summary.input_tokens, 11);
-    }
-
-    #[test]
-    fn standalone_daily_scan_dedupes_pi_and_omp_roots() {
-        let dir = tempdir().unwrap();
-        let pi_sessions = dir.path().join(".pi").join("agent").join("sessions");
-        let omp_sessions = dir.path().join(".omp").join("agent").join("sessions");
-        std::fs::create_dir_all(&pi_sessions).unwrap();
-        std::fs::create_dir_all(&omp_sessions).unwrap();
-        let codex = r#"{"id":"shared","role":"assistant","provider":"openai-codex","model":"gpt-5","timestamp":"2026-07-20T12:00:00Z","usage":{"input":50,"output":5}}"#;
-        let claude = r#"{"id":"claude-only","role":"assistant","provider":"anthropic","model":"claude-sonnet-4-6","timestamp":"2026-07-20T13:00:00Z","usage":{"input":70,"output":7}}"#;
-        std::fs::write(
-            pi_sessions.join("one.jsonl"),
-            format!("{codex}\n{claude}\n"),
-        )
-        .unwrap();
-        std::fs::write(omp_sessions.join("one.jsonl"), format!("{codex}\n")).unwrap();
-
-        let scan = scan_pi_daily_from_roots(
-            DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
-            None,
-            vec![pi_sessions, omp_sessions],
-        );
-        assert!(scan.history_coverage_established);
-        assert_eq!(scan.tokens.values().sum::<u64>(), 132);
-        assert_eq!(scan.tokens.len(), 1);
-    }
-
-    #[test]
-    fn daily_tokens_count_cache_like_the_window_total() {
-        let dir = tempdir().unwrap();
-        let sessions = dir.path().join("agent").join("sessions");
-        std::fs::create_dir_all(&sessions).unwrap();
-        let codex = r#"{"id":"cached-codex","role":"assistant","provider":"openai-codex","model":"gpt-5","timestamp":"2026-07-20T12:00:00Z","usage":{"input":100,"output":20,"cacheRead":10,"cacheWrite":5}}"#;
-        let claude = r#"{"id":"cached-claude","role":"assistant","provider":"anthropic","model":"claude-sonnet-4-6","timestamp":"2026-07-20T13:00:00Z","usage":{"input":40,"output":4,"cacheRead":300,"cacheWrite":30}}"#;
-        std::fs::write(
-            sessions.join("cached.jsonl"),
-            format!("{codex}\n{claude}\n"),
-        )
-        .unwrap();
-        let cutoff = DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-
-        let scan = scan_pi_daily_from_roots(cutoff, None, vec![sessions.clone()]);
-        assert!(scan.history_coverage_established);
-        let daily_total = scan.tokens.values().sum::<u64>();
-        assert_eq!(daily_total, 135 + 374);
-
-        let mut summary = CostSummary::default();
-        let mut seen = HashSet::new();
-        let evidence = scan_roots_into(&mut summary, cutoff, None, &mut seen, vec![sessions], None);
-        assert!(evidence.complete);
-        assert_eq!(summary.total_tokens_for_provider("pi"), daily_total);
-    }
-
-    #[test]
-    fn session_roots_include_pi_and_omp() {
-        let home = PathBuf::from("/home/user");
-        let roots = pi_compatible_session_roots_for(&home, &home, &EnvMap::new());
-        assert!(
-            roots
-                .iter()
-                .any(|p| p.ends_with(".pi/agent/sessions") || p.ends_with(".pi\\agent\\sessions"))
-        );
-        assert!(roots.iter().any(|p| p.ends_with(".omp/agent/sessions") || p.ends_with(".omp\\agent\\sessions")));
-    }
-}
+mod tests;

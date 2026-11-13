@@ -19,6 +19,8 @@
 //!   (Electron) Chromium cookie store, still used for International.
 //! - [`ratio_pool`]: zero-ratio placeholder reconciliation against matching
 //!   legacy counters (upstream 0.63.0).
+//! - [`monthly_breakdown`]: Kimi Code / other-features split of the
+//!   monthly `Total usage` pool (upstream #4759).
 //! - [`auto`]: Auto-mode order after the Code API key (CLI credential, then
 //!   web auth) and which failure is reported when neither works.
 
@@ -30,6 +32,7 @@ pub mod desktop_token;
 mod local_storage;
 #[cfg(test)]
 mod monthly_blocking_tests;
+mod monthly_breakdown;
 mod ratio_pool;
 mod region;
 mod web;
@@ -39,15 +42,17 @@ pub use region::KimiRegion;
 use credential::KimiWebCredential;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use reqwest::Client;
 use serde::Deserialize;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::core::{
-    FetchContext, Provider, ProviderError, ProviderFetchResult, ProviderId, ProviderMetadata,
+    FetchContext, Provider, ProviderDisplayDetail, ProviderError, ProviderFetchResult, ProviderId,
     RateWindow, SourceMode, UsageSnapshot,
 };
+use crate::providers::json;
+use crate::settings::Language;
 
 /// Extra-window id of the monthly membership pool (`Total usage`).
 pub const MONTHLY_WINDOW_ID: &str = "kimi-monthly";
@@ -85,6 +90,10 @@ struct KimiCodeUsagePools {
     weekly: Option<KimiRatioPool>,
     #[serde(default, rename = "limit_month_total")]
     monthly: Option<KimiRatioPool>,
+    /// Kimi Code share of the monthly pool (upstream #4759). Kept as raw JSON
+    /// so a malformed share never rejects the quota windows.
+    #[serde(default, rename = "limit_month_code")]
+    monthly_code: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -98,11 +107,13 @@ struct KimiRatioPool {
 impl KimiRatioPool {
     /// Explicit zero is a known quota value; missing or malformed ratios stay
     /// unknown rather than being rendered as 0% used.
+    fn valid_ratio(&self) -> Option<f64> {
+        json::lenient_f64(self.used_ratio.as_ref())
+            .filter(|ratio| ratio.is_finite() && *ratio >= 0.0)
+    }
+
     fn rate_window(&self, window_minutes: u32) -> Option<RateWindow> {
-        let ratio = value_as_f64(self.used_ratio.as_ref())?;
-        if !ratio.is_finite() || ratio < 0.0 {
-            return None;
-        }
+        let ratio = self.valid_ratio()?;
         Some(RateWindow::with_details(
             ratio.min(1.0) * 100.0,
             Some(window_minutes),
@@ -149,7 +160,10 @@ impl KimiCodeApiUsageResponse {
 
 #[derive(Debug, Deserialize)]
 struct KimiWebUsageResponse {
-    usages: Vec<KimiUsage>,
+    /// Upstream #4700: a lapsed plan can answer without any Code pools (for
+    /// example `{"totalQuota": ...}`), so the list is optional.
+    #[serde(default)]
+    usages: Option<Vec<KimiUsage>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,13 +177,30 @@ struct KimiUsage {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct KimiSubscriptionStatsResponse {
-    subscription_balance: Option<KimiSubscriptionBalance>,
+    subscription_balance: Option<KimiCreditBalance>,
     ratelimit_code7d: Option<KimiSubscriptionRateLimit>,
+    /// Promotional gift pools (upstream #4691). Kept as raw JSON so a
+    /// malformed gift list never rejects the subscription statistics; see
+    /// [`KimiSubscriptionStatsResponse::gift_balances`].
+    #[serde(default)]
+    gift_balances: Option<serde_json::Value>,
 }
 
+impl KimiSubscriptionStatsResponse {
+    /// Upstream `giftBalances` is decoded with `try?`: a list that does not
+    /// decode as a whole yields no gifts, and the subscription pools survive.
+    fn gift_balances(&self) -> Vec<KimiCreditBalance> {
+        self.gift_balances
+            .as_ref()
+            .and_then(|value| Vec::<KimiCreditBalance>::deserialize(value).ok())
+            .unwrap_or_default()
+    }
+}
+
+/// A subscription or gift credit pool (upstream `KimiCreditBalance`).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct KimiSubscriptionBalance {
+struct KimiCreditBalance {
     amount_used_ratio: Option<serde_json::Value>,
     expire_time: Option<serde_json::Value>,
     /// Pool scoping (upstream 0.49.0 #2741): only the omni/subscription pool
@@ -178,6 +209,13 @@ struct KimiSubscriptionBalance {
     feature: Option<String>,
     #[serde(default, rename = "type")]
     balance_type: Option<String>,
+    /// Server-provided gift name. Read leniently: an unusable name falls back
+    /// to the generic "Bonus credits" label instead of dropping the gift.
+    #[serde(default)]
+    display_name: Option<serde_json::Value>,
+    /// Kimi Code share of the subscription pool (upstream #4759).
+    #[serde(default)]
+    kimi_code_used_ratio: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -257,27 +295,12 @@ pub(crate) const PACE_CAPABILITY: crate::core::ProviderPaceCapability =
     ));
 
 /// Kimi AI provider
-pub struct KimiProvider {
-    metadata: ProviderMetadata,
-}
+#[derive(Default)]
+pub struct KimiProvider;
 
 impl KimiProvider {
     pub fn new() -> Self {
-        Self {
-            metadata: ProviderMetadata {
-                id: ProviderId::Kimi,
-                display_name: "Kimi",
-                session_label: "Weekly",
-                weekly_label: "Rate Limit",
-                supports_opus: false,
-                supports_credits: false,
-                default_enabled: false,
-                is_primary: false,
-                dashboard_url: Some("https://kimi.moonshot.cn"),
-                status_page_url: None,
-                tertiary_label_key: None,
-            },
-        }
+        Self
     }
 
     fn auth_token_from_cookie_headers(
@@ -318,12 +341,12 @@ impl KimiProvider {
         detail: &KimiUsageDetail,
         window_minutes: Option<u32>,
     ) -> Result<RateWindow, ProviderError> {
-        let limit = value_as_f64(detail.limit.as_ref())
+        let limit = json::lenient_f64(detail.limit.as_ref())
             .filter(|limit| *limit > 0.0)
             .ok_or_else(|| ProviderError::Parse("Kimi usage limit missing".into()))?;
         let used = match (
-            value_as_f64(detail.used.as_ref()),
-            value_as_f64(detail.remaining.as_ref()),
+            json::lenient_f64(detail.used.as_ref()),
+            json::lenient_f64(detail.remaining.as_ref()),
         ) {
             (Some(used), _) => used,
             (None, Some(remaining)) => (limit - remaining).max(0.0),
@@ -349,20 +372,10 @@ impl KimiProvider {
     }
 }
 
-impl Default for KimiProvider {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[async_trait]
 impl Provider for KimiProvider {
     fn id(&self) -> ProviderId {
         ProviderId::Kimi
-    }
-
-    fn metadata(&self) -> &ProviderMetadata {
-        &self.metadata
     }
 
     async fn fetch_usage(&self, ctx: &FetchContext) -> Result<ProviderFetchResult, ProviderError> {
@@ -373,8 +386,8 @@ impl Provider for KimiProvider {
             SourceMode::Auto => {
                 if code_api::code_api_key(ctx.api_key.as_deref()).is_ok() {
                     match code_api::fetch_via_code_api(ctx, region, None, None, "Code API").await {
-                        Ok(usage) => {
-                            return Ok(ProviderFetchResult::new(usage, "code-api"));
+                        Ok(fetched) => {
+                            return Ok(fetched);
                         }
                         Err(err) => {
                             tracing::debug!(
@@ -415,18 +428,15 @@ impl Provider for KimiProvider {
                 .await
             }
             SourceMode::OAuth => {
-                let usage =
-                    code_api::fetch_via_code_api(ctx, region, None, None, "Code API").await?;
-                Ok(ProviderFetchResult::new(usage, "code-api"))
+                code_api::fetch_via_code_api(ctx, region, None, None, "Code API").await
             }
             SourceMode::Web => {
-                let usage = web::fetch_via_web(
+                web::fetch_via_web(
                     ctx.manual_cookie_header.as_deref(),
                     region,
                     ctx.token_account_isolated,
                 )
-                .await?;
-                Ok(ProviderFetchResult::new(usage, "web"))
+                .await
             }
             SourceMode::Cli => Err(ProviderError::UnsupportedSource(SourceMode::Cli)),
         }
@@ -434,14 +444,6 @@ impl Provider for KimiProvider {
 
     fn available_sources(&self) -> Vec<SourceMode> {
         vec![SourceMode::Auto, SourceMode::Web, SourceMode::OAuth]
-    }
-
-    fn supports_web(&self) -> bool {
-        true
-    }
-
-    fn supports_cli(&self) -> bool {
-        false
     }
 
     fn supports_oauth(&self) -> bool {
@@ -487,13 +489,7 @@ fn apply_subscription_windows(
         .extra_rate_windows
         .iter()
         .any(|extra| extra.id == MONTHLY_WINDOW_ID);
-    if !has_monthly_pool
-        && let Some(balance) = subscription.subscription_balance.as_ref()
-        && matches!(balance.feature.as_deref(), None | Some("FEATURE_OMNI"))
-        && matches!(balance.balance_type.as_deref(), None | Some("SUBSCRIPTION"))
-        && let Some(ratio) =
-            value_as_f64(balance.amount_used_ratio.as_ref()).filter(|value| value.is_finite())
-    {
+    if !has_monthly_pool && let Some((balance, ratio)) = subscription_pool(subscription) {
         // Verified monthly sentinel (#2431 / #2566).
         usage = usage.with_extra_rate_window(
             MONTHLY_WINDOW_ID,
@@ -509,7 +505,8 @@ fn apply_subscription_windows(
 
     if let Some(limit) = subscription.ratelimit_code7d.as_ref()
         && limit.enabled.unwrap_or(true)
-        && let Some(ratio) = value_as_f64(limit.ratio.as_ref()).filter(|value| value.is_finite())
+        && let Some(ratio) =
+            json::lenient_f64(limit.ratio.as_ref()).filter(|value| value.is_finite())
     {
         // Upstream 0.49.0 #2741: the membership 7-day Code ratio and the
         // FEATURE_CODING weekly detail report the same quota through two
@@ -526,6 +523,21 @@ fn apply_subscription_windows(
     }
 
     usage
+}
+
+/// The omni subscription pool that backs `Total usage`, with its used ratio.
+fn subscription_pool(
+    subscription: &KimiSubscriptionStatsResponse,
+) -> Option<(&KimiCreditBalance, f64)> {
+    let balance = subscription.subscription_balance.as_ref()?;
+    if !matches!(balance.feature.as_deref(), None | Some("FEATURE_OMNI"))
+        || !matches!(balance.balance_type.as_deref(), None | Some("SUBSCRIPTION"))
+    {
+        return None;
+    }
+    let ratio =
+        json::lenient_f64(balance.amount_used_ratio.as_ref()).filter(|value| value.is_finite())?;
+    Some((balance, ratio))
 }
 
 /// Upstream `isEquivalentToWeeklyWindow` (#2741): suppress the Code 7-day row
@@ -548,6 +560,16 @@ fn is_equivalent_to_weekly_window(window: &RateWindow, weekly: &RateWindow) -> b
     }
 }
 
+/// Upstream `KimiUsageFetcher.webLanguage` (#4691): Kimi serves gift names in
+/// Chinese for unsupported languages, so only the Chinese UI asks for `zh-CN`
+/// and every other UI language keeps English names.
+fn web_language(language: Language) -> &'static str {
+    match language {
+        Language::Chinese | Language::ChineseTraditional => "zh-CN",
+        _ => "en-US",
+    }
+}
+
 async fn kimi_web_post(
     client: &Client,
     url: &str,
@@ -567,6 +589,7 @@ fn kimi_web_request(
     token: &str,
     body: serde_json::Value,
 ) -> Result<reqwest::Request, ProviderError> {
+    let language = web_language(crate::locale::current_language());
     client
         .post(url)
         .bearer_auth(token)
@@ -575,6 +598,7 @@ fn kimi_web_request(
         .header("Content-Type", "application/json")
         .header("Origin", region.web_base_url())
         .header("Referer", region.console_url())
+        .header("x-language", language)
         .header(
             "User-Agent",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -584,12 +608,60 @@ fn kimi_web_request(
         .map_err(ProviderError::from)
 }
 
-fn value_as_f64(value: Option<&serde_json::Value>) -> Option<f64> {
-    match value? {
-        serde_json::Value::Number(number) => number.as_f64(),
-        serde_json::Value::String(text) => text.trim().replace(',', "").parse().ok(),
-        _ => None,
-    }
+/// Heading of the gift rows (upstream `KimiUsageSnapshot.giftDetails`).
+const GIFT_SECTION_TITLE: &str = "Bonus credits";
+
+/// Upstream `KimiUsageSnapshot.giftDetails` (#4691): promotional gift pools as
+/// one "Bonus credits" section with one row per live gift: remaining share,
+/// progress and expiry. Gifts that are not omni gift pools, carry an unusable
+/// ratio, or expired at or before `updated_at` are skipped. The rows are
+/// independent of the monthly quota, so they stay visible when it is spent.
+fn gift_display_details(
+    subscription: &KimiSubscriptionStatsResponse,
+    updated_at: DateTime<Utc>,
+) -> Vec<ProviderDisplayDetail> {
+    subscription
+        .gift_balances()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, gift)| {
+            if !matches!(gift.feature.as_deref(), None | Some("FEATURE_OMNI"))
+                || !matches!(gift.balance_type.as_deref(), None | Some("GIFT"))
+            {
+                return None;
+            }
+            let used = json::lenient_f64(gift.amount_used_ratio.as_ref())
+                .filter(|ratio| ratio.is_finite() && *ratio >= 0.0)?;
+            let expires_at = gift.expire_time.as_ref().and_then(parse_kimi_timestamp);
+            if expires_at.is_some_and(|expires_at| expires_at <= updated_at) {
+                return None;
+            }
+            let title = gift
+                .display_name
+                .as_ref()
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|name| ProviderDisplayDetail::is_valid_title(name))
+                .unwrap_or(GIFT_SECTION_TITLE);
+            let remaining = ((1.0 - used) * 100.0).clamp(0.0, 100.0);
+            let row = ProviderDisplayDetail::new(
+                format!("kimi-gift-{index}"),
+                title,
+                format!("{remaining:.0}% left"),
+            )?
+            .with_section_title(GIFT_SECTION_TITLE)?
+            .with_progress(used, 1.0)?;
+            match expires_at {
+                Some(expires_at) => row.with_secondary_value(format!(
+                    "Expires {}",
+                    expires_at
+                        .with_timezone(&Local)
+                        .format("%b %-d, %Y at %-I:%M %p")
+                )),
+                None => Some(row),
+            }
+        })
+        .collect()
 }
 
 fn parse_kimi_timestamp(value: &serde_json::Value) -> Option<DateTime<Utc>> {
@@ -658,19 +730,23 @@ fn ascii_header_value(raw: &str) -> String {
     }
 }
 
-fn format_usage_amount(value: f64) -> String {
-    if value.is_finite()
+/// `value` as an i64 when it is finite, integral and inside the i64 range.
+fn exact_i64(value: f64) -> Option<i64> {
+    // The strict upper bound excludes 2^63, which is representable as f64
+    // but has no exact i64 representation.
+    let integral = value.is_finite()
         && value.fract() == 0.0
         && value >= i64::MIN as f64
-        && value < i64::MAX as f64
-    {
-        // The strict upper bound excludes 2^63, which is representable as f64
-        // but has no exact i64 representation.
-        #[allow(
-            clippy::cast_possible_truncation,
-            reason = "finite integral value is bounded to the i64 range above"
-        )]
-        let integral = value as i64;
+        && value < i64::MAX as f64;
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "finite integral value is bounded to the i64 range above"
+    )]
+    integral.then_some(value as i64)
+}
+
+fn format_usage_amount(value: f64) -> String {
+    if let Some(integral) = exact_i64(value) {
         format!("{integral}")
     } else if value.is_finite() && value.fract() == 0.0 {
         // Preserve a large integral value without saturating it to i64::MAX.
@@ -683,7 +759,21 @@ fn format_usage_amount(value: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
+
+    fn web_snapshot(usage: Value, subscription: Value) -> UsageSnapshot {
+        let usage: KimiWebUsageResponse = serde_json::from_value(usage).unwrap();
+        let subscription: KimiSubscriptionStatsResponse =
+            serde_json::from_value(subscription).unwrap();
+        web::snapshot_from_web_usage_response(usage, Some(subscription)).unwrap()
+    }
+
+    fn has_extra(snapshot: &UsageSnapshot, id: &str) -> bool {
+        snapshot
+            .extra_rate_windows
+            .iter()
+            .any(|window| window.id == id)
+    }
 
     #[test]
     fn auth_token_search_skips_unrelated_cookie_headers() {
@@ -780,31 +870,29 @@ mod tests {
 
     #[test]
     fn parses_web_usage_with_subscription_windows() {
-        let usage: KimiWebUsageResponse = serde_json::from_value(json!({
-            "usages": [{
-                "scope": "FEATURE_CODING",
-                "detail": { "limit": "2048", "used": "375", "resetTime": "2026-01-09T15:23:13Z" },
-                "limits": [{
-                    "window": { "duration": 300, "timeUnit": "TIME_UNIT_MINUTE" },
-                    "detail": { "limit": "100", "used": "25" }
+        let snapshot = web_snapshot(
+            json!({
+                "usages": [{
+                    "scope": "FEATURE_CODING",
+                    "detail": { "limit": "2048", "used": "375", "resetTime": "2026-01-09T15:23:13Z" },
+                    "limits": [{
+                        "window": { "duration": 300, "timeUnit": "TIME_UNIT_MINUTE" },
+                        "detail": { "limit": "100", "used": "25" }
+                    }]
                 }]
-            }]
-        }))
-        .unwrap();
-        let subscription: KimiSubscriptionStatsResponse = serde_json::from_value(json!({
-            "subscriptionBalance": {
-                "amountUsedRatio": 0.7716,
-                "expireTime": "2026-07-23T00:00:00Z"
-            },
-            "ratelimitCode7d": {
-                "ratio": 0.0946,
-                "enabled": true,
-                "resetTime": "2026-07-13T15:28:00Z"
-            }
-        }))
-        .unwrap();
-
-        let snapshot = web::snapshot_from_web_usage_response(usage, Some(subscription)).unwrap();
+            }),
+            json!({
+                "subscriptionBalance": {
+                    "amountUsedRatio": 0.7716,
+                    "expireTime": "2026-07-23T00:00:00Z"
+                },
+                "ratelimitCode7d": {
+                    "ratio": 0.0946,
+                    "enabled": true,
+                    "resetTime": "2026-07-13T15:28:00Z"
+                }
+            }),
+        );
 
         assert!((snapshot.primary.used_percent - 18.310546875).abs() < f64::EPSILON);
         assert_eq!(
@@ -834,29 +922,22 @@ mod tests {
     fn feature_scoped_balance_is_not_the_total_usage_lane() {
         // Upstream 0.49.0 #2741: only the omni/subscription pool maps to the
         // "Total usage" lane; feature-scoped balances must not.
-        let usage: KimiWebUsageResponse = serde_json::from_value(json!({
-            "usages": [{
-                "scope": "FEATURE_CODING",
-                "detail": { "limit": "2048", "used": "375" }
-            }]
-        }))
-        .unwrap();
-        let subscription: KimiSubscriptionStatsResponse = serde_json::from_value(json!({
-            "subscriptionBalance": {
-                "amountUsedRatio": 0.5,
-                "feature": "FEATURE_CODING",
-                "type": "SUBSCRIPTION"
-            }
-        }))
-        .unwrap();
-
-        let snapshot = web::snapshot_from_web_usage_response(usage, Some(subscription)).unwrap();
-        assert!(
-            snapshot
-                .extra_rate_windows
-                .iter()
-                .all(|window| window.id != "kimi-monthly")
+        let snapshot = web_snapshot(
+            json!({
+                "usages": [{
+                    "scope": "FEATURE_CODING",
+                    "detail": { "limit": "2048", "used": "375" }
+                }]
+            }),
+            json!({
+                "subscriptionBalance": {
+                    "amountUsedRatio": 0.5,
+                    "feature": "FEATURE_CODING",
+                    "type": "SUBSCRIPTION"
+                }
+            }),
         );
+        assert!(!has_extra(&snapshot, "kimi-monthly"));
     }
 
     #[test]
@@ -864,7 +945,7 @@ mod tests {
         // Upstream 0.49.0 #2741: when the membership Code 7-day ratio and the
         // primary weekly window agree (percent within 1 point, resets within
         // 5 minutes, weekly counter reliable), the extra row is suppressed.
-        let usage: KimiWebUsageResponse = serde_json::from_value(json!({
+        let usage = json!({
             "usages": [{
                 "scope": "FEATURE_CODING",
                 "detail": {
@@ -873,58 +954,27 @@ mod tests {
                     "resetTime": "2026-08-13T15:28:00Z"
                 }
             }]
-        }))
-        .unwrap();
-        let subscription_matching: KimiSubscriptionStatsResponse = serde_json::from_value(json!({
-            "ratelimitCode7d": {
-                "ratio": 0.421,
-                "enabled": true,
-                "resetTime": "2026-08-13T15:30:00Z"
-            }
-        }))
-        .unwrap();
+        });
+        let code_7d = |ratio: f64| {
+            json!({
+                "ratelimitCode7d": {
+                    "ratio": ratio,
+                    "enabled": true,
+                    "resetTime": "2026-08-13T15:30:00Z"
+                }
+            })
+        };
 
-        let snapshot =
-            web::snapshot_from_web_usage_response(usage, Some(subscription_matching)).unwrap();
-
+        let snapshot = web_snapshot(usage.clone(), code_7d(0.421));
         assert!((snapshot.primary.used_percent - 42.0).abs() < f64::EPSILON);
         assert!(
-            snapshot
-                .extra_rate_windows
-                .iter()
-                .all(|window| window.id != "kimi-code-7d"),
+            !has_extra(&snapshot, "kimi-code-7d"),
             "matching Code 7-day row should be suppressed"
         );
 
         // Diverging ratio (or missing reset evidence) keeps the row.
-        let subscription_diverging: KimiSubscriptionStatsResponse = serde_json::from_value(json!({
-            "ratelimitCode7d": {
-                "ratio": 0.9,
-                "enabled": true,
-                "resetTime": "2026-08-13T15:30:00Z"
-            }
-        }))
-        .unwrap();
-        let usage_diverging: KimiWebUsageResponse = serde_json::from_value(json!({
-            "usages": [{
-                "scope": "FEATURE_CODING",
-                "detail": {
-                    "limit": "1000",
-                    "used": "420",
-                    "resetTime": "2026-08-13T15:28:00Z"
-                }
-            }]
-        }))
-        .unwrap();
-        let snapshot =
-            web::snapshot_from_web_usage_response(usage_diverging, Some(subscription_diverging))
-                .unwrap();
-        assert!(
-            snapshot
-                .extra_rate_windows
-                .iter()
-                .any(|window| window.id == "kimi-code-7d")
-        );
+        let snapshot = web_snapshot(usage, code_7d(0.9));
+        assert!(has_extra(&snapshot, "kimi-code-7d"));
     }
 
     #[test]
@@ -935,12 +985,21 @@ mod tests {
     }
 
     #[test]
-    fn oversized_integral_usage_amount_is_not_saturated_to_i64_max() {
-        let value = 2_f64.powi(63);
-        let formatted = format_usage_amount(value);
-
-        assert!(formatted.starts_with("9223372036854775808"));
-        assert_ne!(formatted, i64::MAX.to_string());
+    fn usage_amount_formats_integral_fractional_and_non_finite_values() {
+        let cases = [
+            (42.0, "42"),
+            (-0.0, "0"),
+            (1.5, "1.50"),
+            (-2_f64.powi(63), "-9223372036854775808"),
+            // Not saturated to i64::MAX.
+            (2_f64.powi(63), "9223372036854775808"),
+            (1e20, "100000000000000000000"),
+            (f64::NAN, "NaN"),
+            (f64::INFINITY, "inf"),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(format_usage_amount(value), expected, "{value}");
+        }
     }
 
     #[test]
@@ -951,5 +1010,221 @@ mod tests {
         };
 
         assert_eq!(kimi_window_minutes(&window), None);
+    }
+
+    /// Upstream #4700: a lapsed plan answers with `totalQuota` and no `usages`.
+    fn lapsed_usage() -> Value {
+        json!({ "totalQuota": { "limit": "100", "used": "36", "remaining": "64" } })
+    }
+
+    fn lapsed_membership_stats() -> Value {
+        json!({
+            "subscriptionBalance": {
+                "feature": "FEATURE_OMNI",
+                "type": "SUBSCRIPTION",
+                "amountUsedRatio": 0,
+                "expireTime": "2026-11-22T00:00:00Z"
+            }
+        })
+    }
+
+    #[test]
+    fn lapsed_web_usage_decodes_without_code_pools() {
+        let response: KimiWebUsageResponse = serde_json::from_value(lapsed_usage()).unwrap();
+        assert!(response.usages.is_none());
+    }
+
+    #[test]
+    fn lapsed_web_session_keeps_membership_balance_without_code_pools() {
+        // Upstream #4700: membership pools supply usage; no invented Code bars.
+        let snapshot = web_snapshot(lapsed_usage(), lapsed_membership_stats());
+
+        assert!(snapshot.primary.is_informational);
+        assert!(snapshot.secondary.is_none());
+        let monthly = snapshot
+            .extra_rate_windows
+            .iter()
+            .find(|window| window.id == MONTHLY_WINDOW_ID)
+            .unwrap();
+        assert!((monthly.window.used_percent - 0.0).abs() < f64::EPSILON);
+        assert_eq!(monthly.window.window_minutes, Some(30 * 24 * 60));
+    }
+
+    #[test]
+    fn lapsed_web_session_without_membership_balances_keeps_scope_error() {
+        // Upstream #4700: neither Code usage nor a membership quota is an error.
+        let usage: KimiWebUsageResponse = serde_json::from_value(lapsed_usage()).unwrap();
+        let subscription: KimiSubscriptionStatsResponse =
+            serde_json::from_value(json!({})).unwrap();
+
+        let error = web::snapshot_from_web_usage_response(usage, Some(subscription)).unwrap_err();
+        assert!(matches!(
+            error,
+            ProviderError::Parse(ref message)
+                if message == "FEATURE_CODING scope not found in response"
+        ));
+    }
+
+    fn gift_stats() -> KimiSubscriptionStatsResponse {
+        // Synthetic pools shaped like upstream #4691's fixture. Expired,
+        // ratio-less, non-omni and expired-at-update gifts must not show.
+        serde_json::from_value(json!({
+            "subscriptionBalance": {
+                "feature": "FEATURE_OMNI",
+                "type": "SUBSCRIPTION",
+                "amountUsedRatio": 1,
+                "expireTime": "2026-10-22T00:00:00Z"
+            },
+            "giftBalances": [
+                {
+                    "feature": "FEATURE_OMNI",
+                    "type": "GIFT",
+                    "amountUsedRatio": 1,
+                    "expireTime": "2026-10-23T00:00:00Z",
+                    "displayName": "Reservation Bonus"
+                },
+                {
+                    "feature": "FEATURE_OMNI",
+                    "type": "GIFT",
+                    "amountUsedRatio": 0.2524,
+                    "expireTime": "2026-12-31T15:59:59Z",
+                    "displayName": "Invite to Earn Credit"
+                },
+                {
+                    "feature": "FEATURE_OMNI",
+                    "type": "GIFT",
+                    "amountUsedRatio": 0,
+                    "expireTime": "2026-10-20T00:00:00Z",
+                    "displayName": "Expired grant"
+                },
+                {
+                    "feature": "FEATURE_OMNI",
+                    "type": "GIFT",
+                    "amountUsedRatio": 0,
+                    "expireTime": "2026-10-21T15:00:00Z",
+                    "displayName": "Expires at update"
+                },
+                {
+                    "feature": "FEATURE_CODING",
+                    "type": "GIFT",
+                    "amountUsedRatio": 0.1
+                },
+                {
+                    "feature": "FEATURE_OMNI",
+                    "type": "GIFT",
+                    "displayName": "No ratio"
+                }
+            ]
+        }))
+        .unwrap()
+    }
+
+    fn fixture_updated_at() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-10-21T15:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn gift_rows_show_live_gifts_with_remaining_share_progress_and_expiry() {
+        // Upstream #4691: one "Bonus credits" row per live gift.
+        let rows = gift_display_details(&gift_stats(), fixture_updated_at());
+
+        let titles: Vec<&str> = rows.iter().map(ProviderDisplayDetail::title).collect();
+        assert_eq!(titles, ["Reservation Bonus", "Invite to Earn Credit"]);
+        assert!(
+            rows.iter()
+                .all(|row| row.section_title() == Some("Bonus credits"))
+        );
+
+        let exhausted = &rows[0];
+        assert_eq!(exhausted.value(), "0% left");
+        assert!(exhausted.secondary_value().unwrap().starts_with("Expires "));
+
+        let live = &rows[1];
+        assert_eq!(live.value(), "75% left");
+        let progress = live.progress().unwrap();
+        assert!((progress.used() - 0.2524).abs() < f64::EPSILON);
+        assert!((progress.total() - 1.0).abs() < f64::EPSILON);
+        assert!(live.secondary_value().unwrap().starts_with("Expires "));
+    }
+
+    #[test]
+    fn malformed_gift_list_keeps_subscription_usage() {
+        // Upstream #4691: a malformed optional gift list never hides monthly usage.
+        let usage: KimiWebUsageResponse = serde_json::from_value(json!({
+            "usages": [{
+                "scope": "FEATURE_CODING",
+                "detail": { "limit": "100", "used": "25" }
+            }]
+        }))
+        .unwrap();
+        let subscription: KimiSubscriptionStatsResponse = serde_json::from_value(json!({
+            "subscriptionBalance": { "amountUsedRatio": 0.5 },
+            "giftBalances": { "unexpected": true }
+        }))
+        .unwrap();
+
+        assert!(gift_display_details(&subscription, fixture_updated_at()).is_empty());
+        let snapshot = web::snapshot_from_web_usage_response(usage, Some(subscription)).unwrap();
+        let monthly = snapshot
+            .extra_rate_windows
+            .iter()
+            .find(|window| window.id == MONTHLY_WINDOW_ID)
+            .unwrap();
+        assert!((monthly.window.used_percent - 50.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn gift_balances_are_not_quota_windows() {
+        // Gift pools are display rows only; they never add an extra quota lane.
+        let usage: KimiWebUsageResponse = serde_json::from_value(json!({
+            "usages": [{
+                "scope": "FEATURE_CODING",
+                "detail": { "limit": "100", "used": "25" }
+            }]
+        }))
+        .unwrap();
+        let snapshot = web::snapshot_from_web_usage_response(usage, Some(gift_stats())).unwrap();
+
+        assert!(!has_extra(&snapshot, "kimi-gift-0"));
+        assert!(
+            !snapshot
+                .extra_rate_windows
+                .iter()
+                .any(|window| window.title == "Invite to Earn Credit")
+        );
+    }
+
+    #[test]
+    fn web_language_requests_chinese_gift_names_only_for_chinese_ui() {
+        // Upstream #4691 `KimiWebLanguageTests`: only Chinese UI asks for zh-CN.
+        assert_eq!(web_language(Language::Chinese), "zh-CN");
+        assert_eq!(web_language(Language::ChineseTraditional), "zh-CN");
+        assert_eq!(web_language(Language::English), "en-US");
+        assert_eq!(web_language(Language::Japanese), "en-US");
+        assert_eq!(web_language(Language::Korean), "en-US");
+    }
+
+    #[test]
+    fn web_requests_send_the_x_language_header() {
+        // The header is always one of the two upstream web languages.
+        let client = Client::new();
+        let request = kimi_web_request(
+            &client,
+            "https://www.kimi.com/example",
+            KimiRegion::China,
+            "fixture-token",
+            json!({}),
+        )
+        .unwrap();
+
+        let language = request
+            .headers()
+            .get("x-language")
+            .and_then(|value| value.to_str().ok())
+            .unwrap();
+        assert!(matches!(language, "zh-CN" | "en-US"), "{language}");
+        assert_eq!(language, web_language(crate::locale::current_language()));
     }
 }

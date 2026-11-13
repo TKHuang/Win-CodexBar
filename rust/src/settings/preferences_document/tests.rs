@@ -51,6 +51,7 @@ fn customized_settings() -> Settings {
         menu_bar_icon_style: crate::settings::MenuBarIconStyle::Percent,
         menu_bar_color_by_provider: true,
         merged_overview_selected_providers: vec!["claude".to_string(), "codex".to_string()],
+        merged_overview_all_accounts: true,
         quota_warning_markers_visible: false,
         workday_tick_style: crate::settings::WorkdayTickStyle::HighContrast,
         tray_icon_mode: TrayIconMode::PerProvider,
@@ -75,6 +76,7 @@ fn customized_settings() -> Settings {
         float_bar_dark_text: true,
         float_bar_show_reset_inline: true,
         float_bar_show_cost: true,
+        float_bar_show_weekly: true,
         cost_reporting_period: CostReportingPeriod::MonthToDate,
         cost_usage_enabled: false,
         spend_dashboard_period: CostReportingPeriod::Rolling(90),
@@ -211,6 +213,29 @@ fn export_is_deterministic_and_sorted() {
     let codex = first.find("\"codex\"").expect("codex listed");
     let zai = first.find("\"zai\"").expect("zai listed");
     assert!(claude < codex && codex < zai);
+}
+
+#[test]
+fn export_keeps_only_named_extras_the_provider_declares() {
+    use crate::settings::MetricPreference;
+    let mut settings = customized_settings();
+    settings.provider_metrics.insert(
+        "cursor".to_string(),
+        MetricPreference::NamedExtra("cursor-grok-bot".to_string()),
+    );
+    settings.provider_metrics.insert(
+        "codex".to_string(),
+        MetricPreference::NamedExtra("cursor-grok-bot".to_string()),
+    );
+
+    let exported = PreferencesDocument::from_settings(&settings)
+        .expect("an undeclared named extra does not prevent export");
+    let json: Value = serde_json::from_str(&exported.to_json()).expect("valid JSON");
+    let metrics = &json["preferences"]["provider_metrics"];
+
+    assert_eq!(metrics["cursor"], "extra:cursor-grok-bot");
+    assert!(metrics.get("codex").is_none());
+    assert!(metrics.get("claude").is_some());
 }
 
 #[test]
@@ -463,6 +488,11 @@ fn rejection_matrix_names_the_offending_key() {
             "merged_overview_selected_providers",
         ),
         (
+            "overview all accounts not a bool",
+            json!({ "merged_overview_all_accounts": "yes" }),
+            "merged_overview_all_accounts",
+        ),
+        (
             "threshold over 100",
             json!({ "high_usage_threshold": 100.5 }),
             "high_usage_threshold",
@@ -531,6 +561,16 @@ fn rejection_matrix_names_the_offending_key() {
         (
             "metric provider",
             json!({ "provider_metrics": { "nope": "weekly" } }),
+            "provider_metrics",
+        ),
+        (
+            "named extra of another provider",
+            json!({ "provider_metrics": { "codex": "extra:cursor-grok-bot" } }),
+            "provider_metrics",
+        ),
+        (
+            "undeclared named extra",
+            json!({ "provider_metrics": { "cursor": "extra:cursor-retired" } }),
             "provider_metrics",
         ),
         (

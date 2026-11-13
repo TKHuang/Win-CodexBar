@@ -17,9 +17,10 @@ import {
   TRAY_SCALE_STEP,
 } from "../../../lib/trayScale";
 import CostPeriodControl from "./CostPeriodControl";
+import { resetFlyoutPosition } from "../../../lib/tauri";
 
 /** macOS "Work days" choices; Automatic (empty) saves null. */
-const WORK_DAY_PRESETS = [4, 5, 7];
+const WORK_DAY_PRESETS = [4, 5, 6, 7];
 
 function parseSshHosts(value: string): string[] {
   return value
@@ -133,6 +134,25 @@ export default function MenuTab({ settings, set, saving }: TabProps) {
             onChange={(v) => set({ trayPanelAlwaysOnTop: v })}
           />
         </Field>
+        <Field label={t("TrayPanelMovableLabel")} description={t("TrayPanelMovableHelper")}>
+          <Toggle
+            variant="switch"
+            checked={settings.trayPanelMovable ?? false}
+            disabled={saving}
+            onChange={(v) => set({ trayPanelMovable: v })}
+          />
+        </Field>
+        {/* Keyboard-reachable twin of double-clicking the panel's move strip. */}
+        <div className="settings-group__row">
+          <button
+            type="button"
+            className="credential-btn"
+            disabled={saving}
+            onClick={() => void resetFlyoutPosition().catch(() => {})}
+          >
+            {t("TrayPanelResetPositionButton")}
+          </button>
+        </div>
         <Field
           label={t("ShowResetWhenExhausted")}
           description={t("ShowResetWhenExhaustedHelper")}
@@ -142,6 +162,18 @@ export default function MenuTab({ settings, set, saving }: TabProps) {
             checked={settings.showResetWhenExhausted}
             disabled={saving}
             onChange={(v) => set({ showResetWhenExhausted: v })}
+          />
+        </Field>
+        <Field label={t("PanelStyleLabel")} description={t("PanelStyleHelper")}>
+          <Select
+            variant="menu"
+            value={settings.trayPanelStyle === "classic" ? "classic" : "modern"}
+            disabled={saving}
+            options={[
+              { value: "modern", label: t("PanelStyleModern") },
+              { value: "classic", label: t("PanelStyleClassic") },
+            ]}
+            onChange={(v) => set({ trayPanelStyle: v === "classic" ? "classic" : "modern" })}
           />
         </Field>
         <Field
@@ -214,9 +246,22 @@ export default function MenuTab({ settings, set, saving }: TabProps) {
         >
           <Toggle
             variant="switch"
+            ariaLabel={t("AgentSessionsEnableLabel")}
             checked={settings.agentSessionsEnabled ?? false}
             disabled={saving}
             onChange={(v) => set({ agentSessionsEnabled: v })}
+          />
+        </Field>
+        <Field
+          label={t("AgentSessionsLocalOnlyLabel")}
+          description={t("AgentSessionsLocalOnlyHelper")}
+        >
+          <Toggle
+            variant="switch"
+            ariaLabel={t("AgentSessionsLocalOnlyLabel")}
+            checked={settings.agentSessionsLocalOnly ?? false}
+            disabled={saving || !settings.agentSessionsEnabled}
+            onChange={(v) => set({ agentSessionsLocalOnly: v })}
           />
         </Field>
         <Field
@@ -229,7 +274,11 @@ export default function MenuTab({ settings, set, saving }: TabProps) {
             value={sshHostsDraft}
             aria-label={t("AgentSessionsSshHostsLabel")}
             placeholder="user@host, user@host"
-            disabled={saving || !settings.agentSessionsEnabled}
+            disabled={
+              saving ||
+              !settings.agentSessionsEnabled ||
+              (settings.agentSessionsLocalOnly ?? false)
+            }
             onChange={(event) => setSshHostsDraft(event.target.value)}
             onBlur={() => set({ agentSessionSshHosts: parseSshHosts(sshHostsDraft) })}
             onKeyDown={(event) => {

@@ -1,7 +1,7 @@
 //! Saved Grok CLI logins. Only auth.json identity and tokens move; sessions,
 //! skills, and the rest of ~/.grok stay in the ambient home.
 
-mod login;
+pub(super) mod login;
 mod orca;
 mod orca_runtime;
 mod refresh;
@@ -16,10 +16,19 @@ use uuid::Uuid;
 use crate::atomic_file::replace_staged;
 use crate::secure_file;
 
-pub use login::{begin_login, cancel_login, cleanup_abandoned_logins, login};
+use super::text_field;
+
+pub use login::{begin_login, cancel_login, cleanup_abandoned_logins, executable, login};
 pub use orca::select_account as select_orca_account;
 
 pub static CREDENTIAL_OPERATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Stores a finished Grok sign-in in the saved-account list. The desktop add
+/// flow and `config login --provider grok` both save through here.
+pub async fn save_login(login: SavedLogin) -> io::Result<()> {
+    let _credentials = CREDENTIAL_OPERATION.lock().await;
+    AccountManager::new()?.import(login)
+}
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -411,15 +420,6 @@ fn required_string<'a>(object: &'a Value, key: &str) -> io::Result<&'a str> {
         .and_then(Value::as_str)
         .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| io::Error::other(format!("Grok login is missing {key}. Sign in again.")))
-}
-
-fn text_field(value: &Value, key: &str) -> Option<String> {
-    value
-        .get(key)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToOwned::to_owned)
 }
 
 fn identity_id(auth: &Value) -> io::Result<String> {

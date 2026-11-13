@@ -24,6 +24,7 @@ use super::file_locations::{
 };
 use super::login_runner::{CodexLoginOutcome, CodexLoginRunner, ManagedLoginProcess};
 use super::models::{CodexAccount, CodexAccountSource, utc_now};
+use super::registry_log::{RegistryOperation, log_home_deletion};
 
 /// Friendly account manager error.
 #[derive(Debug, Error)]
@@ -77,7 +78,9 @@ impl CodexAccountManager {
             Err(error) => {
                 // Best-effort teardown of the fresh managed home on failure;
                 // a removal error cannot change the authentication outcome.
-                let _removed_home = fs::remove_dir_all(&home_path);
+                if fs::remove_dir_all(&home_path).is_ok() {
+                    log_home_deletion(RegistryOperation::AddOrReauth);
+                }
                 Err(error)
             }
         }
@@ -157,6 +160,7 @@ impl CodexAccountManager {
             }
             if target.exists() {
                 fs::remove_dir_all(&target)?;
+                log_home_deletion(RegistryOperation::Remove);
             }
         }
         Ok(())
@@ -209,15 +213,6 @@ impl CodexAccountManager {
             CodexAccountSource::Ambient,
             discovered_at,
         ))
-    }
-
-    /// Identity of the currently active (ambient) account, if any.
-    pub fn load_active_identity(&self) -> Option<AuthBackedIdentity> {
-        let auth_path = ambient_codex_home().join("auth.json");
-        if !auth_path.exists() {
-            return None;
-        }
-        load_identity(&ambient_codex_home()).ok()
     }
 
     /// Switch the ambient identity to `target`, materializing the previous

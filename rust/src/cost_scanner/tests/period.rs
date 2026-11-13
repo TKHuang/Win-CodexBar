@@ -15,10 +15,7 @@ fn date(y: i32, m: u32, d: u32) -> NaiveDate {
 
 /// Writes one Codex session under the `YYYY/MM/DD` partition for `day`.
 fn write_session_on(sessions_root: &Path, day: NaiveDate, input_tokens: u64) {
-    let day_dir = sessions_root
-        .join(day.format("%Y").to_string())
-        .join(day.format("%m").to_string())
-        .join(day.format("%d").to_string());
+    let day_dir = partition_dir(sessions_root, day);
     std::fs::create_dir_all(&day_dir).unwrap();
     // Local noon keeps the record on `day` in the local zone.
     let local_noon = Local
@@ -155,4 +152,60 @@ fn codex_month_to_date_excludes_the_previous_month() {
         &root.path().join("cache-mtd"),
     );
     assert_eq!(mtd, 100);
+}
+
+#[test]
+fn changing_history_windows_keeps_source_model_pricing_complete() {
+    let root = tempfile::tempdir().unwrap();
+    let sessions = root.path().join("sessions");
+    let cache = root.path().join("cache");
+    let today = Local::now().date_naive();
+    let folder = sessions.join(today.format("%Y/%m/%d").to_string());
+    std::fs::create_dir_all(&folder).unwrap();
+    let mut lines = Vec::new();
+    for age in [8, 1, 0] {
+        let timestamp = Local
+            .from_local_datetime(&(today - Duration::days(age)).and_hms_opt(12, 0, 0).unwrap())
+            .earliest()
+            .unwrap()
+            .with_timezone(&Utc)
+            .to_rfc3339();
+        lines.push(
+            serde_json::json!({
+                "type": "turn_context", "timestamp": timestamp,
+                "payload": {"model": "gpt-5"}
+            })
+            .to_string(),
+        );
+        lines.push(serde_json::json!({
+            "type": "event_msg", "timestamp": timestamp,
+            "payload": {"type": "token_count", "info": {
+                "last_token_usage": {"input_tokens": 100, "cached_input_tokens": 0, "output_tokens": 0}
+            }}
+        }).to_string());
+    }
+    std::fs::write(folder.join("history.jsonl"), lines.join("\n") + "\n").unwrap();
+    for days in [30, 1, 7, 30, 1, 30] {
+        let summary = CostScanner::new(days)
+            .with_options(CostScanOptions::app_driven())
+            .with_cache_root(&cache)
+            .with_sessions_dirs(vec![sessions.clone()])
+            .scan_codex();
+        assert!(summary.history_coverage_established);
+        assert!(
+            !summary.model_pricing_completeness.is_partial(),
+            "known source models lost pricing after switching to {days} days: {:?}",
+            summary.model_pricing_completeness
+        );
+        assert_eq!(
+            summary.input_tokens,
+            if days >= 9 {
+                300
+            } else if days > 1 {
+                200
+            } else {
+                100
+            }
+        );
+    }
 }

@@ -1,11 +1,12 @@
 import { Fragment } from "react";
 import type {
+  ClaudeSwapAccountSource,
   ProviderDetail,
   SettingsSnapshot,
   SettingsUpdate,
 } from "../../../../types/bridge";
 import type { LocaleKey } from "../../../../i18n/keys";
-import { Field, SettingsGroup, Toggle } from "../../../../components/FormControls";
+import { Field, Select, SettingsGroup, Toggle } from "../../../../components/FormControls";
 import { AutoResumeSection } from "./AutoResumeSection";
 import { OptionalDetailsSection } from "./OptionalDetailsSection";
 import { ClaudeSwapPathField } from "./credentials/ClaudeSwapPathField";
@@ -21,18 +22,25 @@ export type OptionSettings = Pick<
   | "codexHistoricalTracking"
   | "codexExternalOauthSourcesAllowed"
   | "codexLocalSessionCostLedgerEnabled"
+  | "codexOpencodeLocalHistoryEnabled"
   | "codexOpenaiWebBatterySaverEnabled"
   | "claudeAvoidKeychainPrompts"
   | "claudeAllowReadingClaudeCodeCredentials"
   | "claudeSwapEnabled"
   | "claudeSwapExecutablePath"
+  | "claudeSwapSource"
+  | "claudeDesktopCookiesEnabled"
   | "disableKeychainAccess"
 >;
+
+/** Cookie sources the backend treats as automatic for Claude web usage. */
+const AUTOMATIC_COOKIE_SOURCES = new Set(["auto", "browser", "web"]);
 
 interface Props {
   detail: Pick<
     ProviderDetail,
     | "id"
+    | "cookieSource"
     | "autoResumeAfterQuotaReset"
     | "autoResumeSupported"
     | "optionalDetailsEnabled"
@@ -45,6 +53,8 @@ interface Props {
   /** Reload the provider detail after a provider-scoped command saved. */
   onReload: () => void;
 }
+
+const CLAUDE_SWAP_SOURCES: ClaudeSwapAccountSource[] = ["claude-swap", "tcr"];
 
 interface OptionRow {
   key: string;
@@ -68,6 +78,13 @@ function codexRows(settings: OptionSettings): OptionRow[] {
       checked: settings.codexLocalSessionCostLedgerEnabled ?? false,
       patch: (on) => ({ codexLocalSessionCostLedgerEnabled: on }),
       inert: true,
+    },
+    {
+      key: "opencode-history",
+      label: "ProviderCodexOpenCodeLocalHistory",
+      help: "ProviderCodexOpenCodeLocalHistoryHelp",
+      checked: settings.codexOpencodeLocalHistoryEnabled ?? false,
+      patch: (on) => ({ codexOpencodeLocalHistoryEnabled: on }),
     },
     {
       key: "history",
@@ -105,8 +122,11 @@ function codexRows(settings: OptionSettings): OptionRow[] {
   return rows;
 }
 
-function claudeRows(settings: OptionSettings): OptionRow[] {
-  return [
+function claudeRows(
+  settings: OptionSettings,
+  cookieSource: string | null,
+): OptionRow[] {
+  const rows: OptionRow[] = [
     {
       key: "claude-code-credentials",
       label: "ProviderClaudeAllowReadingClaudeCodeCredentials",
@@ -127,11 +147,22 @@ function claudeRows(settings: OptionSettings): OptionRow[] {
     {
       key: "claude-swap",
       label: "ClaudeSwapEnable",
-      help: "ClaudeSwapHint",
+      help: settings.claudeSwapSource === "tcr" ? "ClaudeTcrHint" : "ClaudeSwapHint",
       checked: settings.claudeSwapEnabled ?? false,
       patch: (on) => ({ claudeSwapEnabled: on }),
     },
   ];
+  // The backend reads the desktop session only for the Automatic cookie source.
+  if (cookieSource !== null && AUTOMATIC_COOKIE_SOURCES.has(cookieSource)) {
+    rows.push({
+      key: "claude-desktop-cookies",
+      label: "ProviderClaudeDesktopCookies",
+      help: "ProviderClaudeDesktopCookiesHelp",
+      checked: settings.claudeDesktopCookiesEnabled ?? false,
+      patch: (on) => ({ claudeDesktopCookiesEnabled: on }),
+    });
+  }
+  return rows;
 }
 
 /**
@@ -150,7 +181,7 @@ export function OptionsSection({
     detail.id === "codex"
       ? codexRows(settings)
       : detail.id === "claude"
-        ? claudeRows(settings)
+        ? claudeRows(settings, detail.cookieSource)
         : [];
 
   return (
@@ -184,14 +215,30 @@ export function OptionsSection({
               onChange={(on) => onSettingsChange(row.patch(on))}
             />
           </Field>
-          {/* macOS attaches the cswap path to this toggle as an inline field. */}
+          {/* macOS attaches the executable path to this toggle as an inline
+              field and shows the Source picker only while the toggle is on. */}
           {row.key === "claude-swap" && row.checked && (
-            <ClaudeSwapPathField
-              value={settings.claudeSwapExecutablePath ?? ""}
-              disabled={disabled}
-              t={t}
-              onSettingsChange={onSettingsChange}
-            />
+            <>
+              <ClaudeSwapPathField
+                value={settings.claudeSwapExecutablePath ?? ""}
+                source={settings.claudeSwapSource ?? "claude-swap"}
+                disabled={disabled}
+                t={t}
+                onSettingsChange={onSettingsChange}
+              />
+              <Field label={t("ClaudeSwapSource")}>
+                <Select
+                  variant="menu"
+                  value={settings.claudeSwapSource ?? "claude-swap"}
+                  // Tool names, not prose: they stay untranslated in every locale.
+                  options={CLAUDE_SWAP_SOURCES.map((source) => ({ value: source, label: source }))}
+                  disabled={disabled}
+                  onChange={(value) =>
+                    onSettingsChange({ claudeSwapSource: value as ClaudeSwapAccountSource })
+                  }
+                />
+              </Field>
+            </>
           )}
         </Fragment>
       ))}

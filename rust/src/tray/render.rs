@@ -10,6 +10,11 @@ use super::icon::UsageLevel;
 /// Side length of the generated tray icon in pixels.
 pub const TRAY_ICON_SIZE: u32 = 32;
 
+/// Meter percent for a metric with no reading. Bars draw only their empty
+/// track and the percent icon draws a gray dash, so an unknown value never
+/// reads as a real 0% or as an exhausted quota.
+pub const UNKNOWN_PERCENT: f64 = f64::NAN;
+
 /// Optional pace tint for a tray icon's usage indicator.
 ///
 /// The upstream pace treatment uses green when usage is behind the expected
@@ -133,7 +138,11 @@ fn draw_bar_row(
         clippy::cast_possible_truncation,
         reason = "percent is clamped to 0..=100 and scaled to a 24-pixel meter"
     )]
-    let fill = ((percent.clamp(0.0, 100.0) / 100.0) * bar_width as f64) as u32;
+    let fill = if percent.is_nan() {
+        0
+    } else {
+        ((percent.clamp(0.0, 100.0) / 100.0) * bar_width as f64) as u32
+    };
     let fill_end = (BAR_LEFT + fill).min(BAR_RIGHT);
     let color = usage_color(percent, has_error, pace_color, provider_tint);
 
@@ -344,8 +353,43 @@ pub fn render_percent_icon_rgba_tinted(
     pace_color: Option<TrayPaceColor>,
     provider_tint: Option<(u8, u8, u8)>,
 ) -> (Vec<u8>, u32, u32) {
+    render_percent_icon(percent, has_error, pace_color, provider_tint, false)
+}
+
+/// [`render_percent_icon_rgba_tinted`] for a locally estimated quota: the
+/// percentage is prefixed with `~` (upstream #4410) so it is never mistaken
+/// for a provider-reported meter.
+pub fn render_estimated_percent_icon_rgba_tinted(
+    percent: f64,
+    has_error: bool,
+    pace_color: Option<TrayPaceColor>,
+    provider_tint: Option<(u8, u8, u8)>,
+) -> (Vec<u8>, u32, u32) {
+    render_percent_icon(percent, has_error, pace_color, provider_tint, true)
+}
+
+fn render_percent_icon(
+    percent: f64,
+    has_error: bool,
+    pace_color: Option<TrayPaceColor>,
+    provider_tint: Option<(u8, u8, u8)>,
+    estimated: bool,
+) -> (Vec<u8>, u32, u32) {
     const SZ: u32 = TRAY_ICON_SIZE;
-    let mut img = new_icon_canvas(has_error);
+    // No filled canvas: the square left too little room, so three-character
+    // values ("42%") had to drop to scale 2 and were unreadable once Windows
+    // shrank the icon to 16 px. An outline keeps the contrast instead.
+    let mut img: RgbaImage = ImageBuffer::new(SZ, SZ);
+
+    if percent.is_nan() {
+        let (r, g, b) = UsageLevel::Unknown.color();
+        let scale = 3u32;
+        let start_x = (SZ.saturating_sub(3 * scale)) / 2;
+        let start_y = (SZ.saturating_sub(5 * scale)) / 2;
+        draw_glyph(&mut img, '-', start_x, start_y, scale, Rgba([r, g, b, 255]));
+        outline_glyphs(&mut img, has_error);
+        return (img.into_raw(), SZ, SZ);
+    }
 
     // percent clamped to 0–100 before rounding, so the cast to u32 cannot truncate.
     #[allow(
@@ -353,21 +397,24 @@ pub fn render_percent_icon_rgba_tinted(
         reason = "percent is clamped to 0–100 and rounded; the integer fits u32"
     )]
     let pct = percent.clamp(0.0, 100.0).round() as u32;
+    let marker = if estimated { "~" } else { "" };
     let text = if pct >= 100 {
-        "100".to_string()
+        format!("{marker}100")
     } else {
-        format!("{pct}%")
+        format!("{marker}{pct}%")
     };
     let glyph_width = 3u32;
     let glyph_gap = 1u32;
-    let scale = if text.len() >= 3 { 2u32 } else { 3u32 };
-    // text is "100" or at most "NN%", so its length is ≤ 4 and fits u32.
+    // text is at most "~100" or "~NN%", so its length is ≤ 4 and fits u32.
     #[allow(
         clippy::cast_possible_truncation,
-        reason = "text is \"100\" or \"NN%\", so len ≤ 4 and fits u32"
+        reason = "text is at most \"~100\" or \"~NN%\", so len ≤ 4 and fits u32"
     )]
     let text_len = text.len() as u32;
-    let text_width = text_len * glyph_width * scale + (text_len - 1) * glyph_gap;
+    let width_at = |scale: u32| text_len * glyph_width * scale + (text_len - 1) * glyph_gap;
+    // Largest scale (up to 3) whose text plus a 1 px outline on each side fits.
+    let scale = if width_at(3) + 2 <= SZ { 3u32 } else { 2u32 };
+    let text_width = width_at(scale);
     let text_height = 5 * scale;
     let start_x = (SZ.saturating_sub(text_width)) / 2;
     let start_y = (SZ.saturating_sub(text_height)) / 2;
@@ -379,8 +426,40 @@ pub fn render_percent_icon_rgba_tinted(
         draw_glyph(&mut img, ch, x, start_y, scale, color);
         x += glyph_width * scale + glyph_gap;
     }
+    outline_glyphs(&mut img, has_error);
 
     (img.into_raw(), SZ, SZ)
+}
+
+/// Rings every drawn glyph pixel with a 1 px border in the canvas colour, so
+/// text on a transparent icon stays legible on light and dark taskbars.
+fn outline_glyphs(img: &mut RgbaImage, has_error: bool) {
+    let outline = Rgba([
+        ICON_BACKGROUND_RGB[0],
+        ICON_BACKGROUND_RGB[1],
+        ICON_BACKGROUND_RGB[2],
+        if has_error { 180 } else { 255 },
+    ]);
+    let glyphs = img.clone();
+    let is_glyph = |x: i64, y: i64| {
+        u32::try_from(x)
+            .ok()
+            .zip(u32::try_from(y).ok())
+            .filter(|&(x, y)| x < TRAY_ICON_SIZE && y < TRAY_ICON_SIZE)
+            .is_some_and(|(x, y)| glyphs.get_pixel(x, y)[3] != 0)
+    };
+    for y in 0..TRAY_ICON_SIZE {
+        for x in 0..TRAY_ICON_SIZE {
+            let (xi, yi) = (i64::from(x), i64::from(y));
+            if is_glyph(xi, yi) {
+                continue;
+            }
+            let touches_glyph = (-1..=1).any(|dy| (-1..=1).any(|dx| is_glyph(xi + dx, yi + dy)));
+            if touches_glyph {
+                img.put_pixel(x, y, outline);
+            }
+        }
+    }
 }
 
 fn draw_glyph(img: &mut RgbaImage, ch: char, x: u32, y: u32, scale: u32, color: Rgba<u8>) {
@@ -424,6 +503,8 @@ fn glyph_rows(ch: char) -> Option<[u8; 5]> {
         '8' => [0b111, 0b101, 0b111, 0b101, 0b111],
         '9' => [0b111, 0b101, 0b111, 0b001, 0b111],
         '%' => [0b101, 0b001, 0b010, 0b100, 0b101],
+        '~' => [0b000, 0b110, 0b011, 0b000, 0b000],
+        '-' => [0b000, 0b000, 0b111, 0b000, 0b000],
         _ => return None,
     })
 }
@@ -524,6 +605,72 @@ mod tests {
                 .iter()
                 .any(|px| px[3] == 255 && px[0] != 60)
         );
+    }
+
+    #[test]
+    fn estimated_percent_icon_draws_a_leading_tilde() {
+        let (estimated, _, _) = render_estimated_percent_icon_rgba_tinted(42.0, false, None, None);
+        let (exact, _, _) = render_percent_icon_rgba(42.0, false);
+        let glyph = usage_color(42.0, false, None, None).0;
+
+        // "~42%" at scale 2 starts at x=2, y=11; the tilde's upper stroke
+        // fills columns 0-1 of glyph row 1 and its lower stroke columns 1-2
+        // of row 2.
+        assert_eq!(pixel_at(&estimated, 2, 13), glyph);
+        assert_eq!(pixel_at(&estimated, 6, 15), glyph);
+        assert_ne!(pixel_at(&estimated, 2, 15), glyph);
+        assert_ne!(pixel_at(&estimated, 6, 13), glyph);
+        // The exact "42%" fits at scale 3 instead, starting at x=1, y=8.
+        assert_eq!(pixel_at(&exact, 1, 8), glyph);
+        assert_ne!(estimated, exact);
+    }
+
+    /// Rows that hold at least one pixel of `color`.
+    fn rows_with(rgba: &[u8], color: [u8; 4]) -> Vec<u32> {
+        (0..TRAY_ICON_SIZE)
+            .filter(|&y| (0..TRAY_ICON_SIZE).any(|x| pixel_at(rgba, x, y) == color))
+            .collect()
+    }
+
+    #[test]
+    fn three_character_percent_text_draws_at_full_scale() {
+        for percent in [7.0, 42.0, 100.0] {
+            let (rgba, _, _) = render_percent_icon_rgba(percent, false);
+            let glyph = usage_color(percent, false, None, None).0;
+            // Five glyph rows at scale 3, centred: y = 8..23.
+            assert_eq!(
+                rows_with(&rgba, glyph),
+                (8..23).collect::<Vec<_>>(),
+                "{percent}"
+            );
+        }
+    }
+
+    #[test]
+    fn percent_icon_has_no_canvas_and_outlines_its_glyphs() {
+        let (rgba, _, _) = render_percent_icon_rgba(42.0, false);
+        let outline = [60, 60, 70, 255];
+        // Away from the text the icon is transparent, with no filled square.
+        for (x, y) in [(2, 2), (29, 2), (2, 29), (29, 29), (16, 3)] {
+            assert_eq!(pixel_at(&rgba, x, y)[3], 0, "({x}, {y})");
+        }
+        // The outline rings the text one row above and below it.
+        assert!(rows_with(&rgba, outline).contains(&7));
+        assert!(rows_with(&rgba, outline).contains(&23));
+        assert!(!rows_with(&rgba, outline).contains(&6));
+
+        let (error, _, _) = render_percent_icon_rgba(42.0, true);
+        assert!(rows_with(&error, [60, 60, 70, 180]).contains(&7));
+    }
+
+    #[test]
+    fn estimated_full_icon_keeps_the_tilde_and_fits() {
+        let (estimated, w, h) = render_estimated_percent_icon_rgba_tinted(100.0, false, None, None);
+        assert_eq!(u32::try_from(estimated.len()).unwrap(), w * h * 4);
+        let glyph = usage_color(100.0, false, None, None).0;
+        assert_eq!(pixel_at(&estimated, 2, 13), glyph);
+        // The last "0" ends inside the canvas: glyph 4 spans x=23-28.
+        assert_eq!(pixel_at(&estimated, 28, 11), glyph);
     }
 
     #[test]
@@ -813,5 +960,40 @@ mod tests {
         let (plain, _, _) = render_stacked_bar_icon_rgba(100.0, 100.0, false);
         let (none, _, _) = render_stacked_bar_icon_rgba_tinted(100.0, 100.0, false, None, None);
         assert_eq!(plain, none);
+    }
+
+    #[test]
+    fn unknown_percent_draws_a_gray_dash_instead_of_zero() {
+        let (unknown, width, _) = render_percent_icon_rgba(UNKNOWN_PERCENT, false);
+        let (zero, _, _) = render_percent_icon_rgba(0.0, false);
+        assert_ne!(unknown, zero);
+        let gray = UsageLevel::Unknown.color();
+        let pixels = unknown
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|px| [px[0], px[1], px[2]] == [gray.0, gray.1, gray.2])
+            .count();
+        // A 3x1 glyph row at scale 3 is a 9x3 block.
+        assert_eq!(pixels, 27);
+        let centre = ((16 * width + 16) * 4) as usize;
+        assert_eq!(&unknown[centre..centre + 3], &[gray.0, gray.1, gray.2]);
+        let (tinted, _, _) = render_estimated_percent_icon_rgba_tinted(
+            UNKNOWN_PERCENT,
+            false,
+            Some(TrayPaceColor::Ahead),
+            Some(TEAL),
+        );
+        assert_eq!(tinted, unknown);
+    }
+
+    #[test]
+    fn unknown_percent_bar_is_an_empty_track() {
+        let (unknown, _, _) = render_bar_icon_rgba(UNKNOWN_PERCENT, None, false);
+        let (empty, _, _) = render_bar_icon_rgba(0.0, None, false);
+        assert_eq!(unknown, empty);
+        let (unknown_pair, _, _) = render_bar_icon_rgba(UNKNOWN_PERCENT, Some(40.0), false);
+        let (empty_pair, _, _) = render_bar_icon_rgba(0.0, Some(40.0), false);
+        assert_eq!(unknown_pair, empty_pair);
     }
 }

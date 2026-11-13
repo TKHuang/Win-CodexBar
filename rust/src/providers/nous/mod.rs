@@ -14,7 +14,7 @@ use tokio::time::{Duration, timeout};
 
 use crate::core::{
     FetchContext, Provider, ProviderDisplayDetail, ProviderError, ProviderFetchResult, ProviderId,
-    ProviderMetadata, RateWindow, SourceMode, SubscriptionMetadata, UsageSnapshot,
+    RateWindow, SourceMode, SubscriptionMetadata, UsageSnapshot,
 };
 
 const PORTAL_ACCOUNT_PATH: &str = "api/oauth/account";
@@ -24,26 +24,12 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 mod credentials;
 
 pub struct NousProvider {
-    metadata: ProviderMetadata,
     client: Client,
 }
 
 impl NousProvider {
     pub fn new() -> Self {
         Self {
-            metadata: ProviderMetadata {
-                id: ProviderId::Nous,
-                display_name: "Nous Portal",
-                session_label: "Monthly credits",
-                weekly_label: "Weekly",
-                supports_opus: false,
-                supports_credits: false,
-                default_enabled: false,
-                is_primary: false,
-                dashboard_url: Some("https://portal.nousresearch.com/usage"),
-                status_page_url: None,
-                tertiary_label_key: None,
-            },
             client: crate::core::credentialed_http_client_builder()
                 .timeout(REQUEST_TIMEOUT)
                 .build()
@@ -100,10 +86,6 @@ impl Default for NousProvider {
 impl Provider for NousProvider {
     fn id(&self) -> ProviderId {
         ProviderId::Nous
-    }
-
-    fn metadata(&self) -> &ProviderMetadata {
-        &self.metadata
     }
 
     async fn fetch_usage(&self, ctx: &FetchContext) -> Result<ProviderFetchResult, ProviderError> {
@@ -559,6 +541,43 @@ mod tests {
                 .iter()
                 .any(|detail| detail.id() == "top-up-credits")
         );
+    }
+
+    #[test]
+    fn balance_rows_match_the_declared_balance_detail_ids() {
+        // Credits-only account from upstream #4314: no monthly meter, and the
+        // reported total usable balance is the tooltip balance.
+        let credits_only = serde_json::json!({
+            "subscription": null,
+            "purchased_credits_remaining": 6.76,
+            "paid_service_access": {
+                "has_active_subscription": false,
+                "total_usable_credits": 6.76
+            }
+        });
+        let result = parse_response(&serde_json::to_vec(&credits_only).unwrap()).unwrap();
+        assert!(result.usage.primary.is_informational);
+        let total = result
+            .display_details()
+            .iter()
+            .find(|detail| detail.id() == "total-usable")
+            .expect("total usable row");
+        assert_eq!((total.id(), total.value()), ("total-usable", "$6.76"));
+
+        // Top-up credits without a total still carries the balance row the
+        // tooltip falls back to.
+        let top_up_only = serde_json::json!({
+            "subscription": null,
+            "purchased_credits_remaining": 6.76
+        });
+        let result = parse_response(&serde_json::to_vec(&top_up_only).unwrap()).unwrap();
+        assert!(result.usage.primary.is_informational);
+        let top_up = result
+            .display_details()
+            .iter()
+            .find(|detail| detail.id() == "top-up-credits")
+            .expect("top-up row");
+        assert_eq!(top_up.value(), "$6.76");
     }
 
     #[test]

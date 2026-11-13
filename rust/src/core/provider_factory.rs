@@ -8,21 +8,27 @@
 use super::{
     CostCliExtension, Provider, ProviderId, ProviderLimitResetPolicy, ProviderPaceCapability,
 };
+use crate::providers::AbliterationProvider;
 use crate::providers::AerostackProvider;
 use crate::providers::AtlasCloudProvider;
+use crate::providers::ChatboxProvider;
+use crate::providers::ClaudePlatformProvider;
 use crate::providers::ClawRouterProvider;
 use crate::providers::CosmicProvider;
 use crate::providers::ExaProvider;
 use crate::providers::FalProvider;
 use crate::providers::FloraProvider;
+use crate::providers::FutureAgiProvider;
 use crate::providers::IBMBobProvider;
 use crate::providers::LangdockProvider;
 use crate::providers::LinkupProvider;
 use crate::providers::LithosAIProvider;
+use crate::providers::MunitoProvider;
 use crate::providers::MuseAIProvider;
 use crate::providers::ParallelProvider;
 use crate::providers::SyntheticProvider;
 use crate::providers::TavilyProvider;
+use crate::providers::TraeCnProvider;
 use crate::providers::WorkBuddyProvider;
 use crate::providers::{
     AbacusProvider, AiAndProvider, AixyProvider, AlibabaProvider, AlibabaTokenPlanProvider,
@@ -39,10 +45,10 @@ use crate::providers::{
     NousProvider, OllamaProvider, OpenAIApiProvider, OpenCodeGoProvider, OpenCodeProvider,
     OpenRouterProvider, PerplexityProvider, PiProvider, PoeProvider, QoderProvider,
     QwenCloudProvider, RaycastProvider, ReplicateProvider, SailResearchProvider, SakanaProvider,
-    SofyaProvider, StepFunProvider, Sub2ApiProvider, T3ChatProvider, TinyApiProvider,
-    TypeSafeProvider, V0Provider, VeniceProvider, VercelProvider, VertexAIProvider, WarpProvider,
-    WayfinderProvider, WindsurfProvider, XKiroProvider, XaiProvider, XapiProvider, ZaiProvider,
-    ZedProvider, ZenMuxProvider, ZoomMateProvider,
+    SofyaProvider, SonioxProvider, StepFunProvider, Sub2ApiProvider, T3ChatProvider,
+    TinyApiProvider, TypeSafeProvider, V0Provider, VeniceProvider, VercelProvider,
+    VertexAIProvider, WarpProvider, WayfinderProvider, WindsurfProvider, XKiroProvider,
+    XaiProvider, XapiProvider, ZaiProvider, ZedProvider, ZenMuxProvider, ZoomMateProvider,
 };
 
 /// Instantiate the concrete [`Provider`] implementation for a given [`ProviderId`].
@@ -159,6 +165,13 @@ pub fn instantiate(id: ProviderId) -> Box<dyn Provider> {
         ProviderId::Parallel => Box::new(ParallelProvider::new()),
         ProviderId::Fal => Box::new(FalProvider::new()),
         ProviderId::Flora => Box::new(FloraProvider::new()),
+        ProviderId::FutureAgi => Box::new(FutureAgiProvider::new()),
+        ProviderId::Munito => Box::new(MunitoProvider::new()),
+        ProviderId::Soniox => Box::new(SonioxProvider::new()),
+        ProviderId::ClaudePlatform => Box::new(ClaudePlatformProvider::new()),
+        ProviderId::TraeCn => Box::new(TraeCnProvider::new()),
+        ProviderId::Chatbox => Box::new(ChatboxProvider::new()),
+        ProviderId::Abliteration => Box::new(AbliterationProvider::new()),
     }
 }
 
@@ -185,8 +198,9 @@ pub fn pace_capability(id: ProviderId) -> ProviderPaceCapability {
         ProviderId::Ollama => p::ollama::PACE_CAPABILITY,
         ProviderId::OpenCodeGo => p::opencodego::PACE_CAPABILITY,
         ProviderId::Claude => p::claude::PACE_CAPABILITY,
-        ProviderId::Codex
-        | ProviderId::Pi
+        ProviderId::Kiro => p::kiro::PACE_CAPABILITY,
+        ProviderId::Codex => p::codex::PACE_CAPABILITY,
+        ProviderId::Pi
         | ProviderId::Gemini
         | ProviderId::Antigravity
         | ProviderId::AtlasCloud
@@ -201,7 +215,6 @@ pub fn pace_capability(id: ProviderId) -> ProviderPaceCapability {
         | ProviderId::Tavily
         | ProviderId::Exa
         | ProviderId::Factory
-        | ProviderId::Kiro
         | ProviderId::VertexAI
         | ProviderId::Augment
         | ProviderId::MiniMax
@@ -276,7 +289,14 @@ pub fn pace_capability(id: ProviderId) -> ProviderPaceCapability {
         | ProviderId::Aerostack
         | ProviderId::Parallel
         | ProviderId::Fal
-        | ProviderId::Flora => ProviderPaceCapability::UNSUPPORTED,
+        | ProviderId::Flora
+        | ProviderId::FutureAgi
+        | ProviderId::Munito
+        | ProviderId::Soniox
+        | ProviderId::ClaudePlatform
+        | ProviderId::TraeCn
+        | ProviderId::Chatbox
+        | ProviderId::Abliteration => ProviderPaceCapability::UNSUPPORTED,
     }
 }
 
@@ -394,7 +414,14 @@ pub fn limit_reset_policy(id: ProviderId) -> ProviderLimitResetPolicy {
         | ProviderId::Aerostack
         | ProviderId::Parallel
         | ProviderId::Fal
-        | ProviderId::Flora => ProviderLimitResetPolicy::DEFAULT,
+        | ProviderId::Flora
+        | ProviderId::FutureAgi
+        | ProviderId::Munito
+        | ProviderId::Soniox
+        | ProviderId::ClaudePlatform
+        | ProviderId::TraeCn
+        | ProviderId::Chatbox
+        | ProviderId::Abliteration => ProviderLimitResetPolicy::DEFAULT,
     }
 }
 
@@ -404,6 +431,9 @@ pub fn limit_reset_policy(id: ProviderId) -> ProviderLimitResetPolicy {
 pub(crate) fn cost_cli_extension_for(id: ProviderId) -> Option<&'static dyn CostCliExtension> {
     match id {
         ProviderId::Codex => Some(&crate::codex_costs::CODEX_COST_CLI),
+        ProviderId::OpenCodeGo => {
+            Some(&crate::providers::opencodego::cost_cli::OPENCODEGO_COST_CLI)
+        }
         ProviderId::Claude
         | ProviderId::TinyApi
         | ProviderId::Xapi
@@ -423,7 +453,6 @@ pub(crate) fn cost_cli_extension_for(id: ProviderId) -> Option<&'static dyn Cost
         | ProviderId::StepFun
         | ProviderId::Notion
         | ProviderId::Ollama
-        | ProviderId::OpenCodeGo
         | ProviderId::Pi
         | ProviderId::Gemini
         | ProviderId::Antigravity
@@ -510,7 +539,14 @@ pub(crate) fn cost_cli_extension_for(id: ProviderId) -> Option<&'static dyn Cost
         | ProviderId::Aerostack
         | ProviderId::Parallel
         | ProviderId::Fal
-        | ProviderId::Flora => None,
+        | ProviderId::Flora
+        | ProviderId::FutureAgi
+        | ProviderId::Munito
+        | ProviderId::Soniox
+        | ProviderId::ClaudePlatform
+        | ProviderId::TraeCn
+        | ProviderId::Chatbox
+        | ProviderId::Abliteration => None,
     }
 }
 
@@ -594,14 +630,14 @@ mod tests {
     }
 
     #[test]
-    fn only_codex_registers_a_cost_cli_extension() {
+    fn only_codex_and_opencodego_register_a_cost_cli_extension() {
         for &id in ProviderId::all() {
             assert_eq!(
                 cost_cli_extension_for(id).is_some(),
-                id == ProviderId::Codex,
+                matches!(id, ProviderId::Codex | ProviderId::OpenCodeGo),
                 "{id}"
             );
         }
-        assert_eq!(cost_cli_extensions().count(), 1);
+        assert_eq!(cost_cli_extensions().count(), 2);
     }
 }

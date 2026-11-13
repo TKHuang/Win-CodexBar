@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 
-use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -10,8 +10,9 @@ use crate::core::{
 };
 
 use super::{
-    CostCoverageCounts, CostProvenance, CustomPricing, CustomRates, ImportedSpendSource,
-    SpendActivityCell, SpendDailyPoint, SpendModelRow, SpendTokenMix,
+    ActivityHistogram, CostCoverageCounts, CostProvenance, CustomPricing, CustomRates,
+    ImportedSpendSource, SpendDailyPoint, SpendModelRow, SpendTokenMix, add_known_tokens,
+    add_optional,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,15 +38,28 @@ mod nous_tests;
 #[cfg(test)]
 mod pricing_tests;
 
-#[derive(Default)]
+/// Per-model token classes start at a known zero and turn unknown (`None`) as
+/// soon as one ledger row for the model lacks that count.
 struct ModelAccumulator {
-    input: u64,
-    output: u64,
-    cache_read: u64,
-    cache_creation: u64,
+    input: Option<u64>,
+    output: Option<u64>,
+    cache_read: Option<u64>,
     total: Option<u64>,
     cost: Option<f64>,
     custom_pricing: bool,
+}
+
+impl Default for ModelAccumulator {
+    fn default() -> Self {
+        Self {
+            input: Some(0),
+            output: Some(0),
+            cache_read: Some(0),
+            total: Some(0),
+            cost: None,
+            custom_pricing: false,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -200,7 +214,7 @@ fn aggregate_with_pricing(
     let mut token_mix = SpendTokenMix::default();
     let mut token_total: Option<u64> = None;
     let mut coverage = CostCoverageCounts::default();
-    let mut activity: BTreeMap<(u8, u8), u32> = BTreeMap::new();
+    let mut activity = ActivityHistogram::default();
     let mut models: HashMap<String, ModelAccumulator> = HashMap::new();
     let mut daily: BTreeMap<String, DailyAccumulator> = BTreeMap::new();
     let mut known_cost = 0.0;
@@ -254,20 +268,7 @@ fn aggregate_with_pricing(
             }
         }
 
-        let local = entry.timestamp.with_timezone(&Local);
-        // Weekday (0-6) and hour (0-23) both fit u8.
-        #[allow(
-            clippy::cast_possible_truncation,
-            reason = "weekday (0-6) and hour (0-23) fit u8"
-        )]
-        let key = (
-            local.weekday().num_days_from_monday() as u8,
-            local.hour() as u8,
-        );
-        activity.insert(
-            key,
-            activity.get(&key).copied().unwrap_or(0).saturating_add(1),
-        );
+        activity.add_local(entry.timestamp);
 
         let day = daily
             .entry(zone.date(entry.timestamp).format("%Y-%m-%d").to_string())
@@ -282,19 +283,11 @@ fn aggregate_with_pricing(
         }
 
         let model = models.entry(entry.model.clone()).or_default();
-        model.input = model.input.saturating_add(entry.input_tokens.unwrap_or(0));
-        model.output = model
-            .output
-            .saturating_add(entry.output_tokens.unwrap_or(0));
-        model.cache_read = model
-            .cache_read
-            .saturating_add(entry.cache_read_tokens.unwrap_or(0));
-        model.cache_creation = model
-            .cache_creation
-            .saturating_add(entry.cache_creation_tokens.unwrap_or(0));
-        if let Some(total) = entry.resolved_total_tokens() {
-            model.total = Some(model.total.unwrap_or(0).saturating_add(total));
-        }
+        add_known_tokens(&mut model.input, entry.input_tokens);
+        add_known_tokens(&mut model.output, entry.output_tokens);
+        add_known_tokens(&mut model.cache_read, entry.cache_read_tokens);
+        // A row without a complete total makes the model total unknown.
+        add_known_tokens(&mut model.total, entry.model_total_tokens());
         if let Some(cost) = cost {
             model.cost = Some(model.cost.unwrap_or(0.0) + cost);
         }
@@ -309,11 +302,7 @@ fn aggregate_with_pricing(
             input_tokens: acc.input,
             output_tokens: acc.output,
             cache_read_tokens: acc.cache_read,
-            total_tokens: acc.total.unwrap_or_else(|| {
-                acc.input
-                    .saturating_add(acc.output)
-                    .saturating_add(acc.cache_creation)
-            }),
+            total_tokens: acc.total,
             custom_pricing: acc.custom_pricing,
         })
         .collect();
@@ -363,14 +352,7 @@ fn aggregate_with_pricing(
                 total_tokens: acc.saw_tokens.then_some(acc.total_tokens),
             })
             .collect(),
-        hourly_activity: activity
-            .into_iter()
-            .map(|((weekday, hour), conversations)| SpendActivityCell {
-                weekday,
-                hour,
-                conversations,
-            })
-            .collect(),
+        hourly_activity: activity.into_cells(),
     })
 }
 
@@ -622,6 +604,22 @@ impl OpenCodexEntry {
             saw.then_some(total)
         })
     }
+
+    /// The row's total for its model. An explicit total wins. A derived total
+    /// needs every derivation input; a partial sum would present an undercount
+    /// as an exact model total while the missing class is unknown.
+    fn model_total_tokens(&self) -> Option<u64> {
+        match (
+            self.total_tokens,
+            self.input_tokens,
+            self.output_tokens,
+            self.cache_creation_tokens,
+        ) {
+            (Some(total), _, _, _) => Some(total),
+            (None, Some(_), Some(_), Some(_)) => self.resolved_total_tokens(),
+            _ => None,
+        }
+    }
 }
 
 fn parse_timestamp(value: &Value) -> Option<DateTime<Utc>> {
@@ -675,15 +673,6 @@ fn nonnegative_u64(value: Option<&Value>) -> Option<u64> {
     let parsed =
         (number.is_finite() && number >= 0.0 && number < u64::MAX as f64).then_some(number as u64);
     parsed
-}
-
-fn add_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {
-    match (left, right) {
-        (Some(left), Some(right)) => left.checked_add(right),
-        (Some(left), None) => Some(left),
-        (None, Some(right)) => Some(right),
-        (None, None) => None,
-    }
 }
 
 #[cfg(test)]

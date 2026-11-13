@@ -1,6 +1,11 @@
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
+const tauriMocks = vi.hoisted(() => ({ resetFlyoutPosition: vi.fn().mockResolvedValue(undefined) }));
+vi.mock("../../../lib/tauri", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../../lib/tauri")>()),
+  resetFlyoutPosition: tauriMocks.resetFlyoutPosition,
+}));
 vi.mock("../../../hooks/useLocale", () => ({
   useLocale: () => ({ t: (key: string) => key, language: "english" }),
 }));
@@ -16,6 +21,7 @@ const baseSettings = {
   enabledProviders: ["codex", "claude"],
   trayIconMode: "single",
   trayPanelAlwaysOnTop: false,
+  trayPanelMovable: false,
   overviewLayout: "detailed",
   showAsUsed: false,
   showAllTokenAccountsInMenu: false,
@@ -28,9 +34,12 @@ const baseSettings = {
   costSummaryDisplayStyle: "compact",
   costReportingPeriod: "rolling:30",
   agentSessionsEnabled: false,
+  agentSessionsLocalOnly: false,
   stayAwakeEnabled: false,
   agentSessionSshHosts: [],
   trayScalePercent: 100,
+  trayPanelStyle: "modern",
+  trayPanelWidth: 310,
 } as unknown as SettingsSnapshot;
 
 function renderTab(overrides: Partial<SettingsSnapshot> = {}, set = vi.fn()) {
@@ -72,6 +81,14 @@ describe("MenuTab layout", () => {
     ]);
   });
 
+  it("saves the Panel look from its picker", () => {
+    const { set } = renderTab();
+    expect(select("PanelStyleLabel").value).toBe("modern");
+    expect(optionLabels("PanelStyleLabel")).toEqual(["PanelStyleModern", "PanelStyleClassic"]);
+    fireEvent.change(select("PanelStyleLabel"), { target: { value: "classic" } });
+    expect(set).toHaveBeenCalledWith({ trayPanelStyle: "classic" });
+  });
+
   it("offers the tray Panel scale as its only slider", () => {
     const { container } = renderTab();
     expect(
@@ -109,10 +126,12 @@ describe("MenuTab Usage section", () => {
     expect(set).toHaveBeenCalledWith({ showPace: true });
   });
 
-  it("offers Automatic, 4, 5 and 7 work days and saves null for Automatic", () => {
+  it("offers Automatic, 4, 5, 6 and 7 work days and saves null for Automatic", () => {
     const { set } = renderTab({ weeklyProgressWorkDays: 5 });
     expect(select("WorkDaysLabel").value).toBe("5");
-    expect(Array.from(select("WorkDaysLabel").options, (o) => o.value)).toEqual(["", "4", "5", "7"]);
+    expect(Array.from(select("WorkDaysLabel").options, (o) => o.value)).toEqual(["", "4", "5", "6", "7"]);
+    fireEvent.change(select("WorkDaysLabel"), { target: { value: "6" } });
+    expect(set).toHaveBeenCalledWith({ weeklyProgressWorkDays: 6 });
     fireEvent.change(select("WorkDaysLabel"), { target: { value: "7" } });
     expect(set).toHaveBeenCalledWith({ weeklyProgressWorkDays: 7 });
     fireEvent.change(select("WorkDaysLabel"), { target: { value: "" } });
@@ -122,7 +141,7 @@ describe("MenuTab Usage section", () => {
   it("keeps a saved work day count that is not a Mac preset selectable", () => {
     renderTab({ weeklyProgressWorkDays: 3 });
     expect(select("WorkDaysLabel").value).toBe("3");
-    expect(Array.from(select("WorkDaysLabel").options, (o) => o.value)).toEqual(["", "3", "4", "5", "7"]);
+    expect(Array.from(select("WorkDaysLabel").options, (o) => o.value)).toEqual(["", "3", "4", "5", "6", "7"]);
   });
 
   it("disables Workday tick appearance while Work days is Automatic", () => {
@@ -145,8 +164,16 @@ describe("MenuTab Windows section", () => {
     const { set } = renderTab();
     fireEvent.click(screen.getByRole("checkbox", { name: "TrayPanelAlwaysOnTopLabel" }));
     expect(set).toHaveBeenCalledWith({ trayPanelAlwaysOnTop: true });
+    fireEvent.click(screen.getByRole("checkbox", { name: "TrayPanelMovableLabel" }));
+    expect(set).toHaveBeenCalledWith({ trayPanelMovable: true });
     fireEvent.click(screen.getByRole("checkbox", { name: "ShowResetWhenExhausted" }));
     expect(set).toHaveBeenCalledWith({ showResetWhenExhausted: true });
+  });
+
+  it("puts the panel back next to the tray from a keyboard-reachable button", () => {
+    renderTab({ trayPanelMovable: true });
+    fireEvent.click(screen.getByRole("button", { name: "TrayPanelResetPositionButton" }));
+    expect(tauriMocks.resetFlyoutPosition).toHaveBeenCalledTimes(1);
   });
 
   it("shows the saved Panel scale and saves the new one when the slider is released", async () => {
@@ -197,12 +224,17 @@ describe("MenuTab Content section", () => {
 });
 
 describe("MenuTab Agent sessions section", () => {
-  it("orders Stay Awake, Agent sessions, then Additional SSH hosts", () => {
+  it("orders Stay Awake, Agent sessions, Local sessions only, then Additional SSH hosts", () => {
     renderTab();
     const group = screen.getByRole("region", { name: "AgentSessionsTitle" });
     expect(
       Array.from(group.querySelectorAll(".settings-field__label"), (n) => n.textContent),
-    ).toEqual(["AgentSessionsStayAwakeLabel", "AgentSessionsEnableLabel", "AgentSessionsSshHostsLabel"]);
+    ).toEqual([
+      "AgentSessionsStayAwakeLabel",
+      "AgentSessionsEnableLabel",
+      "AgentSessionsLocalOnlyLabel",
+      "AgentSessionsSshHostsLabel",
+    ]);
   });
 
   it("toggles Stay Awake and Agent sessions", () => {
@@ -211,6 +243,28 @@ describe("MenuTab Agent sessions section", () => {
     expect(set).toHaveBeenCalledWith({ stayAwakeEnabled: true });
     fireEvent.click(screen.getByRole("checkbox", { name: "AgentSessionsEnableLabel" }));
     expect(set).toHaveBeenCalledWith({ agentSessionsEnabled: true });
+  });
+
+  it("keeps remote discovery on by default and saves the local-only toggle", () => {
+    const off = renderTab({ agentSessionsEnabled: true });
+    expect(screen.getByRole("checkbox", { name: "AgentSessionsLocalOnlyLabel" })).not.toBeChecked();
+    off.unmount();
+
+    const { set } = renderTab({ agentSessionsEnabled: true });
+    fireEvent.click(screen.getByRole("checkbox", { name: "AgentSessionsLocalOnlyLabel" }));
+    expect(set).toHaveBeenCalledWith({ agentSessionsLocalOnly: true });
+  });
+
+  it("disables the local-only toggle while agent sessions are off", () => {
+    renderTab();
+    expect(screen.getByRole("checkbox", { name: "AgentSessionsLocalOnlyLabel" })).toBeDisabled();
+  });
+
+  it("disables SSH hosts in local-only mode even when agent sessions are on", () => {
+    renderTab({ agentSessionsEnabled: true, agentSessionsLocalOnly: true });
+    const input = screen.getByRole("textbox", { name: "AgentSessionsSshHostsLabel" }) as HTMLInputElement;
+    expect(input.disabled).toBe(true);
+    expect(screen.getByRole("checkbox", { name: "AgentSessionsLocalOnlyLabel" })).toBeChecked();
   });
 
   it("disables SSH hosts until agent sessions are on, then saves the parsed list on blur", () => {

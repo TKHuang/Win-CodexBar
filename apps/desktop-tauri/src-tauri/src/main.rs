@@ -9,8 +9,10 @@ mod commands;
 mod events;
 mod floatbar;
 mod geometry_store;
+mod http_server;
 mod powertoys;
 mod proof_harness;
+mod proof_tray_menu;
 mod shell;
 mod shortcut_bridge;
 mod state;
@@ -143,6 +145,8 @@ fn main() {
 
     let proof_config = proof_harness::ProofConfig::from_env();
     let is_proof_mode = proof_config.is_some();
+    proof_harness::install_window_origin_from_env(is_proof_mode);
+    proof_harness::install_system_theme_from_env(is_proof_mode);
     let force_start_visible = std::env::var_os("CODEXBAR_START_VISIBLE").is_some();
     let mut settings = codexbar::settings::Settings::load();
     settings.apply_display_mode_fold_migration();
@@ -155,6 +159,9 @@ fn main() {
 
     let mut initial_state = AppState::new();
     initial_state.proof_config = proof_config;
+    initial_state.claude_account_usage = commands::load_account_usage_cache();
+    initial_state.provider_account_usage = commands::load_provider_account_usage();
+    initial_state.claude_swap_usage.cache = commands::load_claude_swap_usage();
     // Validate the complete proof seed before installing any snapshots, so an
     // invalid multi-provider fixture cannot leave a partial cache behind.
     if let Some(snapshots) = proof_harness::seed_usage_snapshots_from_env(
@@ -172,12 +179,22 @@ fn main() {
                 initial_state
                     .provider_cache_updated_at_by_provider
                     .insert(provider, seeded_at);
+                initial_state.seeded_provider_ids.insert(provider);
             }
         }
         initial_state.provider_cache.extend(snapshots);
-        initial_state.provider_cache_seeded = true;
         initial_state.provider_cache_updated_at = Some(seeded_at);
     }
+
+    // Proof runs must never write the real http_server.json or bind a port:
+    // the pathless controller makes apply fail with SaveFailed up front.
+    let http_server_controller = if is_proof_mode {
+        http_server::proof_controller()
+    } else {
+        http_server::controller()
+    };
+    let http_server_controller_for_exit = http_server_controller.clone();
+    let has_usage_seed = !initial_state.seeded_provider_ids.is_empty();
 
     let context = tauri::generate_context!();
     if is_proof_mode {
@@ -192,6 +209,7 @@ fn main() {
     tauri::Builder::default()
         .manage(Mutex::new(initial_state))
         .manage(commands::CurrencyRateCache::default())
+        .manage(http_server_controller.clone())
         .plugin(shortcut_bridge::plugin())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
@@ -206,6 +224,8 @@ fn main() {
             commands::get_settings_snapshot,
             commands::get_currency_rates,
             stay_awake::get_stay_awake_status,
+            http_server::get_http_server_state,
+            http_server::apply_http_server_config,
             commands::list_agent_sessions,
             commands::focus_agent_session,
             commands::update_settings,
@@ -213,6 +233,7 @@ fn main() {
             commands::save_hooks_config,
             commands::set_surface_mode,
             commands::dismiss_tray_panel,
+            commands::reset_flyout_position,
             commands::begin_flyout_gesture,
             commands::end_flyout_gesture,
             commands::reveal_tray_panel_window,
@@ -223,9 +244,10 @@ fn main() {
             commands::refresh_providers,
             commands::refresh_providers_if_stale,
             commands::get_cached_providers,
+            commands::get_provider_account_usage,
+            commands::get_claude_swap_overview_accounts,
             commands::get_deepseek_pricing_status,
             commands::codex_accounts_list,
-            commands::claude_accounts_list,
             commands::get_claude_accounts_state,
             commands::claude_reconciliation_state,
             commands::claude_account_add,
@@ -271,8 +293,11 @@ fn main() {
             commands::get_token_account_providers,
             commands::get_token_accounts,
             commands::add_token_account,
+            commands::update_token_account,
+            commands::move_token_account,
             commands::remove_token_account,
             commands::set_active_token_account,
+            commands::set_token_account_claude_config_dir,
             commands::get_app_info,
             commands::get_safe_diagnostics,
             commands::get_provider_chart_data,
@@ -283,6 +308,8 @@ fn main() {
             commands::import_preferences,
             commands::get_spend_contract,
             commands::get_codex_workspaces_snapshot,
+            commands::get_codex_session_tool_activity,
+            commands::get_codex_session_details,
             commands::reorder_providers,
             commands::reorder_visible_providers,
             commands::restore_default_provider_order,
@@ -295,6 +322,9 @@ fn main() {
             commands::has_openrouter_management_api_key,
             commands::set_openrouter_management_api_key,
             commands::remove_openrouter_management_api_key,
+            commands::has_vercel_access_token,
+            commands::set_vercel_access_token,
+            commands::remove_vercel_access_token,
             commands::get_provider_azure_api_version,
             commands::set_provider_azure_api_version,
             commands::get_provider_cookie_source_options,
@@ -313,6 +343,7 @@ fn main() {
             commands::unregister_global_shortcut,
             commands::get_work_area_rect,
             commands::get_system_accent_color,
+            commands::get_system_theme,
             commands::play_notification_sound,
             commands::open_external_url,
             commands::reanchor_tray_panel,
@@ -327,12 +358,8 @@ fn main() {
             commands::set_ui_language,
             commands::open_path,
             tray_visibility::tray_visibility_status,
-            floatbar::show_float_bar,
-            floatbar::hide_float_bar,
-            floatbar::set_float_bar_opacity,
-            floatbar::set_float_bar_click_through,
+            tray_bridge::proof_activate_tray_item,
             floatbar::resize_float_bar,
-            floatbar::set_float_bar_orientation,
         ])
         .setup(move |app| {
             if let Err(error) = codexbar::providers::claude::accounts::cleanup_abandoned_logins() {
@@ -343,12 +370,22 @@ fn main() {
                 window.hide()?;
             }
             tray_bridge::setup(app)?;
+            if has_usage_seed {
+                // A pinned seed makes the startup refresh skip as cache-fresh,
+                // and only a published refresh repaints the tray.
+                tray_bridge::refresh_tray_presentation(app.handle());
+            }
             shortcut_bridge::register(app.handle());
             floatbar::install(app.handle());
             auto_refresh::install(app.handle().clone());
             stay_awake::install(app.handle().clone());
             if settings.powertoys_status_pipe_enabled {
                 powertoys::install(app.handle().clone());
+            }
+            // Proof runs drive surfaces with synthetic data; they never bind the
+            // user's saved server port.
+            if !is_proof_mode {
+                http_server::install(http_server_controller.clone());
             }
 
             // Give the WebView/event loop one turn to finish startup before
@@ -389,14 +426,6 @@ fn main() {
                         launch,
                         proof_harness::is_proof_mode(window.app_handle()),
                     ) {
-                        return;
-                    }
-                    if let Some(st) = window.app_handle().try_state::<Mutex<AppState>>()
-                        && st
-                            .lock()
-                            .unwrap()
-                            .take_startup_tray_blur_grace(std::time::Instant::now())
-                    {
                         return;
                     }
                     // Grace period: ignore blur within 500ms of showing the panel.
@@ -464,9 +493,10 @@ fn main() {
         })
         .build(context)
         .expect("failed to build CodexBar desktop shell")
-        .run(|_app, event| {
+        .run(move |_app, event| {
             if matches!(event, tauri::RunEvent::Exit) {
                 stay_awake::shutdown();
+                http_server_controller_for_exit.shutdown();
             }
         });
 }

@@ -1,12 +1,16 @@
 use super::*;
-use codexbar::core::{ProviderId, ProviderStateKind};
+use codexbar::core::ProviderId;
 use codexbar::tray::render_stacked_bars_icon_rgba_with_pace;
 
-fn fake_snapshot(id: &str, display_name: &str, used_percent: f64) -> ProviderUsageSnapshot {
+pub(crate) fn fake_snapshot(
+    id: &str,
+    display_name: &str,
+    used_percent: f64,
+) -> ProviderUsageSnapshot {
     fake_snapshot_with(id, display_name, used_percent, None, None, None)
 }
 
-fn fake_snapshot_with(
+pub(crate) fn fake_snapshot_with(
     id: &str,
     display_name: &str,
     used_percent: f64,
@@ -17,36 +21,18 @@ fn fake_snapshot_with(
     let window = |percent: f64| RateWindowSnapshot {
         used_percent: percent,
         remaining_percent: 100.0 - percent,
-        window_minutes: None,
-        resets_at: None,
-        reset_description: None,
-        is_exhausted: false,
-        is_informational: false,
-        reserve_percent: None,
-        reserve_description: None,
-        reserve_will_last_to_reset: false,
-        reserve_eta_seconds: None,
-        pace: None,
-        monthly_limit_block: None,
-        description_is_detail: false,
-        reset_regenerates: false,
-        hidden_on_card: false,
+        ..Default::default()
     };
 
     ProviderUsageSnapshot {
         provider_id: id.into(),
         display_name: display_name.into(),
         primary: window(used_percent),
-        primary_label: None,
         secondary: secondary_percent.map(window),
         secondary_label: None,
         secondary_label_key: None,
         model_specific: None,
         tertiary: tertiary_percent.map(window),
-        tertiary_label: None,
-        extra_rate_windows: Vec::new(),
-        inventory: Vec::new(),
-        display_details: Vec::new(),
         cost: cost.map(|(used, limit)| crate::commands::CostSnapshotBridge {
             used,
             limit: Some(limit),
@@ -64,27 +50,12 @@ fn fake_snapshot_with(
             daily: Vec::new(),
             always_visible: false,
             folded_into_primary: false,
+            pay_as_you_go: false,
             title_key: None,
         }),
-        plan_name: None,
-        account_email: None,
-        account_label: None,
-        subscription: None,
-        source_label: String::new(),
-        has_successful_claude_cli_quota: false,
-        updated_at: "2025-01-01T00:00:00Z".into(),
-        error: None,
-        error_state: ProviderStateKind::Ready,
-        pace: None,
         pace_authoritative: true,
-        account_organization: None,
-        open_ai_api_usage: None,
-        throughput: None,
-        tray_status_label: None,
-        fetch_duration_ms: None,
-        wayfinder_usage: None,
-        session_equivalent_forecast: None,
-        quota_burndown: None,
+        updated_at: "2025-01-01T00:00:00Z".into(),
+        ..Default::default()
     }
 }
 
@@ -114,7 +85,7 @@ fn single_plan_uses_highest_provider_for_icon_and_summary() {
     );
     assert_eq!(
         plan.status_labels(Language::English),
-        vec![("status_summary".to_string(), "Claude 72%".to_string())]
+        vec![("status_summary".to_string(), "Claude 72% used".to_string())]
     );
 }
 
@@ -157,8 +128,8 @@ fn per_provider_plan_preserves_configured_order_for_status_rows() {
     assert_eq!(
         labels,
         vec![
-            ("claude".to_string(), "Claude 72%".to_string()),
-            ("codex".to_string(), "Codex 30%".to_string()),
+            ("claude".to_string(), "Claude 28% left".to_string()),
+            ("codex".to_string(), "Codex 70% left".to_string()),
         ]
     );
 }
@@ -193,8 +164,8 @@ fn stacked_plan_resolves_distinct_preferences_once() {
     assert_eq!(
         plan.status_labels(Language::English),
         vec![
-            ("claude".to_string(), "Claude 72%".to_string()),
-            ("codex".to_string(), "Codex 30%".to_string()),
+            ("claude".to_string(), "Claude 72% used".to_string()),
+            ("codex".to_string(), "Codex 30% used".to_string()),
         ]
     );
 }
@@ -301,6 +272,7 @@ fn one_healthy_provider_never_uses_stacked_renderer() {
             percent: 30.0,
             has_error: false,
             provider_tint: None,
+            estimated: false,
         }
     );
     assert_eq!(plan.status_rows.len(), 1);
@@ -325,6 +297,7 @@ fn all_errors_produce_error_styled_zero_percent_plan() {
             percent: 0.0,
             has_error: true,
             provider_tint: None,
+            estimated: false,
         }
     );
     assert!(plan.status_rows.is_empty());
@@ -403,20 +376,7 @@ fn fake_extra_window(percent: f64) -> crate::commands::NamedRateWindowSnapshot {
         window: crate::commands::RateWindowSnapshot {
             used_percent: percent,
             remaining_percent: 100.0 - percent,
-            window_minutes: None,
-            resets_at: None,
-            reset_description: None,
-            is_exhausted: false,
-            is_informational: false,
-            reserve_percent: None,
-            reserve_description: None,
-            reserve_will_last_to_reset: false,
-            reserve_eta_seconds: None,
-            pace: None,
-            monthly_limit_block: None,
-            description_is_detail: false,
-            reset_regenerates: false,
-            hidden_on_card: false,
+            ..Default::default()
         },
     }
 }
@@ -630,19 +590,8 @@ fn claude_automatic_prefers_weekly_when_model_exhausted() {
         used_percent: 100.0,
         remaining_percent: 0.0,
         window_minutes: Some(10080),
-        resets_at: None,
-        reset_description: None,
         is_exhausted: true,
-        is_informational: false,
-        reserve_percent: None,
-        reserve_description: None,
-        reserve_will_last_to_reset: false,
-        reserve_eta_seconds: None,
-        pace: None,
-        monthly_limit_block: None,
-        description_is_detail: false,
-        reset_regenerates: false,
-        hidden_on_card: false,
+        ..Default::default()
     });
 
     let (primary, _) = selected_tray_percents(&snapshot, &settings);
@@ -673,24 +622,11 @@ fn automatic_prefers_exhausted_weekly_over_low_session() {
 #[test]
 fn automatic_picks_highest_among_model_and_extra_windows() {
     let settings = used_view_settings();
-    let mut snapshot = fake_snapshot_with("gemini", "Gemini", 10.0, Some(30.0), Some(40.0), None);
+    let mut snapshot = fake_snapshot_with("factory", "Droid", 10.0, Some(30.0), Some(40.0), None);
     snapshot.model_specific = Some(crate::commands::RateWindowSnapshot {
         used_percent: 55.0,
         remaining_percent: 45.0,
-        window_minutes: None,
-        resets_at: None,
-        reset_description: None,
-        is_exhausted: false,
-        is_informational: false,
-        reserve_percent: None,
-        reserve_description: None,
-        reserve_will_last_to_reset: false,
-        reserve_eta_seconds: None,
-        pace: None,
-        monthly_limit_block: None,
-        description_is_detail: false,
-        reset_regenerates: false,
-        hidden_on_card: false,
+        ..Default::default()
     });
     snapshot.extra_rate_windows.push(fake_extra_window(90.0));
 
@@ -962,6 +898,7 @@ fn icon_style_not_the_legacy_percent_flag_picks_the_renderer() {
             percent: 30.0,
             has_error: false,
             provider_tint: None,
+            estimated: false,
         }
     );
 
@@ -1309,5 +1246,469 @@ fn color_by_provider_tints_both_stacked_bars_rows() {
     assert_eq!(
         pixel_at(&rgba, 8, 20),
         [CODEX_BRAND.0, CODEX_BRAND.1, CODEX_BRAND.2, 255]
+    );
+}
+
+#[test]
+fn pick_tray_provider_highest_picks_max_primary() {
+    let a = fake_snapshot("codex", "Codex", 30.0);
+    let b = fake_snapshot("claude", "Claude", 72.5);
+    let c = fake_snapshot("gemini", "Gemini", 50.0);
+    let refs: Vec<&ProviderUsageSnapshot> = vec![&a, &b, &c];
+    let picked = pick_tray_provider(
+        &refs,
+        /* prefer_highest = */ true,
+        &Settings::default(),
+        Utc::now(),
+    )
+    .expect("highest mode should pick a provider");
+    assert_eq!(picked.provider_id, "claude");
+}
+
+#[test]
+fn pick_tray_provider_first_preserves_catalog_order() {
+    let a = fake_snapshot("codex", "Codex", 30.0);
+    let b = fake_snapshot("claude", "Claude", 72.5);
+    let refs: Vec<&ProviderUsageSnapshot> = vec![&a, &b];
+    let picked = pick_tray_provider(
+        &refs,
+        /* prefer_highest = */ false,
+        &Settings::default(),
+        Utc::now(),
+    )
+    .expect("non-highest mode should still pick the first entry");
+    assert_eq!(picked.provider_id, "codex");
+}
+
+#[test]
+fn pick_tray_provider_none_when_empty() {
+    let refs: Vec<&ProviderUsageSnapshot> = vec![];
+    let settings = Settings::default();
+    assert!(pick_tray_provider(&refs, true, &settings, Utc::now()).is_none());
+    assert!(pick_tray_provider(&refs, false, &settings, Utc::now()).is_none());
+}
+
+#[test]
+fn pick_tray_provider_highest_ranks_the_selected_metric_by_depletion() {
+    use chrono::TimeZone;
+    let now = Utc.with_ymd_and_hms(2026, 8, 16, 12, 0, 0).unwrap();
+    let timed = |used: f64, minutes: u32, remaining_minutes: i64| RateWindowSnapshot {
+        used_percent: used,
+        remaining_percent: 100.0 - used,
+        window_minutes: Some(minutes),
+        resets_at: Some((now + chrono::Duration::minutes(remaining_minutes)).to_rfc3339()),
+        ..Default::default()
+    };
+    // Codex: a 10% session beside a weekly at 60% one hour into a five-hour
+    // window, which runs out in 40 minutes.
+    let mut codex = fake_snapshot("codex", "Codex", 10.0);
+    codex.primary = timed(10.0, 300, 240);
+    codex.secondary = Some(timed(60.0, 300, 240));
+    let claude = fake_snapshot("claude", "Claude", 80.0);
+    let refs: Vec<&ProviderUsageSnapshot> = vec![&claude, &codex];
+
+    let picked = pick_tray_provider(&refs, true, &Settings::default(), now)
+        .expect("highest mode should pick a provider");
+    assert_eq!(picked.provider_id, "codex");
+}
+
+#[test]
+fn estimated_quota_draws_a_tilde_percent_icon_and_status_label() {
+    let settings = Settings {
+        tray_icon_mode: TrayIconMode::Single,
+        menu_bar_icon_style: codexbar::settings::MenuBarIconStyle::Percent,
+        show_as_used: true,
+        ..Settings::default()
+    };
+    let mut estimated = fake_snapshot("opencodego", "OpenCode Go", 42.0);
+    estimated.quota_estimated = true;
+    let snapshots = vec![estimated];
+
+    let plan = TrayPresentationPlan::resolve(&settings, &snapshots, None);
+
+    assert_eq!(
+        plan.icon,
+        TrayIconPlan::Percent {
+            percent: 42.0,
+            has_error: false,
+            provider_tint: None,
+            estimated: true,
+        }
+    );
+    let (rgba, _, _) = plan.render_icon();
+    assert_eq!(
+        rgba,
+        codexbar::tray::render_estimated_percent_icon_rgba_tinted(42.0, false, None, None).0
+    );
+    assert_ne!(
+        rgba,
+        codexbar::tray::render_percent_icon_rgba(42.0, false).0
+    );
+    assert_eq!(
+        plan.status_labels(Language::English),
+        vec![(
+            "status_summary".to_string(),
+            "OpenCode Go ~42% used".to_string()
+        )]
+    );
+}
+
+#[test]
+fn estimated_marker_skips_an_informational_headline() {
+    let mut snapshot = fake_snapshot("opencodego", "OpenCode Go", 0.0);
+    snapshot.quota_estimated = true;
+    snapshot.primary.is_informational = true;
+    snapshot.primary.reset_description = Some("No usage yet".to_string());
+
+    assert_eq!(
+        headline_status_label(&snapshot, true, Language::English),
+        "No usage yet"
+    );
+}
+
+fn openai_api_throughput(latest: Option<u64>) -> crate::commands::ProviderThroughputSnapshot {
+    crate::commands::ProviderThroughputSnapshot {
+        minutes: Vec::new(),
+        frontier: latest.map(|_| 1_700_000_000),
+        latest_tokens_per_minute: latest,
+        peak_tokens_per_minute: latest.unwrap_or(0),
+        peak_at: None,
+        five_minute_average_tokens_per_minute: 0.0,
+        models: Vec::new(),
+        window_minutes: 60,
+        fetched_at: 1_700_000_060,
+        project_id: None,
+    }
+}
+
+#[test]
+fn tokens_per_minute_metric_labels_status_with_the_latest_rate() {
+    let mut settings = Settings {
+        tray_icon_mode: TrayIconMode::PerProvider,
+        show_as_used: true,
+        ..Settings::default()
+    };
+    settings.set_provider_metric(ProviderId::OpenAIApi, MetricPreference::TokensPerMinute);
+    let mut openai = fake_snapshot("openaiapi", "OpenAI API", 40.0);
+    openai.throughput = Some(openai_api_throughput(Some(49_000_000)));
+    let snapshots = vec![openai.clone(), fake_snapshot("codex", "Codex", 30.0)];
+
+    let plan = TrayPresentationPlan::resolve(&settings, &snapshots, None);
+    let labels = plan.status_labels(Language::English);
+
+    assert!(
+        labels.contains(&("openaiapi".to_string(), "OpenAI API 49M/min".to_string())),
+        "{labels:?}"
+    );
+    // Other providers keep their usage label; the meter keeps a usage lane.
+    assert!(
+        labels.contains(&("codex".to_string(), "Codex 30% used".to_string())),
+        "{labels:?}"
+    );
+
+    openai.throughput = Some(openai_api_throughput(Some(0)));
+    assert_eq!(
+        tokens_per_minute_status(&openai, &settings, Language::English).as_deref(),
+        Some("0/min")
+    );
+}
+
+fn nous_balance_detail(id: &str, value: &str) -> crate::commands::ProviderDisplayDetailSnapshot {
+    crate::commands::ProviderDisplayDetailSnapshot {
+        id: id.to_string(),
+        section_title: None,
+        title: id.to_string(),
+        value: value.to_string(),
+        secondary_value: None,
+        progress: None,
+    }
+}
+
+#[test]
+fn balance_only_nous_status_row_reads_its_balance() {
+    let settings = Settings {
+        tray_icon_mode: TrayIconMode::PerProvider,
+        show_as_used: true,
+        ..Settings::default()
+    };
+    // Credits-only account: no monthly meter, so the headline is informational.
+    let mut nous = fake_snapshot("nous", "Nous Portal", 0.0);
+    nous.primary.is_informational = true;
+    nous.primary.reset_description = Some("Nous Portal credits".to_string());
+    nous.display_details = vec![nous_balance_detail("top-up-credits", "$6.76")];
+    // A monthly meter keeps its percentage even when a balance row exists.
+    let mut metered = fake_snapshot("nous", "Nous Portal", 25.0);
+    metered.display_details = vec![nous_balance_detail("total-usable", "$74.25")];
+
+    let balance_only = vec![nous];
+    let plan = TrayPresentationPlan::resolve(&settings, &balance_only, None);
+    assert_eq!(
+        plan.status_labels(Language::English),
+        vec![("nous".to_string(), "Nous Portal $6.76".to_string())]
+    );
+
+    let metered = vec![metered];
+    let plan = TrayPresentationPlan::resolve(&settings, &metered, None);
+    assert_eq!(
+        plan.status_labels(Language::English),
+        vec![("nous".to_string(), "Nous Portal 25% used".to_string())]
+    );
+}
+
+#[test]
+fn tokens_per_minute_metric_without_reported_minutes_is_unavailable() {
+    let mut settings = Settings::default();
+    settings.set_provider_metric(ProviderId::OpenAIApi, MetricPreference::TokensPerMinute);
+    let mut openai = fake_snapshot("openaiapi", "OpenAI API", 40.0);
+
+    assert_eq!(
+        tokens_per_minute_status(&openai, &settings, Language::English).as_deref(),
+        Some("Tokens/min unavailable")
+    );
+    openai.throughput = Some(openai_api_throughput(None));
+    assert_eq!(
+        tokens_per_minute_status(&openai, &settings, Language::English).as_deref(),
+        Some("Tokens/min unavailable")
+    );
+
+    // Any other metric leaves the usage label alone.
+    let automatic = Settings::default();
+    openai.throughput = Some(openai_api_throughput(Some(1_500)));
+    assert_eq!(
+        tokens_per_minute_status(&openai, &automatic, Language::English),
+        None
+    );
+}
+
+#[test]
+fn tokens_per_minute_metric_on_a_provider_without_a_rate_falls_back() {
+    // A saved Tokens/min value must not leak onto a provider that cannot
+    // report a rate: the row keeps the Automatic usage label instead.
+    let mut settings = Settings::default();
+    settings.set_provider_metric(ProviderId::Codex, MetricPreference::TokensPerMinute);
+    let mut codex = fake_snapshot("codex", "Codex", 30.0);
+    codex.throughput = Some(openai_api_throughput(Some(12_000)));
+    assert_eq!(
+        tokens_per_minute_status(&codex, &settings, Language::English),
+        None
+    );
+}
+
+#[test]
+fn tokens_per_minute_metric_keeps_the_automatic_icon_lane() {
+    let mut settings = Settings {
+        tray_icon_mode: TrayIconMode::Single,
+        show_as_used: true,
+        ..Settings::default()
+    };
+    let mut openai = fake_snapshot("openaiapi", "OpenAI API", 40.0);
+    openai.throughput = Some(openai_api_throughput(Some(12_000)));
+    let snapshots = vec![openai];
+    let automatic_icon = TrayPresentationPlan::resolve(&settings, &snapshots, None).icon;
+
+    settings.set_provider_metric(ProviderId::OpenAIApi, MetricPreference::TokensPerMinute);
+    let plan = TrayPresentationPlan::resolve(&settings, &snapshots, None);
+
+    assert_eq!(plan.icon, automatic_icon);
+    assert_eq!(
+        plan.status_labels(Language::English),
+        vec![(
+            "status_summary".to_string(),
+            "OpenAI API 12K/min".to_string()
+        )]
+    );
+}
+
+fn grok_bot_cursor(used_percent: Option<f64>) -> ProviderUsageSnapshot {
+    let mut cursor = fake_snapshot("cursor", "Cursor", 30.0);
+    cursor.extra_rate_windows = used_percent
+        .map(|used| crate::commands::NamedRateWindowSnapshot {
+            id: "cursor-grok-bot".to_string(),
+            title: "Grok Bot".to_string(),
+            window: RateWindowSnapshot {
+                used_percent: used,
+                remaining_percent: 100.0 - used,
+                ..Default::default()
+            },
+            fallback_lane: false,
+            icon_fallback: None,
+        })
+        .into_iter()
+        .collect();
+    cursor
+}
+
+#[test]
+fn named_extra_metric_labels_status_and_meter_with_the_allowance() {
+    let mut settings = Settings {
+        tray_icon_mode: TrayIconMode::PerProvider,
+        show_as_used: true,
+        ..Settings::default()
+    };
+    settings.set_provider_metric(
+        ProviderId::Cursor,
+        MetricPreference::NamedExtra("cursor-grok-bot".to_string()),
+    );
+    let snapshots = vec![
+        grok_bot_cursor(Some(42.0)),
+        fake_snapshot("codex", "Codex", 30.0),
+    ];
+
+    let labels =
+        TrayPresentationPlan::resolve(&settings, &snapshots, None).status_labels(Language::English);
+    assert!(
+        labels.contains(&("cursor".to_string(), "Cursor Grok Bot 42% used".to_string())),
+        "{labels:?}"
+    );
+    assert!(
+        labels.contains(&("codex".to_string(), "Codex 30% used".to_string())),
+        "{labels:?}"
+    );
+    assert_eq!(selected_tray_percents(&snapshots[0], &settings).0, 42.0);
+
+    // A real 0% stays 0%, distinct from an unknown reading.
+    let zero = grok_bot_cursor(Some(0.0));
+    let preference = settings.get_provider_metric(ProviderId::Cursor);
+    assert_eq!(
+        named_extra_status(&zero, &preference, true, Language::English).as_deref(),
+        Some("Grok Bot 0% used")
+    );
+}
+
+#[test]
+fn named_extra_metric_without_a_reading_shows_a_labeled_dash() {
+    let mut settings = Settings {
+        show_as_used: true,
+        ..Settings::default()
+    };
+    let preference = MetricPreference::NamedExtra("cursor-grok-bot".to_string());
+    settings.set_provider_metric(ProviderId::Cursor, preference.clone());
+    let missing = grok_bot_cursor(None);
+
+    assert_eq!(
+        named_extra_status(&missing, &preference, true, Language::English).as_deref(),
+        Some("Grok Bot \u{2013}")
+    );
+    // The meter is unknown instead of borrowing the 30% core lane.
+    assert!(selected_tray_percents(&missing, &settings).0.is_nan());
+}
+
+#[test]
+fn saved_grok_bot_shows_the_promoted_weekly_pool_in_the_tray() {
+    let mut settings = Settings {
+        show_as_used: true,
+        ..Settings::default()
+    };
+    let preference = MetricPreference::NamedExtra("cursor-grok-bot".to_string());
+    settings.set_provider_metric(ProviderId::Cursor, preference.clone());
+    let mut weekly = grok_bot_cursor(None);
+    weekly.primary.used_percent = 10.0;
+    weekly.primary.is_informational = false;
+    weekly.secondary = None;
+    weekly.primary_label = Some("Weekly".to_string());
+
+    assert_eq!(
+        named_extra_status(&weekly, &preference, true, Language::English).as_deref(),
+        Some("Grok Bot 10% used")
+    );
+    assert_eq!(selected_tray_percents(&weekly, &settings).0, 10.0);
+}
+
+#[test]
+fn named_extra_metric_without_a_reading_renders_an_unknown_icon_in_both_directions() {
+    for show_as_used in [true, false] {
+        let mut settings = Settings {
+            show_as_used,
+            menu_bar_icon_style: codexbar::settings::MenuBarIconStyle::Percent,
+            ..Settings::default()
+        };
+        settings.set_provider_metric(
+            ProviderId::Cursor,
+            MetricPreference::NamedExtra("cursor-grok-bot".to_string()),
+        );
+        let snapshots = vec![grok_bot_cursor(None)];
+
+        let (percent_icon, _, _) =
+            TrayPresentationPlan::resolve(&settings, &snapshots, None).render_icon();
+        let unknown =
+            codexbar::tray::render_percent_icon_rgba(codexbar::tray::UNKNOWN_PERCENT, false).0;
+        assert_eq!(percent_icon, unknown, "show_as_used={show_as_used}");
+        assert_ne!(
+            percent_icon,
+            codexbar::tray::render_percent_icon_rgba(0.0, false).0,
+            "show_as_used={show_as_used}"
+        );
+
+        settings.menu_bar_icon_style = codexbar::settings::MenuBarIconStyle::Bars;
+        let (bar_icon, _, _) =
+            TrayPresentationPlan::resolve(&settings, &snapshots, None).render_icon();
+        let (selected, companion) = selected_tray_percents(&snapshots[0], &settings);
+        assert!(selected.is_nan(), "show_as_used={show_as_used}");
+        assert_eq!(
+            bar_icon,
+            codexbar::tray::render_bar_icon_rgba(codexbar::tray::UNKNOWN_PERCENT, companion, false)
+                .0,
+            "show_as_used={show_as_used}"
+        );
+
+        // A real 0% used still renders as a reading in both directions.
+        let zero = vec![grok_bot_cursor(Some(0.0))];
+        settings.menu_bar_icon_style = codexbar::settings::MenuBarIconStyle::Percent;
+        let (zero_icon, _, _) = TrayPresentationPlan::resolve(&settings, &zero, None).render_icon();
+        let expected = if show_as_used { 0.0 } else { 100.0 };
+        assert_eq!(
+            zero_icon,
+            codexbar::tray::render_percent_icon_rgba(expected, false).0,
+            "show_as_used={show_as_used}"
+        );
+    }
+}
+
+#[test]
+fn named_extra_metric_marks_an_estimated_reading_but_not_a_dash() {
+    let preference = MetricPreference::NamedExtra("cursor-grok-bot".to_string());
+    let mut estimated = grok_bot_cursor(Some(42.0));
+    estimated.quota_estimated = true;
+    assert_eq!(
+        named_extra_status(&estimated, &preference, true, Language::English).as_deref(),
+        Some("Grok Bot ~42% used")
+    );
+
+    let mut missing = grok_bot_cursor(None);
+    missing.quota_estimated = true;
+    assert_eq!(
+        named_extra_status(&missing, &preference, true, Language::English).as_deref(),
+        Some("Grok Bot \u{2013}")
+    );
+}
+
+#[test]
+fn named_extra_metric_never_labels_another_provider_or_an_unknown_id() {
+    let grok = MetricPreference::NamedExtra("cursor-grok-bot".to_string());
+    let mut codex = grok_bot_cursor(Some(42.0));
+    codex.provider_id = "codex".to_string();
+    assert_eq!(
+        named_extra_status(&codex, &grok, true, Language::English),
+        None
+    );
+
+    let retired = MetricPreference::NamedExtra("cursor-retired-window".to_string());
+    assert_eq!(
+        named_extra_status(
+            &grok_bot_cursor(Some(42.0)),
+            &retired,
+            true,
+            Language::English
+        ),
+        None
+    );
+    assert_eq!(
+        named_extra_status(
+            &grok_bot_cursor(Some(42.0)),
+            &MetricPreference::Automatic,
+            true,
+            Language::English
+        ),
+        None
     );
 }

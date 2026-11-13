@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useReducer, useState } from "react";
+import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import type {
   ProviderCatalogEntry,
   ProviderUsageSnapshot,
@@ -9,6 +9,7 @@ import { SettingsGroup } from "../../../components/FormControls";
 import { formatRelativeUpdated } from "../../../lib/relativeTime";
 import { nextEnabledProviders } from "../settingsTabs";
 import { useLocale } from "../../../hooks/useLocale";
+import { useNow } from "../../../hooks/useNow";
 import { providerAllowsPace } from "../../../lib/providerPace";
 import { providerBarAccent } from "../../../components/providers/providerIcons";
 import {
@@ -143,7 +144,15 @@ export function ProviderDetailPane({
   const setBusy = (value: boolean) =>
     dispatch({ type: "SET_BUSY", busy: value });
 
+  // A load started for another provider (e.g. a credential save that finished
+  // after the selection changed) must not replace the current provider.
+  const selectedProviderId = useRef(providerId);
+  selectedProviderId.current = providerId;
+  // Keeps "Updated N ago" advancing while the pane stays open.
+  const nowMs = useNow();
+
   const load = useCallback(async (id: string, signal?: { stale: boolean }) => {
+    const isStale = () => signal?.stale === true || selectedProviderId.current !== id;
     dispatch({ type: "LOAD_START" });
     try {
       const [next, cookieOpts, regionOpts, storageStatus] = await Promise.all([
@@ -152,7 +161,7 @@ export function ProviderDetailPane({
         getProviderRegionOptions(id),
         getCredentialStorageStatus(),
       ]);
-      if (signal?.stale) return;
+      if (isStale()) return;
       dispatch({
         type: "LOAD_SUCCESS",
         detail: next,
@@ -161,12 +170,12 @@ export function ProviderDetailPane({
         credentialStatus: storageStatus,
       });
     } catch (e) {
-      if (signal?.stale) return;
+      if (isStale()) return;
       dispatch({ type: "LOAD_ERROR", error: String(e) });
     } finally {
       // Keep stale guard — concurrent provider switches must not clear loading
       // for the in-flight replacement load.
-      if (!signal?.stale) dispatch({ type: "LOAD_FINISH" });
+      if (!isStale()) dispatch({ type: "LOAD_FINISH" });
     }
   }, []);
 
@@ -346,7 +355,7 @@ export function ProviderDetailPane({
   const hasFetchError = Boolean(detail.lastError?.trim());
   const updatedMs = detail.lastUpdated ? Date.parse(detail.lastUpdated) : Number.NaN;
   const updatedText = Number.isFinite(updatedMs)
-    ? formatRelativeUpdated(updatedMs, t)
+    ? formatRelativeUpdated(updatedMs, t, nowMs)
     : busy
       ? t("SectionRefreshing")
       : hasFetchError
@@ -510,7 +519,11 @@ export function ProviderDetailPane({
       </SettingsGroup>
 
       <SettingsGroup className="provider-detail-group provider-fields-group">
-        <CredentialsDispatcher providerId={detail.id} t={t} />
+        <CredentialsDispatcher
+          providerId={detail.id}
+          t={t}
+          onCredentialsChanged={reload}
+        />
         <ApiKeySection key={`api-${credKey}`} providerId={detail.id} />
         <CookieSection
           key={`cookie-${credKey}`}
@@ -522,7 +535,7 @@ export function ProviderDetailPane({
 
       <SettingsGroup className="provider-detail-group provider-accounts-group">
         {detail.id === "codex" && (
-          <CodexAccountsSection t={t} hidePersonalInfo={hidePersonalInfo} />
+          <CodexAccountsSection t={t} hidePersonalInfo={hidePersonalInfo} showAsUsed={showAsUsed} />
         )}
         {detail.id === "claude" && (
           <ClaudeAccountsSection
@@ -533,6 +546,7 @@ export function ProviderDetailPane({
             resetTimeRelative={resetTimeRelative}
             claudeSwapEnabled={settings.claudeSwapEnabled ?? false}
             claudeSwapExecutablePath={settings.claudeSwapExecutablePath ?? ""}
+            claudeSwapSource={settings.claudeSwapSource ?? "claude-swap"}
           />
         )}
         {detail.id === "grok" && (

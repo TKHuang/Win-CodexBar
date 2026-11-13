@@ -91,8 +91,8 @@ type SessionSource = fn() -> BrowserSessions;
 #[derive(Debug, Default)]
 struct BrowserSessions {
     cookies: Vec<String>,
-    /// Chromium App-Bound Encryption hid a browser's cookies (often Chrome,
-    /// the browser WorkBuddy sessions are bound to).
+    /// Chromium App-Bound Encryption hid these browsers' cookies (often Chrome,
+    /// the browser WorkBuddy sessions are bound to), named in one error.
     protected: Option<ProviderError>,
     /// Another browser's cookies could not be read.
     unreadable: Option<ProviderError>,
@@ -324,8 +324,11 @@ async fn summary(
     Ok(None)
 }
 
-/// Upstream `nextReset`: the earliest future cycle end across the paid and
-/// free listings. A failed listing never discards the balance.
+/// Upstream `nextReset` (#4767): the earliest future cycle end in the paid
+/// listing, else in the free listing. The paid subscription cycle is what
+/// refills the allowance, so a free grant that expires sooner must not shorten
+/// it; the free listing is only queried when the paid one has no future end.
+/// A failed listing never discards the balance.
 async fn next_reset(
     site: &Site<'_>,
     cookie: &str,
@@ -337,7 +340,6 @@ async fn next_reset(
         (PAID_PATH, &PAID_PACKAGE_CODES),
         (FREE_PATH, &FREE_PACKAGE_CODES),
     ];
-    let mut earliest: Option<DateTime<Utc>> = None;
     for (path, codes) in listings {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let Some(timeout) = listing_timeout(site.timeout, remaining) else {
@@ -353,7 +355,7 @@ async fn next_reset(
         match site.post(cookie, agent, path, &body, timeout).await {
             Ok(page) => {
                 if let Some(end) = model::earliest_reset(&page, now) {
-                    earliest = Some(earliest.map_or(end, |current| current.min(end)));
+                    return Some(end);
                 }
             }
             Err(_) => {
@@ -361,7 +363,7 @@ async fn next_reset(
             }
         }
     }
-    earliest
+    None
 }
 
 enum Failure {
@@ -448,12 +450,14 @@ fn browser_sessions() -> BrowserSessions {
 }
 
 /// One Cookie header per browser that holds a `www.workbuddy.cn` session,
-/// in browser order, plus the first App-Bound Encryption skip and the first
-/// other read failure. A browser without cookies is not a failure.
+/// in browser order. Every browser that App-Bound Encryption blocked is named
+/// in one protected error (scan order, no repeats), and the first other read
+/// failure is kept. A browser without cookies is not a failure.
 fn collect_sessions(
     scan: impl IntoIterator<Item = (BrowserType, Result<Vec<Cookie>, CookieError>)>,
 ) -> BrowserSessions {
     let mut found = BrowserSessions::default();
+    let mut blocked: Option<Vec<BrowserType>> = None;
     for (browser, cookies) in scan {
         let error = match cookies {
             Ok(cookies) => {
@@ -464,23 +468,30 @@ fn collect_sessions(
             }
             Err(error) => error,
         };
-        let protected = matches!(error, CookieError::AppBoundEncryption);
+        if matches!(error, CookieError::AppBoundEncryption { .. }) {
+            tracing::debug!(
+                browser = browser.display_name(),
+                "WorkBuddy could not read this browser's cookies (App-Bound Encryption)"
+            );
+            let names = blocked.get_or_insert_with(Vec::new);
+            if !names.contains(&browser) {
+                names.push(browser);
+            }
+            continue;
+        }
         let error = crate::providers::map_browser_cookie_error(error);
         if matches!(error, ProviderError::NoCookies) {
             continue;
         }
         tracing::debug!(
             browser = browser.display_name(),
-            protected,
             "WorkBuddy could not read this browser's cookies"
         );
-        let slot = if protected {
-            &mut found.protected
-        } else {
-            &mut found.unreadable
-        };
-        slot.get_or_insert(error);
+        found.unreadable.get_or_insert(error);
     }
+    found.protected = blocked.map(|browsers| {
+        crate::providers::map_browser_cookie_error(CookieError::AppBoundEncryption { browsers })
+    });
     found
 }
 

@@ -131,8 +131,39 @@ pub struct OAuthUsageResponse {
     #[serde(default)]
     pub iguana_necktie: Option<serde_json::Value>,
 
+    /// Saved limit-reset block, present when the request opted in. Decoded
+    /// leniently by `reset_credits` so a malformed block never hides usage.
     #[serde(default)]
+    cedar_ember: Option<serde_json::Value>,
+
+    /// Read entry by entry (upstream #4614): one malformed limit keeps its siblings.
+    #[serde(default, deserialize_with = "super::scoped_weekly::deserialize_limits")]
     limits: Vec<super::scoped_weekly::ScopedWeeklyLimit>,
+}
+
+/// Display-only limit-reset inventory, when the block is present and valid.
+fn reset_credits_item(
+    response: &OAuthUsageResponse,
+    now: DateTime<Utc>,
+) -> Option<crate::core::ProviderInventoryItem> {
+    response
+        .cedar_ember
+        .as_ref()
+        .and_then(|block| super::reset_credits::inventory_from_block(block, now))
+}
+
+/// Upstream retries without the reset opt-in on 400, and on 403 unless the
+/// rejection names the missing `user:profile` scope.
+fn rejects_reset_opt_in(status: reqwest::StatusCode, body: &str) -> bool {
+    status == reqwest::StatusCode::BAD_REQUEST
+        || (status == reqwest::StatusCode::FORBIDDEN && !body.contains("user:profile"))
+}
+
+/// Status, `Retry-After` and body of one usage response.
+struct UsageReply {
+    status: reqwest::StatusCode,
+    retry_after: Option<HeaderValue>,
+    body: String,
 }
 
 /// Display row for the promotional cloud-credits block, when present and valid.
@@ -185,6 +216,76 @@ pub(super) fn is_rate_limited_error(error: &ProviderError) -> bool {
 /// Claude OAuth fetcher
 pub struct ClaudeOAuthFetcher {
     client: Client,
+    api_base: String,
+    usage_gate: &'static Mutex<usage_gate::UsageGate>,
+    version_source: ClaudeVersionSource,
+}
+
+/// Where the Claude CLI version in the usage User-Agent comes from.
+#[derive(Clone, Copy)]
+enum ClaudeVersionSource {
+    /// Run `claude --version`, cached for `CLAUDE_VERSION_CACHE_TTL`.
+    Detect,
+    /// A fixed answer for tests. `None` exercises the fallback version.
+    #[cfg(test)]
+    Fixed(Option<&'static str>),
+}
+
+/// Upstream `ClaudeOAuthUsageFetcher.fallbackClaudeCodeVersion`, used when the
+/// CLI version cannot be detected.
+const FALLBACK_CLAUDE_CODE_VERSION: &str = "2.1.0";
+/// Upstream caches the detected CLI version for 30 minutes.
+const CLAUDE_VERSION_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
+/// Last successful `claude --version` detection, as (when, version).
+static CLAUDE_VERSION_CACHE: Mutex<Option<(Instant, String)>> = Mutex::new(None);
+#[cfg(test)]
+const TEST_CLAUDE_CODE_VERSION: &str = "2.3.4";
+
+/// Version used in the User-Agent: the detected CLI version, or the fallback
+/// when detection failed or returned nothing usable.
+fn claude_agent_version(detected: Option<&str>) -> &str {
+    detected
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+        .unwrap_or(FALLBACK_CLAUDE_CODE_VERSION)
+}
+
+/// Legacy agent string (`claude-code/<version>`). The fallback retry sends it.
+fn claude_code_user_agent(detected: Option<&str>) -> String {
+    format!("claude-code/{}", claude_agent_version(detected))
+}
+
+/// Opt-in agent string (`claude-cli/<version> (external, cli)`). Upstream
+/// derives it from the legacy string by renaming the product.
+fn claude_cli_user_agent(detected: Option<&str>) -> String {
+    format!(
+        "claude-cli/{} (external, cli)",
+        claude_agent_version(detected)
+    )
+}
+
+/// The Claude CLI version from `claude --version`, cached for the TTL.
+/// Failed detections are not cached, so a later poll can still succeed.
+async fn detected_claude_version() -> Option<String> {
+    {
+        let cache = CLAUDE_VERSION_CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((cached_at, version)) = cache.as_ref()
+            && cached_at.elapsed() < CLAUDE_VERSION_CACHE_TTL
+        {
+            return Some(version.clone());
+        }
+    }
+    // The detector blocks on a child process, so keep it off the async runtime.
+    let version = tokio::task::spawn_blocking(super::cli_binary::detect_claude_version)
+        .await
+        .ok()
+        .flatten()?;
+    *CLAUDE_VERSION_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), version.clone()));
+    Some(version)
 }
 
 /// Gate shared with other CodexBar processes through a small file (#775).
@@ -310,13 +411,66 @@ fn account_refresh_error(error: ProviderError) -> ProviderError {
     }
 }
 
+/// Whether the standalone saved account may stand in for Claude Code's login.
+/// An explicit OAuth token from the environment always wins, so it is checked
+/// first; the standalone account never replaces it or runs ahead of it.
+fn standalone_fallback_applies() -> bool {
+    !credentials_store::environment_token_present() && !super::claude_code_consent()
+}
+
+/// Standalone results carry the saved account's own labels and never the
+/// identity a token may hold, because the token says nothing about which
+/// login Claude CLI uses.
+fn apply_standalone_summary(
+    fetched: &mut ProviderFetchResult,
+    summary: Option<super::accounts::ClaudeAccount>,
+) {
+    fetched.account_identity = None;
+    let Some(summary) = summary else {
+        return;
+    };
+    let usage = &mut fetched.usage;
+    usage.account_email = Some(summary.email);
+    if summary.organization.is_some() {
+        usage.account_organization = summary.organization;
+    }
+    if let Some(label) = summary.plan.as_deref().and_then(super::claude_plan_label) {
+        usage.login_method = Some(label);
+    }
+}
+
 impl ClaudeOAuthFetcher {
-    const USAGE_URL: &'static str = "https://api.anthropic.com/api/oauth/usage";
+    const API_BASE: &'static str = "https://api.anthropic.com";
+    const USAGE_PATH: &'static str = "/api/oauth/usage";
     const DEFAULT_RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(5 * 60);
 
     pub fn new() -> Self {
         Self {
             client: Client::new(),
+            api_base: Self::API_BASE.to_string(),
+            usage_gate: &USAGE_GATE,
+            version_source: ClaudeVersionSource::Detect,
+        }
+    }
+
+    /// A fetcher against a local server with its own in-memory usage gate, so
+    /// tests never touch the shared gate file. The CLI version is pinned so
+    /// the User-Agent is deterministic.
+    #[cfg(test)]
+    fn for_test_server(api_base: impl Into<String>) -> Self {
+        Self {
+            client: Client::new(),
+            api_base: api_base.into(),
+            usage_gate: Box::leak(Box::new(Mutex::new(usage_gate::UsageGate::new(None)))),
+            version_source: ClaudeVersionSource::Fixed(Some(TEST_CLAUDE_CODE_VERSION)),
+        }
+    }
+
+    async fn claude_code_version(&self) -> Option<String> {
+        match self.version_source {
+            ClaudeVersionSource::Detect => detected_claude_version().await,
+            #[cfg(test)]
+            ClaudeVersionSource::Fixed(version) => version.map(str::to_string),
         }
     }
 
@@ -326,6 +480,16 @@ impl ClaudeOAuthFetcher {
     pub async fn fetch(&self) -> Result<ProviderFetchResult, ProviderError> {
         let _account_operation = super::accounts::CREDENTIAL_OPERATION.lock().await;
         let account_manager = super::accounts::AccountManager::new().ok();
+        // Without consent Claude Code's credentials stay closed. A saved
+        // account that was never installed into Claude Code is CodexBar's own
+        // and can still supply usage, so a stale or absent Claude Code login
+        // does not blank the panel. An environment token is checked first.
+        if standalone_fallback_applies()
+            && let Some(manager) = &account_manager
+            && let Some(result) = self.fetch_standalone_saved_account(manager).await
+        {
+            return result;
+        }
         let saved_account_id = account_manager
             .as_ref()
             .and_then(|manager| manager.current_account_id().ok().flatten());
@@ -347,7 +511,9 @@ impl ClaudeOAuthFetcher {
         {
             return Err(error);
         }
-        self.fetch_with_credentials(credentials).await
+        let gate_key =
+            usage_gate::account_key(saved_account_id.as_deref(), &credentials.access_token);
+        self.fetch_with_credentials(credentials, &gate_key).await
     }
 
     /// Fetch a saved account directly; never switch Claude Code to obtain usage.
@@ -363,6 +529,44 @@ impl ClaudeOAuthFetcher {
         let (oauth, active) = manager
             .usage_credentials(id)
             .map_err(|e| ProviderError::Other(e.to_string()))?;
+        self.fetch_saved_account(&manager, id, &oauth, active).await
+    }
+
+    /// Usage for the one saved account CodexBar may use without Claude Code's
+    /// credentials. `None` when there is no such account, so the caller keeps
+    /// its normal path (and its own error) for that case.
+    async fn fetch_standalone_saved_account(
+        &self,
+        manager: &super::accounts::AccountManager,
+    ) -> Option<Result<ProviderFetchResult, ProviderError>> {
+        let (id, oauth) = match manager.standalone_usage_credentials() {
+            Ok(Some(account)) => account,
+            Ok(None) => return None,
+            Err(error) => {
+                tracing::warn!(%error, "Could not read CodexBar's saved Claude accounts");
+                return None;
+            }
+        };
+        tracing::debug!("Claude Code credentials are off; using the standalone saved account");
+        let mut result = self.fetch_saved_account(manager, &id, &oauth, false).await;
+        match &mut result {
+            Ok(fetched) => apply_standalone_summary(fetched, manager.saved_summary(&id)),
+            Err(error) => {
+                tracing::warn!(%error, "Claude usage from the standalone saved account failed");
+            }
+        }
+        Some(result)
+    }
+
+    /// Resolve, refresh when needed, and query one saved account. `active`
+    /// means Claude Code holds the same login, so a refresh also updates it.
+    async fn fetch_saved_account(
+        &self,
+        manager: &super::accounts::AccountManager,
+        id: &str,
+        oauth: &serde_json::Value,
+        active: bool,
+    ) -> Result<ProviderFetchResult, ProviderError> {
         let oauth = oauth.to_string();
         let source = credentials_store::CredentialSource::saved_account(
             manager.usage_source_path(),
@@ -371,20 +575,18 @@ impl ClaudeOAuthFetcher {
         );
         let credentials = credentials_store::parse_credentials_json(&oauth)?;
         let (credentials, outcome) = self
-            .ensure_fresh_credentials(
-                credentials,
-                source.clone(),
-                Some(&manager),
-                Some(id),
-                active,
-            )
+            .ensure_fresh_credentials(credentials, source.clone(), Some(manager), Some(id), active)
             .await;
         if credentials.is_expired()
             && let Some(error) = outcome
         {
             return Err(account_refresh_error(error));
         }
-        let result = self.fetch_with_credentials(credentials.clone()).await;
+        // Keyed by the account, so its own 429 block survives a token renewal.
+        let gate_key = usage_gate::account_key(Some(id), &credentials.access_token);
+        let result = self
+            .fetch_with_credentials(credentials.clone(), &gate_key)
+            .await;
         // Unknown expiry metadata and early server expiry still get one renewal.
         if matches!(&result, Err(ProviderError::OAuthExpired(_)))
             && credentials.refresh_token.is_some()
@@ -393,12 +595,12 @@ impl ClaudeOAuthFetcher {
             expired.expires_at = Some(Utc::now());
             credentials_store::store_refreshed(&source, &expired);
             let (refreshed, outcome) = self
-                .ensure_fresh_credentials(expired, source, Some(&manager), Some(id), active)
+                .ensure_fresh_credentials(expired, source, Some(manager), Some(id), active)
                 .await;
             if let Some(error) = outcome {
                 return Err(account_refresh_error(error));
             }
-            return self.fetch_with_credentials(refreshed).await;
+            return self.fetch_with_credentials(refreshed, &gate_key).await;
         }
         result
     }
@@ -423,29 +625,37 @@ impl ClaudeOAuthFetcher {
             rate_limit_tier: None,
         };
 
-        self.fetch_with_credentials(credentials).await
+        let gate_key = usage_gate::account_key(None, &credentials.access_token);
+        self.fetch_with_credentials(credentials, &gate_key).await
     }
 
     async fn fetch_with_credentials(
         &self,
         credentials: ClaudeOAuthCredentials,
+        gate_key: &str,
     ) -> Result<ProviderFetchResult, ProviderError> {
-        let usage_response = self.fetch_usage(&credentials).await?;
+        let fingerprint = usage_gate::token_fingerprint(&credentials.access_token);
+        // Upstream validates the token before its profile lookup, so an expired
+        // or scope-less token sends no /profile request.
+        Self::check_usage_credentials(&credentials)?;
+        // Started before the usage request so a quick profile answer can still
+        // label this refresh; the usage request never waits for it.
+        let _ = profile::display_email(&self.client, &credentials.access_token, &fingerprint);
+        let usage_response = self.fetch_usage(&credentials, gate_key).await?;
         let mut usage = self.build_usage_snapshot(&usage_response, &credentials);
         let spend_cost = apply_spend_only_extra_usage(&mut usage, &usage_response);
-        // Header email only; a profile failure leaves the usage result intact.
+        // Header email only; a missing or failed profile leaves usage intact.
         if usage.account_email.is_none()
-            && let Some(email) = profile::fetch_email(
-                &self.client,
-                &credentials.access_token,
-                &usage_gate::token_fingerprint(&credentials.access_token),
-            )
-            .await
+            && let Some(email) =
+                profile::display_email(&self.client, &credentials.access_token, &fingerprint)
         {
             usage = usage.with_email(email);
         }
         let mut result = ProviderFetchResult::new(usage, "oauth")
             .with_display_detail(cloud_credits_row(&usage_response, Utc::now()));
+        if let Some(item) = reset_credits_item(&usage_response, Utc::now()) {
+            result = result.with_inventory_item(item);
+        }
         if let Some(cost) = spend_cost {
             result = result.with_cost(cost);
         }
@@ -578,11 +788,9 @@ impl ClaudeOAuthFetcher {
         }
     }
 
-    /// Fetch usage data using OAuth credentials
-    pub async fn fetch_usage(
-        &self,
-        credentials: &ClaudeOAuthCredentials,
-    ) -> Result<OAuthUsageResponse, ProviderError> {
+    /// Expiry and `user:profile` scope checks that run before any request for
+    /// the token, including the profile lookup.
+    fn check_usage_credentials(credentials: &ClaudeOAuthCredentials) -> Result<(), ProviderError> {
         if credentials.is_expired() {
             return Err(ProviderError::OAuthExpired(
                 "OAuth token expired. Run `claude` to refresh.".to_string(),
@@ -597,29 +805,52 @@ impl ClaudeOAuthFetcher {
                 Self::scope_recovery_message()
             )));
         }
+        Ok(())
+    }
 
-        let fingerprint = usage_gate::token_fingerprint(&credentials.access_token);
-        if let Some(result) = Self::gate_precheck(&USAGE_GATE, usage_gate::now_ms(), &fingerprint) {
+    /// Fetch usage data using OAuth credentials
+    pub async fn fetch_usage(
+        &self,
+        credentials: &ClaudeOAuthCredentials,
+        gate_key: &str,
+    ) -> Result<OAuthUsageResponse, ProviderError> {
+        Self::check_usage_credentials(credentials)?;
+
+        if let Some(result) = Self::gate_precheck(self.usage_gate, usage_gate::now_ms(), gate_key) {
             return result;
         }
 
-        let response = self
-            .client
-            .get(Self::USAGE_URL)
-            .header(
-                "Authorization",
-                format!("Bearer {}", credentials.access_token),
+        // Opt in to the saved limit-reset block (upstream 0.72.0). Rejecting
+        // the optional query must not hide quota or spend, so one plain
+        // request follows; its outcome gets the normal handling below.
+        // Upstream 0.77.0: the opt-in request identifies as the Claude CLI,
+        // and the fallback keeps the legacy `claude-code/` string.
+        let usage_url = format!("{}{}", self.api_base, Self::USAGE_PATH);
+        let claude_version = self.claude_code_version().await;
+        let mut reply = self
+            .request_usage(
+                &format!("{usage_url}?{}", super::reset_credits::RESET_OPT_IN_QUERY),
+                &credentials.access_token,
+                &claude_cli_user_agent(claude_version.as_deref()),
             )
-            .header("Accept", "application/json")
-            .header("anthropic-beta", "oauth-2025-04-20")
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
             .await?;
+        if rejects_reset_opt_in(reply.status, &reply.body) {
+            reply = self
+                .request_usage(
+                    &usage_url,
+                    &credentials.access_token,
+                    &claude_code_user_agent(claude_version.as_deref()),
+                )
+                .await?;
+        }
+        let UsageReply {
+            status,
+            retry_after,
+            body,
+        } = reply;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let retry_after = Self::retry_after_duration(response.headers().get(RETRY_AFTER));
-            let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            let retry_after = Self::retry_after_duration(retry_after.as_ref());
 
             // Upstream 0.50.1 #2516: distinguish revoked tokens (keyring ACL
             // revocation, token rotation) from merely expired/invalid ones.
@@ -651,10 +882,11 @@ impl ClaudeOAuthFetcher {
             }
 
             if status.as_u16() == 429 {
-                let backoff = USAGE_GATE
+                let backoff = self
+                    .usage_gate
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .record_rate_limit(usage_gate::now_ms(), &fingerprint, retry_after);
+                    .record_rate_limit(usage_gate::now_ms(), gate_key, retry_after);
                 return Err(Self::rate_limited_error(backoff));
             }
 
@@ -665,17 +897,52 @@ impl ClaudeOAuthFetcher {
             )));
         }
 
-        let body = response
-            .text()
-            .await
-            .map_err(|e| ProviderError::Parse(format!("Failed to read OAuth response: {}", e)))?;
         let usage = Self::parse_usage(&body)?;
 
-        USAGE_GATE
+        self.usage_gate
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .record_success(usage_gate::now_ms(), &fingerprint, body);
+            .record_success(
+                usage_gate::now_ms(),
+                gate_key,
+                super::reset_credits::redact_usage_body(&body),
+            );
         Ok(usage)
+    }
+
+    async fn request_usage(
+        &self,
+        url: &str,
+        access_token: &str,
+        user_agent: &str,
+    ) -> Result<UsageReply, ProviderError> {
+        let response = self
+            .client
+            .get(url)
+            .header("Authorization", format!("Bearer {access_token}"))
+            .header("Accept", "application/json")
+            .header("anthropic-beta", "oauth-2025-04-20")
+            .header("User-Agent", user_agent)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await?;
+        let status = response.status();
+        let retry_after = response.headers().get(RETRY_AFTER).cloned();
+        let body = match response.text().await {
+            Ok(body) => body,
+            Err(e) if status.is_success() => {
+                return Err(ProviderError::Parse(format!(
+                    "Failed to read OAuth response: {}",
+                    e
+                )));
+            }
+            Err(_) => String::new(),
+        };
+        Ok(UsageReply {
+            status,
+            retry_after,
+            body,
+        })
     }
 
     fn parse_usage(body: &str) -> Result<OAuthUsageResponse, ProviderError> {
@@ -820,8 +1087,12 @@ impl ClaudeOAuthFetcher {
         }
 
         // Login method from rate limit tier or default
-        if let Some(tier) = &credentials.rate_limit_tier {
-            usage = usage.with_login_method(super::claude_plan_label(tier));
+        if let Some(label) = credentials
+            .rate_limit_tier
+            .as_deref()
+            .and_then(super::claude_plan_label)
+        {
+            usage = usage.with_login_method(label);
         } else {
             usage = usage.with_login_method("Claude (OAuth)");
         }
@@ -904,3 +1175,6 @@ fn format_reset_date(date: DateTime<Utc>) -> String {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod reset_opt_in_tests;

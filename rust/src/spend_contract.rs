@@ -1,24 +1,30 @@
 //! Unified Usage & Spend accounting contract for upstream 0.53 parity.
 //! Accounting semantics live here so UI/CLI never infer unknown vs zero.
 
+mod custom_pricing;
 mod local_history;
+mod merge;
 mod opencodex;
 
 pub use local_history::{
     LocalCostEstimate, LocalHistoryCoverage, LocalTokenHistorySummary, local_token_history_json,
 };
 
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
 
-use chrono::{Datelike, Local, Timelike, Utc};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use crate::codex_workspaces::{CodexWorkspacesIndex, ProjectUsage, SessionUsage, SourceStatus};
 use crate::cost_reporting_period::{CostReportingPeriod, MAX_ROLLING_DAYS};
 use crate::cost_scanner::{
-    CostScanner, CostSummary, ModelTokenCounts, get_daily_cost_history, get_daily_token_history,
+    CostScanner, CostSummary, get_daily_cost_history, get_daily_token_history,
+};
+
+use custom_pricing::{CustomPricing, CustomRates};
+use merge::{
+    ActivityHistogram, activity_from_sessions, add_known_tokens, add_optional, merge_activity,
+    merge_coverage, merge_daily, merge_models, merge_token_mix, sum_optional_cost,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,10 +131,12 @@ pub struct SpendModelRow {
     pub model: String,
     /// None = unknown/unpriced. Some(0.0) = known free.
     pub cost_usd: Option<f64>,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cache_read_tokens: u64,
-    pub total_tokens: u64,
+    /// None = unknown: at least one of the model's rows did not record usable
+    /// token counts. Some(0) = known zero. Unknown is never summed as zero.
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
     pub custom_pricing: bool,
 }
 
@@ -255,151 +263,6 @@ impl SpendContract {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-struct CustomPricing {
-    entries: HashMap<String, CustomRates>,
-}
-
-/// One `custom-pricing.json` entry, in USD per million tokens. `Some(0.0)` is
-/// free; `None` is unknown and is never filled from another source.
-#[derive(Debug, Clone, Default)]
-struct CustomRates {
-    input: Option<f64>,
-    output: Option<f64>,
-    cache_read: Option<f64>,
-    cache_write: Option<f64>,
-}
-
-impl CustomPricing {
-    fn default_path() -> Option<PathBuf> {
-        dirs::config_dir().map(|path| path.join("CodexBar").join("custom-pricing.json"))
-    }
-
-    fn load() -> Self {
-        Self::default_path()
-            .and_then(|path| fs::read(path).ok())
-            .map(|bytes| Self::parse(&bytes))
-            .unwrap_or_default()
-    }
-
-    /// Upstream `CostUsageCustomPricing.parse`: keys are trimmed and
-    /// lowercased, and every entry is read on its own, so one malformed entry
-    /// never discards the others. An entry without a single usable rate is
-    /// dropped. A document that is not a JSON object is empty.
-    fn parse(bytes: &[u8]) -> Self {
-        let Ok(serde_json::Value::Object(object)) = serde_json::from_slice(bytes) else {
-            return Self::default();
-        };
-        Self {
-            entries: object
-                .into_iter()
-                .filter_map(|(key, value)| {
-                    let key = key.trim().to_ascii_lowercase();
-                    if key.is_empty() {
-                        return None;
-                    }
-                    CustomRates::from_value(&value).map(|rates| (key, rates))
-                })
-                .collect(),
-        }
-    }
-
-    fn rates(&self, provider_id: &str, model: &str) -> Option<&CustomRates> {
-        let model_key = model.trim().to_ascii_lowercase();
-        let provider_key = format!("{}/{}", provider_id.trim().to_ascii_lowercase(), model_key);
-        self.entries
-            .get(&provider_key)
-            .or_else(|| self.entries.get(&model_key))
-    }
-
-    /// Upstream `CostUsageCustomPricing.rates(providerID:model:)` for imported
-    /// ledgers: the bare model key first, then `provider/model`. An empty model
-    /// has no override.
-    fn overlay_rates(&self, provider_id: &str, model: &str) -> Option<&CustomRates> {
-        let model_key = model.trim().to_ascii_lowercase();
-        if model_key.is_empty() {
-            return None;
-        }
-        self.entries.get(&model_key).or_else(|| {
-            let provider_key = format!("{}/{}", provider_id.trim(), model.trim());
-            self.entries.get(&provider_key.to_ascii_lowercase())
-        })
-    }
-}
-
-impl CustomRates {
-    /// Upstream `rates(from:)`: a rate that is missing, not a number,
-    /// negative or non-finite is unknown, and the camelCase spelling wins over
-    /// the snake_case one. `None` when the entry has no usable rate at all.
-    fn from_value(value: &serde_json::Value) -> Option<Self> {
-        let object = value.as_object()?;
-        let rate = |key: &str| {
-            object
-                .get(key)
-                .and_then(serde_json::Value::as_f64)
-                .filter(|rate| rate.is_finite() && *rate >= 0.0)
-        };
-        let rates = Self {
-            input: rate("input"),
-            output: rate("output"),
-            cache_read: rate("cacheRead").or_else(|| rate("cache_read")),
-            cache_write: rate("cacheWrite")
-                .or_else(|| rate("cache_write"))
-                .or_else(|| rate("cacheCreation"))
-                .or_else(|| rate("cache_creation")),
-        };
-        [
-            rates.input,
-            rates.output,
-            rates.cache_read,
-            rates.cache_write,
-        ]
-        .iter()
-        .any(Option::is_some)
-        .then_some(rates)
-    }
-
-    fn cost(&self, counts: &ModelTokenCounts) -> Option<f64> {
-        self.cost_parts(
-            counts.input_tokens,
-            counts.output_tokens,
-            counts.cached_tokens,
-            0,
-        )
-    }
-
-    fn cost_parts(
-        &self,
-        input: u64,
-        output: u64,
-        cache_read: u64,
-        cache_write: u64,
-    ) -> Option<f64> {
-        let cached = cache_read.min(input);
-        self.lane_cost(input.saturating_sub(cached), output, cached, cache_write)
-    }
-
-    /// Upstream `CostUsageCustomPricing.costUSD(rates:...)`: every token lane is
-    /// billed on its own, and a lane with tokens but no rate leaves the cost
-    /// unknown. A missing rate is never filled from another source.
-    fn lane_cost(&self, input: u64, output: u64, cache_read: u64, cache_write: u64) -> Option<f64> {
-        let mut total = 0.0;
-        if input > 0 {
-            total += input as f64 * self.input? / 1_000_000.0;
-        }
-        if output > 0 {
-            total += output as f64 * self.output? / 1_000_000.0;
-        }
-        if cache_read > 0 {
-            total += cache_read as f64 * self.cache_read? / 1_000_000.0;
-        }
-        if cache_write > 0 {
-            total += cache_write as f64 * self.cache_write? / 1_000_000.0;
-        }
-        total.is_finite().then_some(total)
-    }
-}
-
 /// Refreshes models.dev prices for the OpenCodex ledger before a fresh
 /// Usage & Spend build (upstream 0.60.4 `refreshPricingIfNeeded`).
 ///
@@ -495,12 +358,19 @@ pub fn build_contract_from_period_summary(
         native_has_window_costs,
         false,
     );
+    // Rows without usable token counts make the window's token classes unknown
+    // (`None`), never a partial sum reported as the total.
+    let tokens_known = summary.tokens_known();
     let native_token_mix = SpendTokenMix {
-        input_tokens: Some(summary.input_tokens),
-        output_tokens: Some(summary.output_tokens),
-        cache_read_tokens: Some(summary.cached_tokens),
+        input_tokens: tokens_known.then_some(summary.input_tokens),
+        output_tokens: tokens_known.then_some(summary.output_tokens),
+        cache_read_tokens: tokens_known.then_some(summary.cached_tokens),
         cache_creation_tokens: None,
-        reasoning_tokens: summary.reasoning_tokens,
+        reasoning_tokens: if tokens_known {
+            summary.reasoning_tokens
+        } else {
+            None
+        },
         ..SpendTokenMix::default()
     };
 
@@ -515,11 +385,15 @@ pub fn build_contract_from_period_summary(
     let imported = imports.first();
     let replace_native =
         provider_id == "codex" && hide_native_codex_when_opencodex_present && imported.is_some();
-    let token_total = resolve_token_total(
-        summary.total_tokens_for_provider(provider_id),
-        imported,
-        replace_native,
-    );
+    let token_total = if tokens_known {
+        resolve_token_total(
+            summary.total_tokens_for_provider(provider_id),
+            imported,
+            replace_native,
+        )
+    } else {
+        None
+    };
     let resolved = resolve_spend(
         native_cost,
         native_provenance,
@@ -758,19 +632,24 @@ fn model_rows(
     let mut names: HashSet<String> = summary.by_model.keys().cloned().collect();
     names.extend(summary.by_model_tokens.keys().cloned());
     names.extend(summary.unknown_models.iter().cloned());
+    names.extend(summary.unknown_token_rows_by_model.keys().cloned());
     let mut rows: Vec<_> = names
         .into_iter()
         .map(|model| {
-            let counts = summary
-                .by_model_tokens
-                .get(&model)
-                .cloned()
-                .unwrap_or_default();
+            // Unknown counts stay `None` and are never summed as zero, so a
+            // custom-rate cost is not computed from them either.
+            let counts = (!model_tokens_unknown(summary, &model)).then(|| {
+                summary
+                    .by_model_tokens
+                    .get(&model)
+                    .cloned()
+                    .unwrap_or_default()
+            });
             let custom_rates = custom.rates(provider_id, &model);
             // Exact-match overlay is authoritative when present. Missing fields
             // remain unknown rather than falling back to built-in/model.dev rates.
             let cost_usd = if let Some(rates) = custom_rates {
-                rates.cost(&counts)
+                counts.as_ref().and_then(|counts| rates.cost(counts))
             } else if summary.unknown_models.contains(&model) {
                 None
             } else {
@@ -783,10 +662,12 @@ fn model_rows(
             SpendModelRow {
                 model,
                 cost_usd,
-                input_tokens: counts.input_tokens,
-                output_tokens: counts.output_tokens,
-                cache_read_tokens: counts.cached_tokens,
-                total_tokens: counts.total_for_provider(provider_id),
+                input_tokens: counts.as_ref().map(|counts| counts.input_tokens),
+                output_tokens: counts.as_ref().map(|counts| counts.output_tokens),
+                cache_read_tokens: counts.as_ref().map(|counts| counts.cached_tokens),
+                total_tokens: counts
+                    .as_ref()
+                    .map(|counts| counts.total_for_provider(provider_id)),
                 custom_pricing: custom_rates.is_some(),
             }
         })
@@ -801,6 +682,16 @@ fn model_rows(
         (None, None) => left.model.cmp(&right.model),
     });
     rows
+}
+
+/// True when a model's token counts are unknown: one of its rows lacked usable
+/// token counts (`CostSummary::unknown_token_rows_by_model`). A summary that
+/// reports unknown rows without per-model attribution marks every model unknown.
+fn model_tokens_unknown(summary: &CostSummary, model: &str) -> bool {
+    match summary.unknown_token_rows_by_model.get(model) {
+        Some(rows) => *rows > 0,
+        None => summary.unknown_token_rows > 0 && summary.unknown_token_rows_by_model.is_empty(),
+    }
 }
 
 fn coverage_for_models(models: &[SpendModelRow]) -> CostCoverageCounts {
@@ -841,204 +732,6 @@ fn daily_points(provider_id: &str, days: u32) -> Vec<SpendDailyPoint> {
             cost_usd: costs.get(&day).copied().flatten().filter(|_| !incomplete),
             day,
             total_tokens: (!incomplete).then_some(total_tokens),
-        })
-        .collect()
-}
-
-fn activity_from_sessions(sessions: &[SessionUsage]) -> Vec<SpendActivityCell> {
-    let mut cells: BTreeMap<(u8, u8), u32> = BTreeMap::new();
-    for session in sessions {
-        let Some(timestamp) = session.latest_activity.or(session.started_at) else {
-            continue;
-        };
-        let local = timestamp.with_timezone(&Local);
-        // Weekday (0-6) and hour (0-23) both fit u8.
-        #[allow(
-            clippy::cast_possible_truncation,
-            reason = "weekday (0-6) and hour (0-23) fit u8"
-        )]
-        let key = (
-            local.weekday().num_days_from_monday() as u8,
-            local.hour() as u8,
-        );
-        let next = cells.get(&key).copied().unwrap_or(0).saturating_add(1);
-        cells.insert(key, next);
-    }
-    cells
-        .into_iter()
-        .map(|((weekday, hour), conversations)| SpendActivityCell {
-            weekday,
-            hour,
-            conversations,
-        })
-        .collect()
-}
-fn sum_optional_cost(left: Option<f64>, right: Option<f64>) -> Option<f64> {
-    let valid = |value: f64| value.is_finite() && value >= 0.0;
-    match (left, right) {
-        (Some(left), Some(right)) if valid(left) && valid(right) => {
-            let total = left + right;
-            valid(total).then_some(total)
-        }
-        (Some(value), None) | (None, Some(value)) if valid(value) => Some(value),
-        (None, None) => None,
-        _ => None,
-    }
-}
-
-fn merge_coverage(
-    left: CostCoverageCounts,
-    right: &CostCoverageCounts,
-) -> (CostCoverageCounts, bool) {
-    let priced = left.priced.checked_add(right.priced);
-    let unpriced = left.unpriced.checked_add(right.unpriced);
-    let unmetered = left.unmetered.checked_add(right.unmetered);
-    let estimated = left.estimated.checked_add(right.estimated);
-    let exact =
-        priced.is_some() && unpriced.is_some() && unmetered.is_some() && estimated.is_some();
-    let merged = CostCoverageCounts {
-        priced: priced.unwrap_or(u32::MAX),
-        unpriced: unpriced.unwrap_or(u32::MAX),
-        unmetered: unmetered.unwrap_or(u32::MAX),
-        estimated: estimated.unwrap_or(u32::MAX),
-    };
-    let exact = exact && merged.checked_total().is_some();
-    (merged, exact)
-}
-
-fn merge_token_mix(mut left: SpendTokenMix, right: &SpendTokenMix) -> SpendTokenMix {
-    left.overflowed_classes |= right.overflowed_classes;
-    left.input_tokens = merge_token_class(
-        left.input_tokens,
-        right.input_tokens,
-        &mut left.overflowed_classes,
-        1 << 0,
-    );
-    left.output_tokens = merge_token_class(
-        left.output_tokens,
-        right.output_tokens,
-        &mut left.overflowed_classes,
-        1 << 1,
-    );
-    left.cache_read_tokens = merge_token_class(
-        left.cache_read_tokens,
-        right.cache_read_tokens,
-        &mut left.overflowed_classes,
-        1 << 2,
-    );
-    left.cache_creation_tokens = merge_token_class(
-        left.cache_creation_tokens,
-        right.cache_creation_tokens,
-        &mut left.overflowed_classes,
-        1 << 3,
-    );
-    left.reasoning_tokens = merge_token_class(
-        left.reasoning_tokens,
-        right.reasoning_tokens,
-        &mut left.overflowed_classes,
-        1 << 4,
-    );
-    left
-}
-
-fn merge_token_class(
-    left: Option<u64>,
-    right: Option<u64>,
-    overflowed_classes: &mut u8,
-    bit: u8,
-) -> Option<u64> {
-    if *overflowed_classes & bit != 0 {
-        return None;
-    }
-    match (left, right) {
-        (Some(left), Some(right)) => match left.checked_add(right) {
-            Some(total) => Some(total),
-            None => {
-                *overflowed_classes |= bit;
-                None
-            }
-        },
-        (Some(left), None) => Some(left),
-        (None, Some(right)) => Some(right),
-        (None, None) => None,
-    }
-}
-
-fn add_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {
-    match (left, right) {
-        (Some(left), Some(right)) => left.checked_add(right),
-        (Some(left), None) => Some(left),
-        (None, Some(right)) => Some(right),
-        (None, None) => None,
-    }
-}
-
-fn merge_models(mut left: Vec<SpendModelRow>, right: &[SpendModelRow]) -> Vec<SpendModelRow> {
-    for incoming in right {
-        if let Some(existing) = left.iter_mut().find(|row| row.model == incoming.model) {
-            existing.cost_usd = sum_optional_cost(existing.cost_usd, incoming.cost_usd);
-            existing.input_tokens = existing.input_tokens.saturating_add(incoming.input_tokens);
-            existing.output_tokens = existing
-                .output_tokens
-                .saturating_add(incoming.output_tokens);
-            existing.cache_read_tokens = existing
-                .cache_read_tokens
-                .saturating_add(incoming.cache_read_tokens);
-            existing.total_tokens = existing.total_tokens.saturating_add(incoming.total_tokens);
-            existing.custom_pricing |= incoming.custom_pricing;
-        } else {
-            left.push(incoming.clone());
-        }
-    }
-    left.sort_by(|a, b| {
-        b.cost_usd
-            .partial_cmp(&a.cost_usd)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.model.cmp(&b.model))
-    });
-    left
-}
-
-fn merge_daily(left: Vec<SpendDailyPoint>, right: &[SpendDailyPoint]) -> Vec<SpendDailyPoint> {
-    let mut days: BTreeMap<String, SpendDailyPoint> = left
-        .into_iter()
-        .map(|point| (point.day.clone(), point))
-        .collect();
-    for incoming in right {
-        let entry = days
-            .entry(incoming.day.clone())
-            .or_insert_with(|| SpendDailyPoint {
-                day: incoming.day.clone(),
-                cost_usd: None,
-                total_tokens: None,
-            });
-        entry.cost_usd = sum_optional_cost(entry.cost_usd, incoming.cost_usd);
-        entry.total_tokens = add_optional(entry.total_tokens, incoming.total_tokens);
-    }
-    days.into_values().collect()
-}
-
-fn merge_activity(
-    left: Vec<SpendActivityCell>,
-    right: &[SpendActivityCell],
-) -> Vec<SpendActivityCell> {
-    let mut cells: BTreeMap<(u8, u8), u32> = left
-        .into_iter()
-        .map(|cell| ((cell.weekday, cell.hour), cell.conversations))
-        .collect();
-    for cell in right {
-        let current = cells.get(&(cell.weekday, cell.hour)).copied().unwrap_or(0);
-        cells.insert(
-            (cell.weekday, cell.hour),
-            current.saturating_add(cell.conversations),
-        );
-    }
-    cells
-        .into_iter()
-        .map(|((weekday, hour), conversations)| SpendActivityCell {
-            weekday,
-            hour,
-            conversations,
         })
         .collect()
 }

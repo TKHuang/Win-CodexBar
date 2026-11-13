@@ -1,3 +1,4 @@
+import type { SettingsSnapshot } from "./types/bridge";
 import { render, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -59,7 +60,8 @@ vi.mock("./hooks/useSurfaceSnapshot", () => ({
 
 import App from "./App";
 import { buildBundle } from "./test/localeHarness";
-import type { BootstrapState, SettingsSnapshot } from "./types/bridge";
+import type { BootstrapState } from "./types/bridge";
+import { makeSettings } from "./test/fixtures";
 
 function settings(overrides: Partial<SettingsSnapshot> = {}): SettingsSnapshot {
   return {
@@ -86,6 +88,7 @@ function settings(overrides: Partial<SettingsSnapshot> = {}): SettingsSnapshot {
     highUsageThreshold: 70,
     criticalUsageThreshold: 90,
     predictivePaceWarningEnabled: false,
+    predictivePaceWarningLeadHours: 0,
     credentialExpiryNotificationsEnabled: false,
     trayIconMode: "single",
     switcherShowsIcons: true,
@@ -93,6 +96,7 @@ function settings(overrides: Partial<SettingsSnapshot> = {}): SettingsSnapshot {
     menuBarShowsPercent: false,
     menuBarIconStyle: "bars",
     mergedOverviewSelectedProviders: [],
+    mergedOverviewAllAccounts: false,
     quotaWarningMarkersVisible: true,
     workdayTickStyle: "subtle",
     menuBarColorPace: false,
@@ -121,8 +125,12 @@ function settings(overrides: Partial<SettingsSnapshot> = {}): SettingsSnapshot {
     theme: "dark",
     windowScalePercent: 125,
     trayScalePercent: 100,
+    trayPanelStyle: "modern",
+    trayPanelWidth: 310,
     trayPanelAlwaysOnTop: false,
+    trayPanelMovable: false,
     powertoysStatusPipeEnabled: false,
+    shareUsageWithCli: false,
     claudeAvoidKeychainPrompts: false,
     codexSparkUsageVisible: true,
     disableKeychainAccess: false,
@@ -137,6 +145,7 @@ function settings(overrides: Partial<SettingsSnapshot> = {}): SettingsSnapshot {
     floatBarDarkText: false,
     floatBarShowResetInline: false,
     floatBarShowCost: false,
+    floatBarShowWeekly: false,
     claudeDailyRoutinesUsageVisible: true,
     claudeAllowReadingClaudeCodeCredentials: false,
     alibabaTokenPlanRegion: "cn",
@@ -151,7 +160,7 @@ function bootstrap(): BootstrapState {
   return {
     contractVersion: "v1",
     providers: [],
-    settings: settings(),
+    settings: makeSettings(),
   };
 }
 
@@ -161,7 +170,7 @@ describe("App window-label routing", () => {
     webviewWindowMocks.label = "main";
     surfaceMocks.snapshot = { mode: "hidden", target: { kind: "summary" } };
     tauriMocks.getBootstrapState.mockResolvedValue(bootstrap());
-    tauriMocks.getSettingsSnapshot.mockResolvedValue(settings());
+    tauriMocks.getSettingsSnapshot.mockResolvedValue(makeSettings());
     tauriMocks.checkForUpdates.mockResolvedValue({
       status: "idle",
       version: null,

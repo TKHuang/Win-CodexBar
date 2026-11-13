@@ -17,7 +17,7 @@ const events = vi.hoisted(() => ({
 }));
 vi.mock("../../../../../lib/tauri", () => mocks);
 vi.mock("@tauri-apps/api/event", () => events);
-vi.mock("../../../../../hooks/useLocale", () => ({ useLocale: () => ({ t: (key: string) => key }) }));
+vi.mock("../../../../../hooks/useLocale", () => import("../../../../../test/mocks/locale"));
 import { GrokAccountsSection } from "./GrokAccountsSection";
 
 const t = (key: string) => key;
@@ -104,8 +104,8 @@ describe("GrokAccountsSection", () => {
     expect(container.innerHTML).not.toContain("example.com");
   });
 
-  it("numbers hidden accounts by sorted id, not list order", async () => {
-    // The unsaved live login is listed first, but "user-a" sorts first.
+  it("numbers hidden accounts in list order, not by sorted id", async () => {
+    // The unsaved live login is listed first, though "user-a" sorts first.
     const live: GrokAccount = { ...current, id: "user-z", email: "z@example.com" };
     const saved: GrokAccount = { ...other, id: "user-a", email: "a@example.com" };
     mocks.grokAccountsList.mockResolvedValue([live, saved]);
@@ -114,6 +114,6 @@ describe("GrokAccountsSection", () => {
     const labels = [...container.querySelectorAll(".credential-card__info strong")].map(
       (label) => label.textContent,
     );
-    expect(labels).toEqual(["Account 2", "Account 1"]);
+    expect(labels).toEqual(["Account 1", "Account 2"]);
   });
 });

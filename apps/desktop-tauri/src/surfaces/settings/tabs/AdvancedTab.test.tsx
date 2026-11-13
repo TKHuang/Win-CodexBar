@@ -3,98 +3,31 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const tauriMocks = vi.hoisted(() => ({
   getSafeDiagnostics: vi.fn(),
+  getHttpServerState: vi.fn(() => new Promise(() => {})),
+  applyHttpServerConfig: vi.fn(),
   registerGlobalShortcut: vi.fn().mockResolvedValue(undefined),
   unregisterGlobalShortcut: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("../../../lib/tauri", () => tauriMocks);
-vi.mock("../../../hooks/useLocale", () => ({
-  useLocale: () => ({ t: (key: string) => key }),
-}));
+vi.mock("../../../hooks/useLocale", () => import("../../../test/mocks/locale"));
 
 import AdvancedTab from "./AdvancedTab";
 import type { SettingsSnapshot } from "../../../types/bridge";
+import { makeSettings } from "../../../test/fixtures";
 
-const settings: SettingsSnapshot = {
+const settings: SettingsSnapshot = makeSettings({
   enabledProviders: [],
-  refreshIntervalSecs: 300,
-  adaptiveRefresh: false,
-  refreshAllProvidersOnMenuOpen: false,
-  statusChecksEnabled: true,
-  lowPowerMode: false,
-  startAtLogin: false,
-  startMinimized: false,
-  showNotifications: true,
-  soundEnabled: true,
-  notificationSoundTheme: "windows",
-  highUsageThreshold: 70,
-  criticalUsageThreshold: 90,
-  predictivePaceWarningEnabled: false,
-  credentialExpiryNotificationsEnabled: false,
-  trayIconMode: "single",
-  switcherShowsIcons: true,
   menuBarShowsHighestUsage: true,
   menuBarShowsPercent: true,
   menuBarIconStyle: "percent",
-  mergedOverviewSelectedProviders: [],
-  quotaWarningMarkersVisible: true,
-  workdayTickStyle: "subtle",
-  menuBarColorPace: false,
-  menuBarColorByProvider: false,
-  menuBarPaceReservePositive: false,
-  providersSortedAlphabetically: false,
   showAsUsed: false,
   showAllTokenAccountsInMenu: true,
-  enableAnimations: true,
-  resetTimeRelative: true,
-  showResetWhenExhausted: false,
   menuBarDisplayMode: "compact",
-  overviewLayout: "detailed",
-  notificationSoundPaths: {
-    predictiveWarning: null,
-    highUsage: null,
-    criticalUsage: null,
-    exhausted: null,
-    statusIssue: null,
-    sessionDepleted: null,
-    sessionRestored: null,
-  },
-  hidePersonalInfo: false,
-  autoDownloadUpdates: false,
-  installUpdatesOnQuit: false,
   globalShortcut: "",
-  switcherShortcuts: {},
-  codexCustomSessionsDirs: [],
-  antigravityAdditionalProfileHomes: [],
-  updateChannel: "stable",
-  uiLanguage: "english",
-  uiLanguageFollowsSystem: false,
-  theme: "dark",
-  windowScalePercent: 125,
-  trayScalePercent: 100,
-  trayPanelAlwaysOnTop: false,
-  powertoysStatusPipeEnabled: false,
   claudeAvoidKeychainPrompts: true,
-  codexSparkUsageVisible: true,
-  disableKeychainAccess: false,
-  providerMetrics: {},
-  floatBarEnabled: false,
   floatBarOpacity: 0.9,
-  floatBarScale: 100,
-  floatBarOrientation: "horizontal",
-  floatBarStyle: "floating",
-  floatBarClickThrough: false,
-  floatBarProviderIds: [],
-  floatBarDarkText: false,
-  floatBarShowResetInline: false,
-  floatBarShowCost: false,
-  claudeDailyRoutinesUsageVisible: true,
-  claudeAllowReadingClaudeCodeCredentials: false,
-  alibabaTokenPlanRegion: "cn",
-  weeklyProgressWorkDays: null,
-  costSummaryDisplayStyle: "compact",
-  providerAccentColors: {},
-};
+});
 
 describe("AdvancedTab", () => {
   beforeEach(() => {
@@ -124,6 +57,29 @@ describe("AdvancedTab", () => {
     });
   });
 
+
+  it("toggles sharing usage with the CLI", () => {
+    const set = vi.fn();
+    const { rerender } = render(
+      <AdvancedTab settings={settings} set={set} saving={false} />,
+    );
+
+    const toggle = screen.getByRole("checkbox", { name: "ShareUsageWithCliLabel" });
+    expect(toggle).not.toBeChecked();
+    fireEvent.click(toggle);
+    expect(set).toHaveBeenCalledWith({ shareUsageWithCli: true });
+
+    rerender(
+      <AdvancedTab
+        settings={{ ...settings, shareUsageWithCli: true }}
+        set={set}
+        saving={false}
+      />,
+    );
+    expect(
+      screen.getByRole("checkbox", { name: "ShareUsageWithCliLabel" }),
+    ).toBeChecked();
+  });
 
   it("keeps proxy text edits local until blur or Enter", () => {
     const set = vi.fn();

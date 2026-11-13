@@ -179,17 +179,33 @@ pub(crate) fn build_tray_menu_with(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn menu_contains(menu: &[TrayMenuEntry], id: &str) -> bool {
+    pub(crate) fn menu_contains(menu: &[TrayMenuEntry], id: &str) -> bool {
         menu.iter().any(|entry| {
             entry.id.as_deref() == Some(id)
                 || (!entry.children.is_empty() && menu_contains(&entry.children, id))
         })
     }
 
-    fn sample_provider_catalog() -> Vec<ProviderCatalogEntry> {
+    /// Every entry in the tree, parents before children.
+    pub(crate) fn flatten(menu: &[TrayMenuEntry]) -> Vec<&TrayMenuEntry> {
+        menu.iter()
+            .flat_map(|entry| std::iter::once(entry).chain(flatten(&entry.children)))
+            .collect()
+    }
+
+    /// Ids of the rows a user can click: not a separator, not disabled, and not a submenu.
+    pub(crate) fn actionable_ids(menu: &[TrayMenuEntry]) -> Vec<String> {
+        flatten(menu)
+            .into_iter()
+            .filter(|entry| !entry.is_separator && !entry.disabled && entry.children.is_empty())
+            .filter_map(|entry| entry.id.clone())
+            .collect()
+    }
+
+    pub(crate) fn sample_provider_catalog() -> Vec<ProviderCatalogEntry> {
         vec![
             ProviderCatalogEntry {
                 id: "codex".into(),
@@ -206,10 +222,18 @@ mod tests {
         ]
     }
 
-    fn both_enabled() -> HashSet<String> {
+    pub(crate) fn both_enabled() -> HashSet<String> {
         ["codex".to_string(), "claude".to_string()]
             .into_iter()
             .collect()
+    }
+
+    #[test]
+    fn tray_menu_includes_about_and_provider_entries() {
+        let menu = build_tray_menu(&sample_provider_catalog(), &[], &both_enabled());
+        assert!(menu_contains(&menu, "about"));
+        assert!(menu_contains(&menu, "toggle_provider:codex"));
+        assert!(menu_contains(&menu, "quit"));
     }
 
     #[test]

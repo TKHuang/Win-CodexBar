@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const tauriMocks = vi.hoisted(() => ({
@@ -105,6 +105,7 @@ function renderCard(
     usageThresholds?: UsageThresholdSettings | null;
     weeklyProgressWorkDays?: number | null;
     hideEmail?: boolean;
+    panelStyle?: "classic" | "modern";
   } = {},
 ) {
   return render(
@@ -121,6 +122,7 @@ function renderCard(
           costSummaryDisplayStyle: opts.costSummaryDisplayStyle,
           usageThresholds: opts.usageThresholds,
           weeklyProgressWorkDays: opts.weeklyProgressWorkDays,
+          panelStyle: opts.panelStyle,
         }}
         onLayoutChange={opts.onLayoutChange}
       />
@@ -1038,6 +1040,7 @@ describe("MenuCard", () => {
   it("renders local token and cost totals after chart data loads", async () => {
     const { container } = renderCard(provider(null));
 
+    fireEvent.click(await screen.findByRole("button", { name: "CostTitle" }));
     expect(await screen.findByText("30d cost")).toBeInTheDocument();
     expect(container.querySelector(".menu-card--with-details")).toBeInTheDocument();
     expect(container.querySelector(".menu-card--header-only")).not.toBeInTheDocument();
@@ -1072,6 +1075,7 @@ describe("MenuCard", () => {
     });
 
     const { container } = renderCard(snapshot);
+    fireEvent.click(await screen.findByRole("button", { name: "CostTitle" }));
     const bar = await waitFor(() => {
       const element = container.querySelector(".card-dash__bar");
       if (!element) throw new Error("local chart bar not rendered yet");
@@ -1104,6 +1108,7 @@ describe("MenuCard", () => {
 
     renderCard(provider(null));
 
+    fireEvent.click(await screen.findByRole("button", { name: "CostTitle" }));
     expect(await screen.findByText("MTD cost")).toBeInTheDocument();
     expect(screen.getByText("MTD tokens")).toBeInTheDocument();
     expect(screen.getByText("$7.50")).toBeInTheDocument();
@@ -1186,18 +1191,50 @@ describe("MenuCard", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("puts the percent after the title and the reset at the end of the same line", async () => {
+  it("puts the percent under the bar with the reset at the end of the same line", async () => {
     const snapshot = provider(null, 37);
     snapshot.primary.resetsAt = new Date(Date.now() + 90 * 60 * 1000).toISOString();
 
     const { container } = renderCard(snapshot);
 
     expect(await screen.findByText("63% left")).toHaveClass("menu-metric__percent");
+    const metric = container.querySelector(".menu-metric");
+    expect(Array.from(metric?.children ?? [], (node) => node.getAttribute("class"))).toEqual([
+      "menu-metric__title",
+      "menu-metric__progress",
+      "menu-metric__head",
+    ]);
+    const head = container.querySelector(".menu-metric__head");
+    expect(Array.from(head?.children ?? [], (node) => node.textContent)).toEqual([
+      "63% left",
+      "Resets in 1h 30m",
+    ]);
+  });
+
+  it("classic puts the percent after the title and keeps the bar under that line", async () => {
+    const snapshot = provider(null, 37);
+    snapshot.primary.resetsAt = new Date(Date.now() + 90 * 60 * 1000).toISOString();
+
+    const { container } = renderCard(snapshot, { panelStyle: "classic" });
+
+    expect(await screen.findByText("63% left")).toHaveClass("menu-metric__percent");
+    const metric = container.querySelector(".menu-metric");
+    expect(Array.from(metric?.children ?? [], (node) => node.getAttribute("class"))).toEqual([
+      "menu-metric__head",
+      "menu-metric__progress",
+    ]);
     const head = container.querySelector(".menu-metric__head");
     expect(Array.from(head?.children ?? [], (node) => node.textContent)).toEqual([
       "ProviderSessionLabel 63% left",
       "Resets in 1h 30m",
     ]);
+    expect(container.querySelector(".menu-metric__progress")).toHaveAttribute("height", "6");
+  });
+
+  it("modern draws the bar eight pixels thick", async () => {
+    const { container } = renderCard(provider(null, 37));
+    await screen.findByText("63% left");
+    expect(container.querySelector(".menu-metric__progress")).toHaveAttribute("height", "8");
   });
 
   it("shows a reserve as a green pace stripe and a pace line under the bar", async () => {
@@ -1441,7 +1478,7 @@ describe("MenuCard", () => {
           DetailCostBalance: "Balance",
           InventoryAvailableCount: "{} available",
           IntlLocale: "en-US",
-          PlanRenewsOn: "Renews: {}",
+          PlanRenewsOn: "Plan renews: {}",
           PlanExpiresOn: "Plan expires: {}",
         }),
       );
@@ -1449,7 +1486,7 @@ describe("MenuCard", () => {
 
     it("shows the plan date under the quota rows, before saved resets and Extra usage", async () => {
       const { container } = renderCard(claude());
-      const note = await screen.findByText("Renews: Dec 1, 2026");
+      const note = await screen.findByText("Plan renews: Dec 1, 2026");
       const content = container.querySelector(".menu-card__content");
       const order = [...(content?.children ?? [])].map((el) => el.className);
       expect(order.indexOf("menu-card__metrics")).toBeLessThan(order.indexOf(note.className));
@@ -1461,18 +1498,18 @@ describe("MenuCard", () => {
     it("hides each section independently", async () => {
       const { container, unmount } = renderCard(claude(["section:subscription"]));
       expect(await screen.findByText("2 available")).toBeInTheDocument();
-      expect(screen.queryByText(/Renews:/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/Plan renews:/)).not.toBeInTheDocument();
       expect(container.querySelector(".card-extra")).not.toBeNull();
       unmount();
 
       const resets = renderCard(claude(["section:claude-reset-credits"]));
-      expect(await screen.findByText("Renews: Dec 1, 2026")).toBeInTheDocument();
+      expect(await screen.findByText("Plan renews: Dec 1, 2026")).toBeInTheDocument();
       expect(screen.queryByText("2 available")).not.toBeInTheDocument();
       expect(resets.container.querySelector(".card-extra")).not.toBeNull();
       resets.unmount();
 
       const extra = renderCard(claude(["section:claude-extra-usage"]));
-      expect(await screen.findByText("Renews: Dec 1, 2026")).toBeInTheDocument();
+      expect(await screen.findByText("Plan renews: Dec 1, 2026")).toBeInTheDocument();
       expect(screen.getByText("2 available")).toBeInTheDocument();
       expect(extra.container.querySelector(".card-extra")).toBeNull();
     });
@@ -1481,14 +1518,14 @@ describe("MenuCard", () => {
       const snapshot = claude(["section:claude-extra-usage"]);
       snapshot.sourceLabel = "admin-api";
       const { container } = renderCard(snapshot);
-      await screen.findByText("Renews: Dec 1, 2026");
+      await screen.findByText("Plan renews: Dec 1, 2026");
       expect(container.querySelector(".card-extra")).not.toBeNull();
     });
 
     it("keeps the plan date off the compact Overview when quota bars are present", async () => {
       const { container } = renderCard(claude(), { compactOverview: true });
       await waitFor(() => expect(container.querySelector(".menu-metric__title")).not.toBeNull());
-      expect(screen.queryByText(/Renews:/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/Plan renews:/)).not.toBeInTheDocument();
     });
   });
 

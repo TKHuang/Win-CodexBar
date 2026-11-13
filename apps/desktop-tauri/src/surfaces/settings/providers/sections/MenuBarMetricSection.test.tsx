@@ -1,7 +1,9 @@
+import { makeRateWindow as rateWindow } from "../../../../test/fixtures";
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { ProviderDetail } from "../../../../types/bridge";
 import { MenuBarMetricSection } from "./MenuBarMetricSection";
+import { makeRateWindow } from "../../../../test/fixtures";
 
 function provider(extra = true): ProviderDetail {
   return {
@@ -23,7 +25,7 @@ function provider(extra = true): ProviderDetail {
     modelSpecific: null,
     tertiary: null,
     extraRateWindows: extra
-      ? [{ id: "additional_budget", title: "Additional Budget", window: rateWindow(42) }]
+      ? [{ id: "additional_budget", title: "Additional Budget", window: makeRateWindow(42) }]
       : [],
     cost: null,
     pace: null,
@@ -45,9 +47,9 @@ function mistral(observed = true): ProviderDetail {
     displayName: "Mistral",
     primaryMetricLabel: "Included API",
     monthlyPlanWindowId: "mistral-monthly-plan",
-    session: observed ? rateWindow(2) : null,
+    session: observed ? makeRateWindow(2) : null,
     extraRateWindows: observed
-      ? [{ id: "mistral-monthly-plan", title: "Monthly Plan", window: rateWindow(42) }]
+      ? [{ id: "mistral-monthly-plan", title: "Monthly Plan", window: makeRateWindow(42) }]
       : [],
     hasSnapshot: observed,
   };
@@ -55,19 +57,6 @@ function mistral(observed = true): ProviderDetail {
 
 function optionNames() {
   return screen.getAllByRole("option").map((option) => option.textContent);
-}
-
-function rateWindow(usedPercent: number) {
-  return {
-    usedPercent,
-    remainingPercent: 100 - usedPercent,
-    windowMinutes: null,
-    resetsAt: null,
-    resetDescription: null,
-    isExhausted: false,
-    reservePercent: null,
-    reserveDescription: null,
-  };
 }
 
 describe("MenuBarMetricSection", () => {
@@ -94,7 +83,7 @@ describe("MenuBarMetricSection", () => {
       providerMetrics: { opencodego: "tertiary" },
     });
 
-    const observed = { ...base, tertiary: rateWindow(37) };
+    const observed = { ...base, tertiary: makeRateWindow(37) };
     rerender(
       <MenuBarMetricSection
         provider={observed}
@@ -110,7 +99,7 @@ describe("MenuBarMetricSection", () => {
 
   it("keeps the generic tertiary label when no provider key is declared", () => {
     const base = provider(false);
-    base.tertiary = rateWindow(37);
+    base.tertiary = makeRateWindow(37);
 
     render(
       <MenuBarMetricSection
@@ -202,6 +191,119 @@ describe("MenuBarMetricSection", () => {
     expect(screen.getByRole("combobox")).toHaveValue("extraUsage");
   });
 
+  it("offers Tokens/min only for providers that report throughput", () => {
+    const onChange = vi.fn();
+    const openai: ProviderDetail = {
+      ...provider(false),
+      id: "openaiapi",
+      displayName: "OpenAI API",
+      tokensPerMinuteMetric: true,
+    };
+    const { rerender } = render(
+      <MenuBarMetricSection
+        provider={openai}
+        providerMetrics={{}}
+        disabled={false}
+        t={(key) => key}
+        onChange={onChange}
+      />,
+    );
+
+    expect(optionNames()).toEqual(["Automatic", "ProviderSessionLabel", "MetricTokensPerMinute"]);
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "tokensPerMinute" } });
+    expect(onChange).toHaveBeenCalledWith({
+      providerMetrics: { openaiapi: "tokensPerMinute" },
+    });
+
+    rerender(
+      <MenuBarMetricSection
+        provider={provider()}
+        providerMetrics={{}}
+        disabled={false}
+        t={(key) => key}
+        onChange={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("option", { name: "MetricTokensPerMinute" })).toBeNull();
+  });
+
+  it("offers a declared named allowance before the first refresh and saves it", () => {
+    const onChange = vi.fn();
+    const cursor: ProviderDetail = {
+      ...provider(false),
+      id: "cursor",
+      displayName: "Cursor",
+      hasSnapshot: false,
+      namedExtraMetrics: [{ id: "cursor-grok-bot", label: "Grok Bot" }],
+    };
+    render(
+      <MenuBarMetricSection
+        provider={cursor}
+        providerMetrics={{}}
+        disabled={false}
+        t={(key) => key}
+        onChange={onChange}
+      />,
+    );
+
+    expect(optionNames()).toEqual([
+      "Automatic",
+      "ProviderSessionLabel",
+      "ExtraUsage",
+      "Grok Bot",
+    ]);
+    fireEvent.change(screen.getByRole("combobox"), {
+      target: { value: "extra:cursor-grok-bot" },
+    });
+    expect(onChange).toHaveBeenCalledWith({
+      providerMetrics: { cursor: "extra:cursor-grok-bot" },
+    });
+  });
+
+  it("selects a saved named allowance and keeps a retired one readable", () => {
+    const cursor: ProviderDetail = {
+      ...provider(false),
+      id: "cursor",
+      displayName: "Cursor",
+      namedExtraMetrics: [{ id: "cursor-grok-bot", label: "Grok Bot" }],
+    };
+    const { rerender } = render(
+      <MenuBarMetricSection
+        provider={cursor}
+        providerMetrics={{ cursor: "extra:cursor-grok-bot" }}
+        disabled={false}
+        t={(key) => key}
+        onChange={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("combobox")).toHaveValue("extra:cursor-grok-bot");
+
+    rerender(
+      <MenuBarMetricSection
+        provider={cursor}
+        providerMetrics={{ cursor: "extra:cursor-retired" }}
+        disabled={false}
+        t={(key) => key}
+        onChange={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("combobox")).toHaveValue("extra:cursor-retired");
+    expect(screen.getByRole("option", { name: "cursor-retired" })).toBeInTheDocument();
+  });
+
+  it("never offers another provider's named allowance", () => {
+    render(
+      <MenuBarMetricSection
+        provider={provider()}
+        providerMetrics={{}}
+        disabled={false}
+        t={(key) => key}
+        onChange={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("option", { name: "Grok Bot" })).toBeNull();
+  });
+
   it("hides the picker for Aixy, which offers only Automatic", () => {
     const aixy = provider();
     aixy.id = "aixy";
@@ -223,7 +325,7 @@ it("offers the provider-declared lane labels in the metric picker", () => {
     const base = provider(false);
     base.id = "litellm";
     base.displayName = "LiteLLM";
-    base.weekly = rateWindow(30);
+    base.weekly = makeRateWindow(30);
     base.primaryLabel = "Fuel Pack";
     base.secondaryLabel = "Gemini Pro";
 
@@ -245,7 +347,7 @@ it("offers the provider-declared lane labels in the metric picker", () => {
 
 it("keeps the generic metric labels when the provider declares none", () => {
     const base = provider(false);
-    base.weekly = rateWindow(30);
+    base.weekly = makeRateWindow(30);
 
     render(
       <MenuBarMetricSection

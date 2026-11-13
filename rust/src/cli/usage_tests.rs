@@ -3,10 +3,10 @@
 use super::*;
 use crate::core::{
     CostSnapshot, FetchContext, NamedRateWindow, ProviderAccountData, ProviderDisplayDetail,
-    ProviderId, ProviderInventoryItem, RateWindow, SourceMode, TokenAccount, TokenAccountKind,
-    TokenAccountSupport, UsageSnapshot,
+    ProviderFetchResult, ProviderId, ProviderInventoryItem, RateWindow, SourceMode, TokenAccount,
+    TokenAccountKind, TokenAccountSupport, UsageSnapshot,
 };
-use crate::providers::claude::claude_swap::ClaudeSwapAccount;
+use crate::providers::claude::claude_swap::{ClaudeSwapAccount, ClaudeSwapAccountSource};
 use crate::status::{ProviderStatus as StatusInfo, StatusIndicator};
 use chrono::Utc;
 use fetch_helpers::find_token_account;
@@ -22,6 +22,7 @@ fn sample_swap_account() -> ClaudeSwapAccount {
     };
     ClaudeSwapAccount {
         id: "claude-swap:2".to_string(),
+        source: ClaudeSwapAccountSource::ClaudeSwap,
         slot: 2,
         label: "work@example.com".to_string(),
         email: Some("work@example.com".to_string()),
@@ -46,7 +47,9 @@ fn sample_swap_account() -> ClaudeSwapAccount {
         action: Some(crate::providers::claude::claude_swap::ClaudeSwapAccountAction::Switch),
         is_disabled: false,
         spend: None,
+        usage_fetched_at: None,
         historical_usage: None,
+        session_equivalent_forecast: None,
     }
 }
 
@@ -134,7 +137,12 @@ fn claude_swap_brief_renderer_keeps_one_line_per_provider() {
         updated_at: None,
     };
 
-    let text = super::claude_swap::render_claude_swap_brief(&[first, second], Some(&status), false);
+    let text = super::claude_swap::render_claude_swap_brief(
+        ClaudeSwapAccountSource::ClaudeSwap,
+        &[first, second],
+        Some(&status),
+        false,
+    );
     assert!(!text.contains('\n'));
     assert!(text.contains("work@example.com (active)"));
     assert!(text.contains("personal@example.com"));
@@ -180,9 +188,42 @@ fn claude_swap_detailed_text_shows_history_but_brief_does_not() {
     assert!(detailed.contains("Last known usage (captured 2026-09-12T00:45:00+00:00)"));
     assert!(detailed.contains("Session 44%"));
 
-    let brief = super::claude_swap::render_claude_swap_brief(&[account], None, false);
+    let brief = super::claude_swap::render_claude_swap_brief(
+        ClaudeSwapAccountSource::ClaudeSwap,
+        &[account],
+        None,
+        false,
+    );
     assert!(!brief.contains("Last known usage"));
     assert!(!brief.contains("44%"));
+}
+
+/// tcr rows name their own tool in JSON, text and brief output instead of
+/// the claude-swap label.
+#[test]
+fn tcr_rows_are_labelled_with_their_source() {
+    let mut account = sample_swap_account();
+    account.id = "tcr:2".to_string();
+    account.source = ClaudeSwapAccountSource::Tcr;
+    account.action = None;
+    account.is_disabled = true;
+
+    let payload = super::claude_swap::claude_swap_json_payload(&account, None);
+    assert_eq!(payload["source"], "tcr");
+    assert_eq!(payload["account"]["id"], "tcr:2");
+
+    let text = super::claude_swap::render_claude_swap_text(&account, None, false);
+    assert!(text.starts_with("Claude (tcr)  work@example.com"), "{text}");
+    assert!(text.contains("Disabled by tcr."), "{text}");
+    assert!(!text.contains("claude-swap"), "{text}");
+
+    let brief = super::claude_swap::render_claude_swap_brief(
+        ClaudeSwapAccountSource::Tcr,
+        &[account],
+        None,
+        false,
+    );
+    assert!(brief.starts_with("Claude (tcr): "), "{brief}");
 }
 
 #[test]
@@ -250,6 +291,21 @@ fn explicit_provider_never_reads_enabled_providers() {
         ProviderSelection::from_arg(None).unwrap(),
         ProviderSelection::Single(ProviderId::Claude)
     );
+}
+
+#[test]
+fn provider_flag_accepts_every_catalog_id_from_config_providers() {
+    // `config providers --format json` reports each provider by its CLI name,
+    // and `--provider` must select that same provider (upstream #4643).
+    for id in ProviderId::all() {
+        assert_eq!(
+            ProviderSelection::from_arg(Some(id.cli_name())).unwrap(),
+            ProviderSelection::Single(*id),
+            "--provider {} should select {}",
+            id.cli_name(),
+            id.display_name()
+        );
+    }
 }
 
 #[test]
@@ -776,6 +832,24 @@ fn cli_lane_pace_scores_copilot_against_the_february_cycle() {
 }
 
 #[test]
+fn cli_lane_pace_scores_a_reported_codex_30_day_window_without_calendar_inference() {
+    use chrono::TimeZone;
+    // A March reset makes accidental February calendar-month inference
+    // observable: 20 of 30 days left is a third expected, 20 of 28 would not be.
+    let reset = Utc.with_ymd_and_hms(2026, 3, 1, 16, 8, 45).unwrap();
+    let now = reset - chrono::Duration::days(20);
+    let window = RateWindow::with_details(11.0, Some(43_200), Some(reset), None);
+
+    let pace = render::lane_pace_at(ProviderId::Codex, &window, now, None, || {
+        panic!("a reported 30-day Codex window must use the reset-window rule")
+    })
+    .expect("codex reset-window pace");
+    assert!((pace.expected_used_percent - 100.0 / 3.0).abs() < 1e-9);
+    assert!((pace.delta_percent - (11.0 - 100.0 / 3.0)).abs() < 1e-9);
+    assert!(pace.will_last_to_reset);
+}
+
+#[test]
 fn cli_lane_pace_keeps_reset_window_pace_for_a_resolved_31_day_cycle() {
     use chrono::TimeZone;
     // StepFun already expands the 30-day sentinel to the real cycle: 31
@@ -889,4 +963,158 @@ fn json_pace_follows_weekly_work_days() {
     // Each render reads the clock again, so compare within a small tolerance.
     assert!((expected(Some(7)) - linear).abs() < 0.01);
     assert!(expected(Some(5)) > linear);
+}
+
+mod app_cache_fallback {
+    use super::super::fetch_helpers::{
+        AppCacheFallback, app_cache_fallback, render_app_cache_json, render_app_cache_text,
+    };
+    use super::*;
+    use crate::cli_usage_cache::{self, CliUsageCache, Entry};
+    use crate::core::ProviderError;
+    use chrono::{Duration, TimeZone};
+
+    fn cached_usage() -> UsageSnapshot {
+        let mut usage = UsageSnapshot::new(RateWindow::with_details(42.0, Some(300), None, None));
+        usage.updated_at = Utc.with_ymd_and_hms(2026, 10, 20, 11, 58, 30).unwrap();
+        usage
+    }
+
+    fn fallback(age_seconds: i64) -> AppCacheFallback {
+        AppCacheFallback {
+            result: ProviderFetchResult::new(cached_usage(), cli_usage_cache::SOURCE_LABEL),
+            age_seconds,
+            status: None,
+        }
+    }
+
+    fn plain_command() -> UsageCommand {
+        let mut command = UsageCommand::from_args_with(
+            UsageArgs {
+                provider: Some("codex".to_string()),
+                source: "auto".to_string(),
+                ..UsageArgs::default()
+            },
+            Vec::new,
+        )
+        .unwrap();
+        command.use_color = false;
+        command
+    }
+
+    #[test]
+    fn json_row_is_marked_as_app_cache_with_its_age() {
+        let row = render_app_cache_json(ProviderId::Codex, &plain_command(), fallback(90));
+        assert_eq!(
+            row,
+            serde_json::json!({
+                "provider": "codex",
+                "source": "codexbar-app",
+                "ageSeconds": 90,
+                "usage": {
+                    "primary": {
+                        "used_percent": 42.0,
+                        "window_minutes": 300,
+                        "is_informational": false,
+                    },
+                    "updated_at": "2026-10-20T11:58:30Z",
+                },
+                "cost": null,
+            })
+        );
+    }
+
+    #[test]
+    fn text_output_says_it_came_from_the_app_cache() {
+        let command = plain_command();
+        let text = render_app_cache_text(ProviderId::Codex, &command, &fallback(150));
+        assert!(text.contains("(codexbar-app)"), "{text}");
+        assert!(
+            text.ends_with("Cached by the CodexBar app 2m ago (credentials could not be decrypted in this session)."),
+            "{text}"
+        );
+        let mut brief = plain_command();
+        brief.brief = true;
+        let line = render_app_cache_text(ProviderId::Codex, &brief, &fallback(5));
+        assert!(line.contains("Cached by the CodexBar app 5s ago"), "{line}");
+        assert!(!line.contains('\n'), "{line}");
+    }
+
+    #[test]
+    fn gate_is_closed_by_default_and_for_explicit_selections() {
+        let command = plain_command();
+        assert!(!command.app_cache_gate().opted_in);
+        assert!(command.app_cache_gate().default_account_fetch);
+        for args in [
+            UsageArgs {
+                source: "web".to_string(),
+                ..UsageArgs::default()
+            },
+            UsageArgs {
+                provider: Some("codex".to_string()),
+                account: Some("1".to_string()),
+                ..UsageArgs::default()
+            },
+            UsageArgs {
+                all_accounts: true,
+                ..UsageArgs::default()
+            },
+        ] {
+            let command = UsageCommand::from_args_with(args, Vec::new).unwrap();
+            assert!(!command.app_cache_gate().default_account_fetch);
+        }
+    }
+
+    #[tokio::test]
+    async fn fallback_serves_the_cache_only_when_sharing_is_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(cli_usage_cache::CACHE_FILE_NAME);
+        let mut usage = cached_usage();
+        usage.updated_at = Utc::now() - Duration::seconds(30);
+        CliUsageCache::new(vec![Entry::new(ProviderId::Codex, &usage).unwrap()])
+            .write(&path)
+            .unwrap();
+        // The process-wide witness only ever turns on, so setting it here
+        // cannot open a gate that another test expects closed.
+        cli_usage_cache::note_dpapi_decrypt_failure();
+        let auth: anyhow::Error = ProviderError::AuthRequired.into();
+
+        let mut command = plain_command();
+        command.app_cache_path = Some(path.clone());
+        assert!(
+            app_cache_fallback(ProviderId::Codex, &command, &auth)
+                .await
+                .is_none(),
+            "sharing off must not fall back"
+        );
+
+        command.app_cache_opted_in = true;
+        let served = app_cache_fallback(ProviderId::Codex, &command, &auth)
+            .await
+            .expect("sharing on falls back");
+        assert_eq!(served.result.source_label, "codexbar-app");
+        assert!(
+            !served.result.pace_authoritative,
+            "stale cached rows must not feed pace advice"
+        );
+        assert!((30..=40).contains(&served.age_seconds));
+
+        let timeout: anyhow::Error = ProviderError::Timeout.into();
+        assert!(
+            app_cache_fallback(ProviderId::Codex, &command, &timeout)
+                .await
+                .is_none()
+        );
+        let not_a_provider_error = anyhow::anyhow!("No active token account for Codex");
+        assert!(
+            app_cache_fallback(ProviderId::Codex, &command, &not_a_provider_error)
+                .await
+                .is_none()
+        );
+        assert!(
+            app_cache_fallback(ProviderId::Claude, &command, &auth)
+                .await
+                .is_none()
+        );
+    }
 }

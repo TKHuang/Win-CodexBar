@@ -110,7 +110,8 @@ pub struct OpenAiApiUsageHistory {
     pub history_days: u32,
     /// Project the Admin queries were scoped to, when one is configured.
     pub project_id: Option<String>,
-    /// One bucket per UTC day that has data, ascending by `start_time`.
+    /// One bucket per UTC day in the window, ascending by `start_time`. A day with no
+    /// usage is a zero bucket once the fetch that produced the history has data.
     pub daily: Vec<OpenAiApiDailyUsage>,
 }
 
@@ -560,6 +561,12 @@ pub struct CostSnapshot {
     /// second bar. Presentation only; not serialized.
     #[serde(skip)]
     pub folded_into_primary: bool,
+
+    /// Provider-owned presentation hint (upstream `.payAsYouGoSpend`): the
+    /// card shows the period spend and the prepaid balance as plain lines,
+    /// with no bar even when a limit is set. Presentation only; not serialized.
+    #[serde(skip)]
+    pub pay_as_you_go: bool,
 }
 
 impl CostSnapshot {
@@ -582,7 +589,14 @@ impl CostSnapshot {
             provenance: None,
             card_title_key: None,
             folded_into_primary: false,
+            pay_as_you_go: false,
         }
+    }
+
+    /// Builder pattern: present this cost as pay-as-you-go spend plus balance.
+    pub fn pay_as_you_go(mut self) -> Self {
+        self.pay_as_you_go = true;
+        self
     }
 
     /// Builder pattern: the provider's own title for the card's cost block.
@@ -829,6 +843,12 @@ pub struct ProviderFetchResult {
     #[serde(default = "default_pace_authoritative")]
     pub pace_authoritative: bool,
 
+    /// Whether the quota percentages are a local estimate rather than
+    /// provider-reported meters (upstream `dataConfidence == .estimated`).
+    /// Surfaces mark estimated percentages with `~`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub quota_estimated: bool,
+
     /// Stable provider-account identity used by safety-sensitive local session
     /// actions. It never crosses the frontend bridge.
     #[serde(skip)]
@@ -859,6 +879,7 @@ impl ProviderFetchResult {
             source_label: source_label.into(),
             has_successful_claude_cli_quota: false,
             pace_authoritative: true,
+            quota_estimated: false,
             account_identity: None,
             last_good_owner: None,
         }
@@ -888,6 +909,12 @@ impl ProviderFetchResult {
     /// Mark this result as unsuitable for derived pace/run-out advice.
     pub fn with_non_authoritative_pace(mut self) -> Self {
         self.pace_authoritative = false;
+        self
+    }
+
+    /// Mark the quota percentages as a local estimate.
+    pub fn with_estimated_quota(mut self) -> Self {
+        self.quota_estimated = true;
         self
     }
 
@@ -941,6 +968,25 @@ mod tests {
                 .with_non_authoritative_pace()
                 .pace_authoritative
         );
+    }
+
+    #[test]
+    fn fetch_result_estimate_flag_defaults_off_and_round_trips() {
+        let usage = UsageSnapshot::new(RateWindow::new(25.0));
+        let exact = ProviderFetchResult::new(usage.clone(), "api");
+        assert!(!exact.quota_estimated);
+        assert!(
+            serde_json::to_value(&exact)
+                .unwrap()
+                .get("quota_estimated")
+                .is_none()
+        );
+
+        let estimated = ProviderFetchResult::new(usage, "local estimate").with_estimated_quota();
+        let encoded = serde_json::to_value(&estimated).unwrap();
+        assert_eq!(encoded["quota_estimated"], true);
+        let decoded: ProviderFetchResult = serde_json::from_value(encoded).unwrap();
+        assert!(decoded.quota_estimated);
     }
 
     #[test]

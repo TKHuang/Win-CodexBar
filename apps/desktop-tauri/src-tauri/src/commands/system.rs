@@ -204,6 +204,48 @@ fn abgr_to_hex(value: u32) -> String {
     format!("#{r:02x}{g:02x}{b:02x}")
 }
 
+/// The Windows app-theme setting (`"light"` or `"dark"`) for the Settings
+/// window under the `auto` theme.
+///
+/// Every native window is pinned to Dark (see `shell/settings_window.rs`), so
+/// `prefers-color-scheme` inside the webview always reports dark. This reads
+/// the OS setting directly instead. In proof mode, `CODEXBAR_PROOF_SYSTEM_THEME`
+/// replaces the OS read so the `auto` theme can be proven in both directions.
+#[tauri::command]
+pub fn get_system_theme() -> String {
+    if let Some(theme) = crate::proof_harness::system_theme_override() {
+        return theme.to_string();
+    }
+    theme_from_apps_use_light(apps_use_light_theme_value()).to_string()
+}
+
+/// Maps `HKCU\...\Themes\Personalize\AppsUseLightTheme` to a theme name.
+/// Only a non-zero value means light. A zero, a missing value or a read error
+/// resolves to dark, the theme these windows used before the OS was read.
+fn theme_from_apps_use_light(value: Option<u32>) -> &'static str {
+    match value {
+        Some(0) | None => "dark",
+        Some(_) => "light",
+    }
+}
+
+#[cfg(windows)]
+fn apps_use_light_theme_value() -> Option<u32> {
+    use winreg::RegKey;
+    use winreg::enums::HKEY_CURRENT_USER;
+
+    RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+        .ok()?
+        .get_value::<u32, _>("AppsUseLightTheme")
+        .ok()
+}
+
+#[cfg(not(windows))]
+fn apps_use_light_theme_value() -> Option<u32> {
+    None
+}
+
 #[tauri::command]
 pub fn play_notification_sound(
     event: codexbar::sound::NotificationSoundEvent,
@@ -238,10 +280,10 @@ pub fn quit_app(app: tauri::AppHandle) {
     app.exit(0);
 }
 
-fn dashboard_url_for_provider(provider_id: &str) -> Option<String> {
+fn dashboard_url_for_provider(provider_id: &str, login_method: Option<&str>) -> Option<String> {
     let id = ProviderId::from_cli_name(provider_id)?;
     let settings = Settings::load();
-    provider_dashboard_url(id, &settings)
+    provider_dashboard_url(id, &settings, login_method)
 }
 
 fn status_page_url_for_provider(provider_id: &str) -> Option<String> {
@@ -267,7 +309,16 @@ pub fn open_provider_dashboard(
         codexbar::providers::helmcode::dashboard_url_for_organization(organization.as_deref())
             .to_string()
     } else {
-        dashboard_url_for_provider(&provider_id)
+        // The cached plan label picks the account-specific dashboard (for
+        // example Claude subscriptions); it is `None` before the first refresh.
+        let login_method = state.lock().ok().and_then(|guard| {
+            guard
+                .provider_cache
+                .iter()
+                .find(|snapshot| snapshot.provider_id == provider_id)
+                .and_then(|snapshot| snapshot.plan_name.clone())
+        });
+        dashboard_url_for_provider(&provider_id, login_method.as_deref())
             .ok_or_else(|| format!("No dashboard URL registered for provider '{provider_id}'"))?
     };
     open_url_in_browser(&url)
@@ -299,7 +350,7 @@ pub async fn trigger_provider_login(
 
     // For other providers, surface the dashboard URL as the login flow
     // is not yet wired through the Tauri shell.
-    if let Some(url) = dashboard_url_for_provider(&provider_id) {
+    if let Some(url) = dashboard_url_for_provider(&provider_id, None) {
         return open_url_in_browser(&url);
     }
     Err(format!(
@@ -334,6 +385,7 @@ async fn run_cli_provider_login(
         )),
         LoginOutcome::LaunchFailed(e) => Err(format!("Failed to launch {display_name} login: {e}")),
         LoginOutcome::TimedOut => Err(format!("{display_name} login timed out")),
+        LoginOutcome::Cancelled => Err(format!("{display_name} login cancelled")),
         LoginOutcome::Failed { status } => Err(format!(
             "{display_name} login failed with exit code {status}"
         )),
@@ -342,57 +394,14 @@ async fn run_cli_provider_login(
 
 async fn run_copilot_device_login(app: &tauri::AppHandle) -> Result<(), String> {
     let flow = CopilotDeviceFlow::new();
-    let device = flow
-        .start_flow()
-        .await
-        .map_err(|e| format!("GitHub device login failed: {e}"))?;
+    let device = start_device_login(&flow).await.map_err(|e| e.to_string())?;
 
     open_url_in_browser(device.verification_url_to_open())?;
 
-    let token = flow
-        .wait_for_token(&device.device_code, device.interval, device.expires_in)
-        .await
-        .map_err(|e| format!("GitHub device login failed: {e}"))?;
-
     let api = CopilotApi::new();
-    let identity = api.fetch_identity_with_token(&token, None).await.ok();
-    let plan = api
-        .fetch_usage_with_token(&token, None, None)
-        .await
-        .ok()
-        .and_then(|usage| usage.login_method);
-
-    let login = identity.as_ref().map(|identity| identity.login.clone());
-    let label = match (login.as_deref(), plan.as_deref()) {
-        (Some(login), Some(plan)) => format!("{login} ({plan})"),
-        (Some(login), None) => login.to_string(),
-        (None, Some(plan)) => plan.to_string(),
-        (None, None) => "GitHub Copilot".to_string(),
-    };
-
     let store = TokenAccountStore::new();
-    let mut data = store
-        .load_provider(ProviderId::Copilot)
-        .map_err(|e| e.to_string())?;
-    let identity_id = identity.as_ref().and_then(|identity| identity.id);
-    let existing_index =
-        find_existing_copilot_account(&api, &data.accounts, identity_id, login.as_deref()).await;
-
-    if let Some(index) = existing_index {
-        data.accounts[index].token = token;
-        data.accounts[index].label = label;
-        data.accounts[index].external_identifier = identity_id.map(copilot_external_identifier);
-        data.set_active(index);
-    } else {
-        let mut account = TokenAccount::new(label, token);
-        account.external_identifier = identity_id.map(copilot_external_identifier);
-        account.mark_used();
-        data.add_account(account);
-        data.set_active(data.accounts.len().saturating_sub(1));
-    }
-
-    store
-        .save_provider(ProviderId::Copilot, &data)
+    finish_device_login(&flow, &api, &store, &device)
+        .await
         .map_err(|e| e.to_string())?;
 
     let _ = app.emit(
@@ -400,59 +409,6 @@ async fn run_copilot_device_login(app: &tauri::AppHandle) -> Result<(), String> 
         serde_json::json!({ "providerId": "copilot" }),
     );
     Ok(())
-}
-
-async fn find_existing_copilot_account(
-    api: &CopilotApi,
-    accounts: &[TokenAccount],
-    identity_id: Option<u64>,
-    login: Option<&str>,
-) -> Option<usize> {
-    if let Some(identity_id) = identity_id
-        && let Some(index) = find_copilot_account_by_identity(accounts, identity_id)
-    {
-        return Some(index);
-    }
-
-    let mut label_fallback = None;
-    for (index, account) in accounts
-        .iter()
-        .enumerate()
-        .filter(|(_, account)| account.external_identifier.is_none())
-    {
-        if let Some(identity_id) = identity_id {
-            match api.fetch_identity_with_token(&account.token, None).await {
-                Ok(resolved_identity) if resolved_identity.id == Some(identity_id) => {
-                    return Some(index);
-                }
-                Ok(resolved_identity) if resolved_identity.id.is_some() => continue,
-                _ => {}
-            }
-        }
-
-        if label_fallback.is_none() && copilot_label_matches_login(account, login) {
-            label_fallback = Some(index);
-        }
-    }
-
-    label_fallback
-}
-
-fn find_copilot_account_by_identity(accounts: &[TokenAccount], identity_id: u64) -> Option<usize> {
-    let external_identifier = copilot_external_identifier(identity_id);
-    accounts.iter().position(|account| {
-        account.external_identifier.as_deref() == Some(external_identifier.as_str())
-    })
-}
-
-fn copilot_external_identifier(identity_id: u64) -> String {
-    format!("github:user:{identity_id}")
-}
-
-fn copilot_label_matches_login(account: &TokenAccount, login: Option<&str>) -> bool {
-    login.is_some_and(|login| {
-        account.label == login || account.label.starts_with(&format!("{login} ("))
-    })
 }
 
 #[cfg(test)]
@@ -468,27 +424,27 @@ mod tests {
     #[test]
     fn dashboard_url_resolves_from_codex_provider_metadata() {
         assert_eq!(
-            dashboard_url_for_provider("codex").as_deref(),
-            Some("https://chatgpt.com/codex/cloud/settings/analytics#usage")
+            dashboard_url_for_provider("codex", None).as_deref(),
+            Some("https://chatgpt.com/settings/usage?tab=overview")
         );
     }
 
     #[test]
     fn dashboard_url_resolves_openrouter_activity() {
         assert_eq!(
-            dashboard_url_for_provider("openrouter").as_deref(),
+            dashboard_url_for_provider("openrouter", None).as_deref(),
             Some("https://openrouter.ai/activity")
         );
     }
 
     #[test]
-    fn copilot_stored_identity_precedes_legacy_label_match() {
-        let legacy = TokenAccount::new("octocat (Pro)", "old-token");
-        let mut identified = TokenAccount::new("Renamed account", "known-token");
-        identified.external_identifier = Some(copilot_external_identifier(123));
+    fn apps_use_light_theme_nonzero_reads_as_light() {
+        assert_eq!(theme_from_apps_use_light(Some(1)), "light");
+    }
 
-        let accounts = vec![legacy.clone(), identified];
-        assert_eq!(find_copilot_account_by_identity(&accounts, 123), Some(1));
-        assert!(copilot_label_matches_login(&legacy, Some("octocat")));
+    #[test]
+    fn apps_use_light_theme_zero_or_unreadable_reads_as_dark() {
+        assert_eq!(theme_from_apps_use_light(Some(0)), "dark");
+        assert_eq!(theme_from_apps_use_light(None), "dark");
     }
 }

@@ -1,7 +1,87 @@
 //! Remote (SSH / Tailscale) agent-session retrieval and wire decoding.
 
 use super::*;
+use crate::settings::Settings;
 use futures::future::join_all;
+use std::ffi::OsString;
+
+/// Decides whether remote (SSH / Tailscale) discovery may run.
+///
+/// Checked immediately before every remote spawn (see [`spawn_remote`]) and
+/// again before remote results are merged, so a toggle made while a discovery
+/// is in flight stops the next spawn and drops results already gathered.
+#[derive(Clone)]
+pub(crate) struct RemoteDiscoveryGate {
+    allowed: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+impl RemoteDiscoveryGate {
+    /// Re-reads `settings.json` on every check. See `Settings::agent_sessions_remote_allowed_now`.
+    pub(crate) fn from_settings() -> Self {
+        Self::new(Settings::agent_sessions_remote_allowed_now)
+    }
+
+    /// For remote discovery the user asked for directly, such as `codexbar sessions
+    /// --ssh-host`. Desktop "Agent sessions" and "Local sessions only" do not apply.
+    pub(crate) fn explicit_request() -> Self {
+        Self::new(|| true)
+    }
+
+    pub(crate) fn new(allowed: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        Self {
+            allowed: Arc::new(allowed),
+        }
+    }
+
+    pub(crate) fn allows(&self) -> bool {
+        (self.allowed)()
+    }
+}
+
+/// Runs one remote discovery process. Production uses the hidden [`CommandRunner`];
+/// tests inject a recorder so they can assert which processes would have started.
+pub(crate) trait RemoteProcessSpawner: Send + Sync {
+    fn spawn(&self, binary: &str, options: &CommandOptions) -> Result<CommandResult, CommandError>;
+}
+
+/// Spawns through [`CommandRunner::run`], whose `spawn_child` sets `CREATE_NO_WINDOW` on Windows.
+pub(crate) struct HiddenProcessSpawner;
+
+impl RemoteProcessSpawner for HiddenProcessSpawner {
+    fn spawn(&self, binary: &str, options: &CommandOptions) -> Result<CommandResult, CommandError> {
+        CommandRunner::new().run(binary, None, options)
+    }
+}
+
+/// Everything one discovery pass needs to reach the network: the gate, the spawner,
+/// and the `PATH` used to find the standalone Tailscale CLI.
+#[derive(Clone)]
+pub(crate) struct RemoteContext {
+    pub(crate) gate: RemoteDiscoveryGate,
+    pub(crate) spawner: Arc<dyn RemoteProcessSpawner>,
+    pub(crate) path_var: Option<OsString>,
+}
+
+/// Spawns one remote discovery process only while the gate allows it.
+///
+/// The gate is read on the blocking thread right before the spawner runs, so a
+/// closed gate never starts a process. Returns `None` when nothing was spawned.
+pub(crate) async fn spawn_remote(
+    ctx: &RemoteContext,
+    binary: String,
+    options: CommandOptions,
+) -> Option<Result<CommandResult, CommandError>> {
+    let gate = ctx.gate.clone();
+    let spawner = Arc::clone(&ctx.spawner);
+    match tokio::task::spawn_blocking(move || {
+        gate.allows().then(|| spawner.spawn(&binary, &options))
+    })
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => Some(Err(CommandError::LaunchFailed(error.to_string()))),
+    }
+}
 
 impl RemoteSessionFetcher {
     const BUNDLED_CLI_FALLBACK: &'static str =
@@ -11,7 +91,16 @@ impl RemoteSessionFetcher {
         Self { per_host_timeout }
     }
 
-    pub async fn fetch(&self, hosts: &[String]) -> Vec<AgentSessionHostResult> {
+    /// Fetch every host over SSH. Returns nothing once the gate is closed, and drops
+    /// results gathered while it was closing.
+    pub(crate) async fn fetch(
+        &self,
+        hosts: &[String],
+        ctx: &RemoteContext,
+    ) -> Vec<AgentSessionHostResult> {
+        if !ctx.gate.allows() {
+            return Vec::new();
+        }
         let valid = Self::sanitized_hosts(hosts);
         let valid_keys = valid
             .iter()
@@ -31,10 +120,14 @@ impl RemoteSessionFetcher {
             })
             .collect::<Vec<_>>();
         let timeout = self.per_host_timeout;
-        let mut results = Self::fetch_hosts_with(&valid, |host| async move {
-            Self::fetch_host(host, timeout).await
+        let mut results = Self::fetch_hosts_with(&valid, |host| {
+            let ctx = ctx.clone();
+            async move { Self::fetch_host(host, timeout, &ctx).await }
         })
         .await;
+        if !ctx.gate.allows() {
+            return Vec::new();
+        }
         results.append(&mut invalid);
         results.sort_by(|lhs, rhs| {
             lhs.host
@@ -44,14 +137,25 @@ impl RemoteSessionFetcher {
         results
     }
 
-    pub(crate) async fn tailscale_hosts() -> Result<Vec<String>, String> {
+    /// Tailscale peers from the standalone CLI. `Ok(empty)` when the gate is closed
+    /// (nothing spawned) or no standalone CLI exists.
+    pub(crate) async fn tailscale_hosts(ctx: &RemoteContext) -> Result<Vec<String>, String> {
+        let Some(cli) = tailscale_cli_path(ctx.path_var.as_deref()) else {
+            tracing::debug!(
+                "No standalone Tailscale CLI found on PATH; skipping Tailscale discovery."
+            );
+            return Ok(Vec::new());
+        };
         let options = CommandOptions {
             timeout: Duration::from_secs(5),
             initial_delay: Duration::ZERO,
             extra_args: vec!["status".to_string(), "--json".to_string()],
             ..CommandOptions::default()
         };
-        match CommandRunner::new().run_async("tailscale", None, &options).await {
+        let Some(outcome) = spawn_remote(ctx, cli, options).await else {
+            return Ok(Vec::new());
+        };
+        match outcome {
             Err(CommandError::BinaryNotFound(_)) => Ok(Vec::new()),
             Err(_) => Err(
                 "Unable to query Tailscale peers; manual SSH hosts are still available.".to_string(),
@@ -68,13 +172,18 @@ impl RemoteSessionFetcher {
         }
     }
 
-    async fn fetch_host(host: String, timeout: Duration) -> AgentSessionHostResult {
+    /// One host's SSH result. `None` when the gate closed before the spawn.
+    async fn fetch_host(
+        host: String,
+        timeout: Duration,
+        ctx: &RemoteContext,
+    ) -> Option<AgentSessionHostResult> {
         let options = match Self::ssh_options(&host, timeout) {
             Ok(options) => options,
-            Err(error) => return AgentSessionHostResult::failed("<invalid SSH host>", error),
+            Err(error) => return Some(AgentSessionHostResult::failed("<invalid SSH host>", error)),
         };
-        let result = CommandRunner::new().run_async("ssh", None, &options).await;
-        match result {
+        let result = spawn_remote(ctx, "ssh".to_string(), options).await?;
+        Some(match result {
             Ok(result) if result.timed_out => AgentSessionHostResult::failed(
                 host,
                 "SSH session discovery timed out; verify the host is reachable and key authentication is configured.",
@@ -84,7 +193,7 @@ impl RemoteSessionFetcher {
                     AgentSessionHostResult::failed(
                         host,
                         actionable_message(
-                            "Remote session response was not valid JSON; update CodexBar on the remote host",
+                            "Remote session response could not be decoded; update CodexBar on the remote host",
                             error,
                         ),
                     )
@@ -107,7 +216,7 @@ impl RemoteSessionFetcher {
                     error,
                 ),
             ),
-        }
+        })
     }
 
     pub(crate) fn ssh_options(host: &str, timeout: Duration) -> Result<CommandOptions, String> {
@@ -128,7 +237,9 @@ impl RemoteSessionFetcher {
                 host,
                 "sh".to_string(),
                 "-lc".to_string(),
-                remote_command,
+                // ssh joins the remote argv with spaces and the remote login shell
+                // re-parses it, so the whole `||` chain must reach `sh -lc` as one word.
+                shell_quote(&remote_command),
             ],
             ..CommandOptions::default()
         })
@@ -290,15 +401,18 @@ impl RemoteSessionFetcher {
         )
     }
 
+    /// Runs `fetch` for every host concurrently. `None` marks a host skipped because
+    /// the gate closed; it contributes no row.
     pub(crate) async fn fetch_hosts_with<F, Fut>(
         hosts: &[String],
         fetch: F,
     ) -> Vec<AgentSessionHostResult>
     where
         F: Fn(String) -> Fut + Clone,
-        Fut: Future<Output = AgentSessionHostResult>,
+        Fut: Future<Output = Option<AgentSessionHostResult>>,
     {
-        let mut results = join_all(hosts.iter().cloned().map(|host| fetch.clone()(host))).await;
+        let outcomes = join_all(hosts.iter().cloned().map(|host| fetch.clone()(host))).await;
+        let mut results = outcomes.into_iter().flatten().collect::<Vec<_>>();
         results.sort_by(|lhs, rhs| {
             lhs.host
                 .to_ascii_lowercase()
@@ -307,17 +421,52 @@ impl RemoteSessionFetcher {
         results
     }
 
-    fn decode_remote_sessions(host: &str, body: &str) -> Result<AgentSessionHostResult, String> {
-        if let Ok(mut sessions) = serde_json::from_str::<Vec<AgentSession>>(body) {
-            for session in &mut sessions {
-                session.host = host.to_string();
+    /// Decode what a remote `sessions --json-v2` / `--json` printed.
+    ///
+    /// Accepts the upstream macOS flat array, the Windows CLI `{sessions, errors}`
+    /// envelope, a bare array of Windows rows, and the older `{host, sessions, error}`
+    /// host-result object. Every session is attributed to the SSH target `host`;
+    /// errors the remote CLI reported become this host's error.
+    pub(crate) fn decode_remote_sessions(
+        host: &str,
+        body: &str,
+    ) -> Result<AgentSessionHostResult, String> {
+        let value: Value = serde_json::from_str(body.trim())
+            .map_err(|err| format!("response is not JSON ({err})"))?;
+        let (rows, errors) = match value {
+            Value::Array(_) => (
+                serde_json::from_value::<Vec<RemoteSessionRow>>(value)
+                    .map_err(|err| format!("unsupported session row ({err})"))?,
+                Vec::new(),
+            ),
+            Value::Object(_) => {
+                let envelope = serde_json::from_value::<RemoteSessionEnvelope>(value)
+                    .map_err(|err| format!("unsupported session object ({err})"))?;
+                let mut errors = envelope.errors.unwrap_or_default();
+                errors.extend(envelope.error);
+                (envelope.sessions, errors)
             }
-            return Ok(AgentSessionHostResult::success(host, sessions));
-        }
-        let mut result = Self::decode_host_result(body)?;
-        result.host = host.to_string();
-        for session in &mut result.sessions {
-            session.host = host.to_string();
+            _ => {
+                return Err(
+                    "expected a JSON array of sessions or a {sessions, errors} object".to_string(),
+                );
+            }
+        };
+
+        let mut result = AgentSessionHostResult::success(
+            host,
+            rows.into_iter().map(|row| row.into_session(host)).collect(),
+        );
+        let errors = errors
+            .iter()
+            .map(|error| error.trim())
+            .filter(|error| !error.is_empty())
+            .collect::<Vec<_>>();
+        if !errors.is_empty() {
+            result.error = Some(crate::logging::safe_error_message(format!(
+                "Remote host reported: {}",
+                errors.join("; ")
+            )));
         }
         Ok(result)
     }
@@ -386,10 +535,6 @@ impl RemoteSessionFetcher {
         })?;
         Ok(result)
     }
-
-    pub fn failed_result(host: &str, err: impl std::fmt::Display) -> AgentSessionHostResult {
-        AgentSessionHostResult::failed(host.to_string(), err)
-    }
 }
 
 impl Default for RemoteSessionFetcher {
@@ -400,6 +545,142 @@ impl Default for RemoteSessionFetcher {
     }
 }
 
+/// One session row from a remote CLI. The Windows CLI nests `workspace`, `activity`
+/// and `focusTarget`; upstream macOS (`AgentSession` Codable) prints flat `cwd`,
+/// `projectName`, `startedAt` and `lastActivityAt` and has no focus target.
+/// The row's own `host` is ignored: the SSH target is authoritative.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteSessionRow {
+    id: String,
+    provider: AgentSessionProvider,
+    #[serde(default)]
+    dialect: Option<PiSessionDialect>,
+    #[serde(default)]
+    session_name: Option<String>,
+    source: AgentSessionSource,
+    state: AgentSessionState,
+    #[serde(default)]
+    pid: Option<i64>,
+    #[serde(default)]
+    transcript_path: Option<String>,
+    #[serde(default)]
+    workspace: Option<AgentSessionWorkspace>,
+    #[serde(default)]
+    activity: Option<AgentSessionActivity>,
+    #[serde(default)]
+    focus_target: Option<AgentSessionFocusTarget>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    project_name: Option<String>,
+    #[serde(default)]
+    started_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    last_activity_at: Option<DateTime<Utc>>,
+}
+
+impl RemoteSessionRow {
+    fn into_session(self, host: &str) -> AgentSession {
+        let pid = self
+            .pid
+            .and_then(|pid| u32::try_from(pid).ok())
+            .filter(|pid| *pid > 0);
+        let (nested_cwd, nested_project) = self
+            .workspace
+            .map(|workspace| (workspace.cwd, workspace.project_name))
+            .unwrap_or_default();
+        let cwd = nested_cwd.or(self.cwd);
+        let project_name = nested_project
+            .or(self.project_name)
+            .or_else(|| cwd.as_deref().and_then(project_name_from_cwd));
+        let (nested_started, nested_last) = self
+            .activity
+            .map(|activity| (activity.started_at, activity.last_activity_at))
+            .unwrap_or_default();
+        let focus_target =
+            self.focus_target
+                .unwrap_or_else(|| match (pid, self.transcript_path.as_ref()) {
+                    (Some(pid), _) => AgentSessionFocusTarget::Process { pid },
+                    (None, Some(transcript_path)) => AgentSessionFocusTarget::Transcript {
+                        transcript_path: transcript_path.clone(),
+                    },
+                    (None, None) => AgentSessionFocusTarget::None,
+                });
+        AgentSession {
+            id: self.id,
+            provider: self.provider,
+            dialect: self.dialect,
+            session_name: self.session_name,
+            source: self.source,
+            state: self.state,
+            pid,
+            transcript_path: self.transcript_path,
+            host: host.to_string(),
+            workspace: AgentSessionWorkspace { cwd, project_name },
+            activity: AgentSessionActivity {
+                started_at: nested_started.or(self.started_at),
+                last_activity_at: nested_last.or(self.last_activity_at),
+            },
+            focus_target,
+        }
+    }
+}
+
+/// Object-shaped remote output: the Windows CLI's `{sessions, errors}` and the older
+/// `{host, sessions, error}` host result.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteSessionEnvelope {
+    sessions: Vec<RemoteSessionRow>,
+    #[serde(default)]
+    errors: Option<Vec<String>>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+#[cfg(windows)]
+pub(crate) const TAILSCALE_CLI_FILE_NAME: &str = "tailscale.exe";
+#[cfg(not(windows))]
+pub(crate) const TAILSCALE_CLI_FILE_NAME: &str = "tailscale";
+
+/// First standalone Tailscale CLI on `path_var`, as a UTF-8 path.
+///
+/// Only the exact CLI file name qualifies. The Windows GUI client (`tailscale-ipn.exe`), `.cmd`/`.bat`
+/// launchers and symlinks are never spawned, because running the VPN app's binary in status mode can
+/// start its tunnel. Bare-name lookup through `which` is avoided for the same reason: it also honors
+/// PATHEXT, so a launcher script would be selected ahead of the CLI.
+pub(crate) fn tailscale_cli_path(path_var: Option<&std::ffi::OsStr>) -> Option<String> {
+    let path_var = path_var?;
+    std::env::split_paths(path_var)
+        .map(|dir| dir.join(TAILSCALE_CLI_FILE_NAME))
+        .find(|candidate| is_standalone_tailscale_cli(candidate))
+        .and_then(|path| path.to_str().map(str::to_owned))
+}
+
+/// A regular file (not a symlink or directory) with a native executable header: PE (`MZ`) on
+/// Windows, ELF elsewhere. Scripts and other launchers are rejected before any process starts.
+pub(crate) fn is_standalone_tailscale_cli(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.file_type().is_file() {
+        return false;
+    }
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 4];
+    if file.read_exact(&mut magic).is_err() {
+        return false;
+    }
+    magic[..2] == *b"MZ" || magic == *b"\x7fELF"
+}
+
 /// `--json-v2` (Pi-family aware) first, legacy `--json` for older installs —
 /// upstream 0.48.0 #2626 negotiation, including the bundled macOS CLI
 /// fallback path.
@@ -407,8 +688,8 @@ fn remote_sessions_command(bundled_cli_fallback: &str) -> String {
     [
         "codexbar sessions --json-v2",
         "codexbar sessions --json",
-        &format!("'{bundled_cli_fallback}' sessions --json-v2"),
-        &format!("'{bundled_cli_fallback}' sessions --json"),
+        &format!("{} sessions --json-v2", shell_quote(bundled_cli_fallback)),
+        &format!("{} sessions --json", shell_quote(bundled_cli_fallback)),
     ]
     .join(" || ")
 }
@@ -416,6 +697,149 @@ fn remote_sessions_command(bundled_cli_fallback: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Upstream `codexbar sessions --json-v2` output: `printJSON` of `[AgentSession]`
+    /// (CLISessionsCommand.swift runSessions, CLIErrorReporting.swift encodeJSON) with
+    /// `JSONEncoder` defaults, `.iso8601` dates, nil optionals omitted and `/` escaped.
+    const UPSTREAM_SESSIONS_V2: &str = r#"[{"id":"codex-rollout-1","provider":"codex","source":"ide","state":"active","pid":4242,"cwd":"\/Users\/proof\/src\/proof-app","projectName":"proof-app","sessionName":"Fix session labels","startedAt":"2026-08-03T11:30:00Z","lastActivityAt":"2026-08-03T12:00:00Z","transcriptPath":"\/Users\/proof\/.codex\/sessions\/rollout-1.jsonl","host":"proof-mac.local"},{"id":"claude-file-1","provider":"claude","source":"desktopApp","state":"idle","cwd":"\/Users\/proof\/src\/proof-web","lastActivityAt":"2026-08-03T10:00:00Z","transcriptPath":"\/Users\/proof\/.claude\/projects\/proof-web\/claude-file-1.jsonl","host":"proof-mac.local"},{"id":"pid:77","provider":"pi","dialect":"omp","source":"cli","state":"active","pid":77,"host":"proof-mac.local"}]"#;
+
+    #[test]
+    fn upstream_flat_array_decodes_with_ssh_target_as_host() {
+        let result =
+            RemoteSessionFetcher::decode_remote_sessions("me@proof-mac", UPSTREAM_SESSIONS_V2)
+                .expect("upstream payload decodes");
+
+        assert_eq!(result.host, "me@proof-mac");
+        assert_eq!(result.error, None);
+        assert_eq!(result.sessions.len(), 3);
+        assert!(result.sessions.iter().all(|s| s.host == "me@proof-mac"));
+
+        let codex = &result.sessions[0];
+        assert_eq!(codex.provider, AgentSessionProvider::Codex);
+        assert_eq!(codex.source, AgentSessionSource::Ide);
+        assert_eq!(codex.state, AgentSessionState::Active);
+        assert_eq!(codex.pid, Some(4242));
+        assert_eq!(codex.session_name.as_deref(), Some("Fix session labels"));
+        assert_eq!(
+            codex.workspace.cwd.as_deref(),
+            Some("/Users/proof/src/proof-app")
+        );
+        assert_eq!(codex.workspace.project_name.as_deref(), Some("proof-app"));
+        assert_eq!(
+            codex.activity.started_at,
+            DateTime::parse_from_rfc3339("2026-08-03T11:30:00Z")
+                .ok()
+                .map(|d| d.with_timezone(&Utc))
+        );
+        assert_eq!(
+            codex.activity.last_activity_at,
+            DateTime::parse_from_rfc3339("2026-08-03T12:00:00Z")
+                .ok()
+                .map(|d| d.with_timezone(&Utc))
+        );
+        assert_eq!(
+            codex.transcript_path.as_deref(),
+            Some("/Users/proof/.codex/sessions/rollout-1.jsonl")
+        );
+        assert_eq!(
+            codex.focus_target,
+            AgentSessionFocusTarget::Process { pid: 4242 }
+        );
+
+        let claude = &result.sessions[1];
+        assert_eq!(claude.source, AgentSessionSource::DesktopApp);
+        assert_eq!(claude.state, AgentSessionState::Idle);
+        assert_eq!(claude.pid, None);
+        assert_eq!(claude.activity.started_at, None);
+        // Upstream omitted projectName here; it is derived from cwd like local rows.
+        assert_eq!(claude.workspace.project_name.as_deref(), Some("proof-web"));
+        assert_eq!(
+            claude.focus_target,
+            AgentSessionFocusTarget::Transcript {
+                transcript_path: "/Users/proof/.claude/projects/proof-web/claude-file-1.jsonl"
+                    .to_string()
+            }
+        );
+
+        let omp = &result.sessions[2];
+        assert_eq!(omp.provider, AgentSessionProvider::Pi);
+        assert_eq!(omp.dialect, Some(PiSessionDialect::Omp));
+        assert_eq!(omp.workspace.cwd, None);
+        assert_eq!(
+            omp.focus_target,
+            AgentSessionFocusTarget::Process { pid: 77 }
+        );
+    }
+
+    #[test]
+    fn upstream_pretty_output_and_empty_list_decode() {
+        let value: Value = serde_json::from_str(UPSTREAM_SESSIONS_V2).unwrap();
+        let pretty = serde_json::to_string_pretty(&value).unwrap();
+        let result = RemoteSessionFetcher::decode_remote_sessions("proof-mac", &pretty).unwrap();
+        assert_eq!(result.sessions.len(), 3);
+
+        let empty = RemoteSessionFetcher::decode_remote_sessions("proof-mac", "[]\n").unwrap();
+        assert_eq!(
+            empty,
+            AgentSessionHostResult::success("proof-mac", Vec::new())
+        );
+    }
+
+    #[test]
+    fn host_result_object_still_decodes_and_its_error_is_kept() {
+        let body = r#"{"host":"other-name","sessions":[{"id":"s1","provider":"codex","source":"cli","state":"active","pid":9,"transcriptPath":null,"host":"other-name","workspace":{"cwd":"/w","projectName":"w"},"activity":{"startedAt":null,"lastActivityAt":null},"focusTarget":{"kind":"process","pid":9}}],"error":"partial scan"}"#;
+        let result = RemoteSessionFetcher::decode_remote_sessions("proof-host", body).unwrap();
+        assert_eq!(result.host, "proof-host");
+        assert_eq!(result.sessions[0].host, "proof-host");
+        assert_eq!(
+            result.sessions[0].workspace.project_name.as_deref(),
+            Some("w")
+        );
+        assert_eq!(
+            result.error.as_deref(),
+            Some("Remote host reported: partial scan")
+        );
+    }
+
+    #[test]
+    fn remote_envelope_errors_surface_as_the_host_error() {
+        let body = r#"{"sessions":[],"errors":["tailscale: Tailscale status failed", "  "]}"#;
+        let result = RemoteSessionFetcher::decode_remote_sessions("proof-host", body).unwrap();
+        assert!(result.sessions.is_empty());
+        assert_eq!(
+            result.error.as_deref(),
+            Some("Remote host reported: tailscale: Tailscale status failed")
+        );
+    }
+
+    #[test]
+    fn malformed_remote_payloads_fail_with_a_clear_reason() {
+        let cases = [
+            ("sh: codexbar: not json output", "response is not JSON"),
+            ("", "response is not JSON"),
+            ("\"usage\"", "expected a JSON array of sessions"),
+            (
+                r#"[{"id":"x","source":"cli","state":"active"}]"#,
+                "unsupported session row",
+            ),
+            (
+                r#"[{"id":"x","provider":"gemini","source":"cli","state":"active"}]"#,
+                "unsupported session row",
+            ),
+            (r#"{"errors":[]}"#, "unsupported session object"),
+        ];
+        for (body, expected) in cases {
+            let error =
+                RemoteSessionFetcher::decode_remote_sessions("proof-host", body).expect_err(body);
+            assert!(error.contains(expected), "{body:?} -> {error}");
+        }
+    }
+
+    #[test]
+    fn shell_quote_escapes_single_quotes() {
+        assert_eq!(shell_quote("a b"), "'a b'");
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+    }
 
     #[test]
     fn codex_cost_options_are_noninteractive_and_summary_only() {

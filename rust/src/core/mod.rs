@@ -11,6 +11,7 @@ mod cost_cli_extension;
 mod cost_pricing;
 pub mod curl_capture;
 mod display_detail;
+mod fetch_context_builder;
 mod hook_transition;
 mod hooks;
 
@@ -25,19 +26,20 @@ mod openai_dashboard;
 mod pace_capability;
 mod provider;
 mod provider_factory;
+#[cfg(test)]
+mod provider_registry_snapshot_tests;
 mod provider_state;
 mod quota_burndown;
 mod rate_window;
 mod redactor;
+mod refresh_interaction;
 mod session_equivalent_forecast;
-mod session_quota;
 mod sqlite;
 mod throughput;
 mod timezone;
 mod token_accounts;
 mod usage_pace;
 mod usage_snapshot;
-mod widget_snapshot;
 
 pub use adaptive_refresh::*;
 pub use aws_signing::*;
@@ -50,6 +52,9 @@ pub(crate) use cost_cli_extension::{
 pub use cost_pricing::*;
 pub use curl_capture::*;
 pub use display_detail::*;
+pub use fetch_context_builder::{
+    build_fetch_context, provider_cookie_domain, token_account_session_is_passive,
+};
 pub use hook_transition::*;
 pub use hooks::*;
 
@@ -72,12 +77,11 @@ pub use quota_burndown::{
 };
 pub use rate_window::*;
 pub use redactor::*;
+pub use refresh_interaction::*;
 pub use session_equivalent_forecast::*;
-pub use session_quota::*;
 pub use sqlite::*;
 pub use throughput::*;
 pub use timezone::{local_timezone_name, try_local_timezone_name};
 pub use token_accounts::*;
 pub use usage_pace::*;
 pub use usage_snapshot::*;
-pub use widget_snapshot::*;

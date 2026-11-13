@@ -80,16 +80,17 @@ export function CookieSection({ providerId, cookieDomain, onChanged }: Props) {
 
   useEffect(() => {
     if (cookieDomain === null) return;
-    listDetectedBrowsers()
+    listDetectedBrowsers(providerId)
       .then((list) => {
         setBrowsers(list);
         setBrowsersLoaded(true);
         if (list.length > 0) setBrowserType(list[0].browserType);
       })
       .catch(() => {
-        setBrowsersLoaded(true);
+        // A failed lookup says nothing about installed browsers, so the
+        // empty-state hint stays hidden.
       });
-  }, [cookieDomain]);
+  }, [cookieDomain, providerId]);
 
   if (cookieDomain === null) return null;
   if (!loaded) return null;
@@ -176,6 +177,10 @@ export function CookieSection({ providerId, cookieDomain, onChanged }: Props) {
         </ul>
       ) : (
         <p className="credential-empty">{t("BrowserCookieNoneSaved")}</p>
+      )}
+
+      {browsersLoaded && browsers.length === 0 && (
+        <p className="credential-empty">{t("NoBrowsersDetectedHint")}</p>
       )}
 
       {browsersLoaded && browsers.length > 0 && (

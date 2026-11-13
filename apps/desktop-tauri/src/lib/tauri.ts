@@ -2,6 +2,8 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   HooksConfigSave,
   HooksConfigSnapshot,
+  HttpServerConfig,
+  HttpServerSnapshot,
   ClaudeAccount,
   ClaudeReconciliationSnapshot,
   GrokAccount,
@@ -25,6 +27,8 @@ import type {
   ProviderSummary,
   ProviderUsageSnapshot,
   ProviderTokenAccountsBridge,
+  ProviderAccountUsageBridge,
+  ClaudeSwapOverviewAccountsBridge,
   TokenAccountSupportBridge,
   SettingsSnapshot,
   SettingsUpdate,
@@ -41,8 +45,9 @@ import type {
   SessionFocusResult,
   TrayVisibilityStatusDto,
   UsageSpendSummary,
-  SpendContract,
-  CodexLocalProjectUsageSnapshot,
+  CodexSessionDetailCheckpoint,
+  CodexSessionDetails,
+  CodexSessionToolActivity,
   CodexAccount,
   CodexAccountUsageSnapshot,
   CodexAccountsStateBridge,
@@ -115,6 +120,14 @@ export function getCurrencyRates(preferredCurrencyCode: string): Promise<Currenc
 
 export function getStayAwakeStatus(): Promise<boolean> {
   return invoke<boolean>("get_stay_awake_status");
+}
+
+export function getHttpServerState(): Promise<HttpServerSnapshot> {
+  return invoke<HttpServerSnapshot>("get_http_server_state");
+}
+
+export function applyHttpServerConfig(config: HttpServerConfig): Promise<HttpServerSnapshot> {
+  return invoke<HttpServerSnapshot>("apply_http_server_config", { config });
 }
 
 export function getHooksConfig(): Promise<HooksConfigSnapshot> {
@@ -271,6 +284,18 @@ export function removeOpenRouterManagementApiKey(): Promise<void> {
   return invoke<void>("remove_openrouter_management_api_key");
 }
 
+export function hasVercelAccessToken(): Promise<boolean> {
+  return invoke<boolean>("has_vercel_access_token");
+}
+
+export function setVercelAccessToken(accessToken: string): Promise<void> {
+  return invoke<void>("set_vercel_access_token", { accessToken });
+}
+
+export function removeVercelAccessToken(): Promise<void> {
+  return invoke<void>("remove_vercel_access_token");
+}
+
 export function getManualCookies(): Promise<CookieInfoBridge[]> {
   return invoke<CookieInfoBridge[]>("get_manual_cookies");
 }
@@ -291,8 +316,13 @@ export function removeManualCookie(
   return invoke<CookieInfoBridge[]>("remove_manual_cookie", { providerId });
 }
 
-export function listDetectedBrowsers(): Promise<DetectedBrowserBridge[]> {
-  return invoke<DetectedBrowserBridge[]>("list_detected_browsers");
+/** With `providerId`, also lists a desktop app store only that provider may use. */
+export function listDetectedBrowsers(
+  providerId?: string,
+): Promise<DetectedBrowserBridge[]> {
+  return invoke<DetectedBrowserBridge[]>("list_detected_browsers", {
+    providerId: providerId ?? null,
+  });
 }
 
 export function importBrowserCookies(
@@ -330,6 +360,34 @@ export function getUsageSpendSummary(options?: { period?: string; forceRefresh?:
   });
 }
 
+/** Native tool operations of one Codex conversation, read on demand. */
+export function getCodexSessionToolActivity(
+  sessionId: string,
+  historyDays?: number,
+): Promise<CodexSessionToolActivity> {
+  return invoke<CodexSessionToolActivity>("get_codex_session_tool_activity", {
+    sessionId,
+    historyDays: historyDays ?? null,
+  });
+}
+
+/**
+ * Request-level usage of one Codex conversation, read on demand. Rejects with a
+ * `CodexSessionDetailError` code; `sourceChanged` means the logs moved past
+ * the summary in `checkpoint`.
+ */
+export function getCodexSessionDetails(
+  sessionId: string,
+  checkpoint: CodexSessionDetailCheckpoint,
+  historyDays?: number,
+): Promise<CodexSessionDetails> {
+  return invoke<CodexSessionDetails>("get_codex_session_details", {
+    sessionId,
+    historyDays: historyDays ?? null,
+    checkpoint,
+  });
+}
+
 export function writeUsageSpendExport(path: string, payload: string): Promise<void> {
   return invoke<void>("write_usage_spend_export", { path, payload });
 }
@@ -344,27 +402,6 @@ export function importPreferences(path: string): Promise<SettingsSnapshot> {
   return invoke<SettingsSnapshot>("import_preferences", { path });
 }
 
-export function getSpendContract(
-  providerId: string,
-  options?: { period?: string; includeOpenCodex?: boolean },
-): Promise<SpendContract> {
-  return invoke<SpendContract>("get_spend_contract", {
-    providerId,
-    period: options?.period ?? null,
-    includeOpenCodex: options?.includeOpenCodex ?? null,
-  });
-}
-
-export function getCodexWorkspacesSnapshot(options?: {
-  forceRefresh?: boolean;
-  historyDays?: number;
-}): Promise<CodexLocalProjectUsageSnapshot> {
-  return invoke<CodexLocalProjectUsageSnapshot>("get_codex_workspaces_snapshot", {
-    forceRefresh: options?.forceRefresh ?? null,
-    historyDays: options?.historyDays ?? null,
-  });
-}
-
 // ── Token account bridge ─────────────────────────────────────────────
 
 export function getTokenAccountProviders(): Promise<TokenAccountSupportBridge[]> {
@@ -377,6 +414,16 @@ export function getTokenAccounts(
   return invoke<ProviderTokenAccountsBridge>("get_token_accounts", { providerId });
 }
 
+/** Last successful usage per saved token account. Reads the cache only; never fetches. */
+export function getProviderAccountUsage(providerId: string): Promise<ProviderAccountUsageBridge> {
+  return invoke<ProviderAccountUsageBridge>("get_provider_account_usage", { providerId });
+}
+
+/** claude-swap/tcr pool accounts and their last usage. Reads the cache only; never fetches. */
+export function getClaudeSwapOverviewAccounts(): Promise<ClaudeSwapOverviewAccountsBridge> {
+  return invoke<ClaudeSwapOverviewAccountsBridge>("get_claude_swap_overview_accounts");
+}
+
 export function addTokenAccount(
   providerId: string,
   label: string,
@@ -386,6 +433,37 @@ export function addTokenAccount(
     providerId,
     label,
     token,
+  });
+}
+
+/**
+ * Edit a saved account in place. A blank `label` keeps the saved label; a
+ * `null` or blank `token` keeps the saved credential, which is never returned.
+ */
+export function updateTokenAccount(
+  providerId: string,
+  accountId: string,
+  label: string,
+  token: string | null,
+): Promise<ProviderTokenAccountsBridge> {
+  return invoke<ProviderTokenAccountsBridge>("update_token_account", {
+    providerId,
+    accountId,
+    label,
+    token,
+  });
+}
+
+/** Move a saved account to `index` in the list; the active account does not change. */
+export function moveTokenAccount(
+  providerId: string,
+  accountId: string,
+  index: number,
+): Promise<ProviderTokenAccountsBridge> {
+  return invoke<ProviderTokenAccountsBridge>("move_token_account", {
+    providerId,
+    accountId,
+    index,
   });
 }
 
@@ -409,6 +487,17 @@ export function setActiveTokenAccount(
   });
 }
 
+export function setTokenAccountClaudeConfigDir(
+  providerId: string,
+  accountId: string,
+  directory: string | null,
+): Promise<ProviderTokenAccountsBridge> {
+  return invoke<ProviderTokenAccountsBridge>("set_token_account_claude_config_dir", {
+    providerId,
+    accountId,
+    directory,
+  });
+}
 // ── Phase 5 — i18n ────────────────────────────────────────────────────
 
 export function getLocaleStrings(
@@ -583,6 +672,11 @@ export function reanchorTrayPanel(): Promise<void> {
   return invoke<void>("reanchor_tray_panel");
 }
 
+/** Forget where the user dragged the tray panel and anchor it to the tray again. */
+export function resetFlyoutPosition(): Promise<void> {
+  return invoke<void>("reset_flyout_position");
+}
+
 export function revealTrayPanelWindow(): Promise<void> {
   return invoke<void>("reveal_tray_panel_window");
 }
@@ -591,15 +685,16 @@ export function getSystemAccentColor(): Promise<string | null> {
   return invoke<string | null>("get_system_accent_color");
 }
 
+/** The Windows app-theme setting; the native windows are pinned Dark, so the webview cannot read it. */
+export function getSystemTheme(): Promise<"light" | "dark"> {
+  return invoke<"light" | "dark">("get_system_theme");
+}
+
 export function quitApp(): Promise<void> {
   return invoke<void>("quit_app");
 }
 
 // ── Codex multi-account (ADR 0003) ───────────────────────────────────
-
-export function codexAccountsList(): Promise<CodexAccount[]> {
-  return invoke<CodexAccount[]>("codex_accounts_list");
-}
 
 export function codexAccountAdd(): Promise<CodexAccount> {
   return invoke<CodexAccount>("codex_account_add");
@@ -621,14 +716,6 @@ export function codexAccountFetch(
   id: string,
 ): Promise<CodexAccountUsageSnapshot> {
   return invoke<CodexAccountUsageSnapshot>("codex_account_fetch", { id });
-}
-
-export function codexAccountSnapshots(): Promise<
-  Record<string, CodexAccountUsageSnapshot>
-> {
-  return invoke<Record<string, CodexAccountUsageSnapshot>>(
-    "codex_account_snapshots",
-  );
 }
 
 export function codexAccountRestartDesktop(

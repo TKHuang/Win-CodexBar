@@ -43,7 +43,9 @@ pub struct AdaptiveRefreshDecision {
 const RECENT_INTERACTION_THRESHOLD: Duration = Duration::from_secs(5 * 60);
 const WARM_THRESHOLD: Duration = Duration::from_secs(60 * 60);
 const IDLE_THRESHOLD: Duration = Duration::from_secs(4 * 60 * 60);
-const CODING_ACTIVITY_THRESHOLD: Duration = Duration::from_secs(5 * 60);
+/// Coding activity older than this does not change the delay. Platform scanners use it as the
+/// activity window, so a rollout older than this is not worth recording.
+pub const CODING_ACTIVITY_THRESHOLD: Duration = Duration::from_secs(5 * 60);
 
 const RECENT_INTERACTION_DELAY: Duration = Duration::from_secs(2 * 60);
 const WARM_DELAY: Duration = Duration::from_secs(5 * 60);
@@ -51,9 +53,6 @@ const IDLE_DELAY: Duration = Duration::from_secs(15 * 60);
 const LONG_IDLE_DELAY: Duration = Duration::from_secs(30 * 60);
 const CONSTRAINED_DELAY: Duration = Duration::from_secs(30 * 60);
 const CODING_ACTIVITY_DELAY_CAP: Duration = Duration::from_secs(5 * 60);
-
-/// Representative cadence for consumers that need one interval but cannot access live state.
-pub const NOMINAL_INTERVAL_FOR_HEURISTICS: Duration = Duration::from_secs(5 * 60);
 
 /// Compute the next adaptive refresh delay from activity / power inputs.
 pub fn next_delay(input: AdaptiveRefreshInput) -> AdaptiveRefreshDecision {

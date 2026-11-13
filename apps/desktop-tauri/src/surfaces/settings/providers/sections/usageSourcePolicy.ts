@@ -42,6 +42,11 @@ const POLICIES: Readonly<Record<string, UsageSourcePolicy>> = {
         label: "Local API / agy CLI",
         description: "Uses the local Antigravity app or agy's signed-in account, which may differ from the selected Google account.",
       },
+      {
+        value: "oauth",
+        label: "Google OAuth",
+        description: "Reads quota from the Google API with the Antigravity OAuth credentials saved in ~/.codexbar/antigravity/oauth_creds.json.",
+      },
     ],
   },
   nous: {
@@ -88,6 +93,32 @@ const POLICIES: Readonly<Record<string, UsageSourcePolicy>> = {
         descriptionKey: "ProviderZedUsageSourceWebHelp",
       },
     ],
+  },
+  gemini: {
+    options: [
+      {
+        value: "auto",
+        label: "Auto",
+        labelKey: "ProviderSourceAutoShort",
+        description: "Uses the Gemini CLI login; the Gemini app browser session is used only when Gemini app is selected.",
+        descriptionKey: "ProviderGeminiUsageSourceAutoHelp",
+      },
+      {
+        value: "cli",
+        label: "Gemini CLI",
+        labelKey: "ProviderGeminiCli",
+        description: "Uses the Gemini CLI login only.",
+        descriptionKey: "ProviderGeminiUsageSourceCliHelp",
+      },
+      {
+        value: "web",
+        label: "Gemini app",
+        labelKey: "ProviderGeminiApp",
+        description: "Reads the Gemini app 5-hour and weekly limits from the selected gemini.google.com browser session or manual cookie header only, with no Gemini CLI fallback.",
+        descriptionKey: "ProviderGeminiUsageSourceWebHelp",
+      },
+    ],
+    hideCookieSourceValues: ["auto", "cli"],
   },
   gitkraken: {
     options: [
@@ -137,7 +168,7 @@ const POLICIES: Readonly<Record<string, UsageSourcePolicy>> = {
       {
         value: "auto",
         label: "Auto",
-        description: "Uses the configured Command Code API key, then falls back to browser cookies.",
+        description: "Uses the active saved session only when the cookie source is Manual; otherwise the configured Command Code API key or browser cookies.",
       },
       {
         value: "oauth",

@@ -4,6 +4,7 @@
 
 import { contrastRatio, mixWithWhite } from "../../lib/color";
 import abacus from "./icons/ProviderIcon-abacus.svg?raw";
+import abliteration from "./icons/ProviderIcon-abliteration.svg?raw";
 import aerostack from "./icons/ProviderIcon-aerostack.svg?raw";
 import alibaba from "./icons/ProviderIcon-alibaba.svg?raw";
 import amp from "./icons/ProviderIcon-amp.svg?raw";
@@ -11,7 +12,10 @@ import antigravity from "./icons/ProviderIcon-antigravity.svg?raw";
 import atlascloud from "./icons/ProviderIcon-atlascloud.svg?raw";
 import augment from "./icons/ProviderIcon-augment.svg?raw";
 import bedrock from "./icons/ProviderIcon-bedrock.svg?raw";
+import chatbox from "./icons/ProviderIcon-chatbox.svg?raw";
 import claude from "./icons/ProviderIcon-claude.svg?raw";
+import claudeplatform from "./icons/ProviderIcon-claudeplatform.svg?raw";
+import traecn from "./icons/ProviderIcon-traecn.svg?raw";
 import codebuff from "./icons/ProviderIcon-codebuff.svg?raw";
 import coderabbit from "./icons/ProviderIcon-coderabbit.svg?raw";
 import codex from "./icons/ProviderIcon-codex.svg?raw";
@@ -39,6 +43,7 @@ import exa from "./icons/ProviderIcon-exa.svg?raw";
 import factory from "./icons/ProviderIcon-factory.svg?raw";
 import fal from "./icons/ProviderIcon-fal.svg?raw";
 import flora from "./icons/ProviderIcon-flora.svg?raw";
+import futureagi from "./icons/ProviderIcon-futureagi.svg?raw";
 import gemini from "./icons/ProviderIcon-gemini.svg?raw";
 import grok from "./icons/ProviderIcon-grok.svg?raw";
 import groq from "./icons/ProviderIcon-groq.svg?raw";
@@ -58,6 +63,7 @@ import meta from "./icons/ProviderIcon-meta.svg?raw";
 import mimo from "./icons/ProviderIcon-mimo.svg?raw";
 import minimax from "./icons/ProviderIcon-minimax.svg?raw";
 import mistral from "./icons/ProviderIcon-mistral.svg?raw";
+import munito from "./icons/ProviderIcon-munito.svg?raw";
 import muse from "./icons/ProviderIcon-muse.svg?raw";
 import museai from "./icons/ProviderIcon-museai.svg?raw";
 import notion from "./icons/ProviderIcon-notion.svg?raw";
@@ -78,6 +84,7 @@ import replicate from "./icons/ProviderIcon-replicate.svg?raw";
 import sailresearch from "./icons/ProviderIcon-sailresearch.svg?raw";
 import sakana from "./icons/ProviderIcon-sakana.svg?raw";
 import sofya from "./icons/ProviderIcon-sofya.svg?raw";
+import soniox from "./icons/ProviderIcon-soniox.svg?raw";
 import stepfun from "./icons/ProviderIcon-stepfun.svg?raw";
 import sub2api from "./icons/ProviderIcon-sub2api.svg?raw";
 import synthetic from "./icons/ProviderIcon-synthetic.svg?raw";
@@ -118,6 +125,7 @@ export interface ProviderIcon {
 
 const RAW: Record<string, string> = {
   abacus: tint(abacus),
+  abliteration: tint(abliteration),
   aerostack: tint(aerostack),
   alibaba: tint(alibaba),
   amp: tint(amp),
@@ -126,6 +134,9 @@ const RAW: Record<string, string> = {
   augment: tint(augment),
   bedrock: tint(bedrock),
   claude: tint(claude),
+  claudeplatform: tint(claudeplatform),
+  traecn: tint(traecn),
+  chatbox: tint(chatbox),
   codebuff: tint(codebuff),
   coderabbit: tint(coderabbit),
   codex: tint(codex),
@@ -153,6 +164,7 @@ const RAW: Record<string, string> = {
   factory: tint(factory),
   fal: tint(fal),
   flora: tint(flora),
+  futureagi: tint(futureagi),
   gemini: tint(gemini),
   grok: tint(grok),
   groq: tint(groq),
@@ -177,6 +189,7 @@ const RAW: Record<string, string> = {
   xapi: tint(xapi),
   xkiro: tint(xkiro),
   mistral: tint(mistral),
+  munito: tint(munito),
   muse: tint(muse),
   museai: tint(museai),
   workbuddy: tint(workbuddy),
@@ -192,6 +205,7 @@ const RAW: Record<string, string> = {
   sailresearch: tint(sailresearch),
   sakana: tint(sakana),
   sofya: tint(sofya),
+  soniox: tint(soniox),
   stepfun: tint(stepfun),
   sub2api: tint(sub2api),
   synthetic: tint(synthetic),
@@ -220,7 +234,11 @@ export const PROVIDER_ICON_REGISTRY: Record<string, ProviderIcon> = {
   aerostack:   { id: "aerostack",   brandColor: "#6366F1", fallbackLetter: "◆", svgPath: RAW.aerostack },
   augment:     { id: "augment",     brandColor: "#1aa049", fallbackLetter: "A", svgPath: RAW.augment },
   claude:      { id: "claude",      brandColor: "#cc7c5e", fallbackLetter: "◈", svgPath: RAW.claude },
-  pi:          { id: "pi",          brandColor: "#7c3aed", fallbackLetter: "P" },
+  claudeplatform: { id: "claudeplatform", brandColor: "#cc7c5e", fallbackLetter: "◈", svgPath: RAW.claudeplatform },
+  traecn:       { id: "traecn",       brandColor: "#4D7CFE", fallbackLetter: "T", svgPath: RAW.traecn },
+  chatbox:     { id: "chatbox",     brandColor: "#228BE6", fallbackLetter: "C", svgPath: RAW.chatbox },
+  abliteration: { id: "abliteration", brandColor: "#1B1B1B", fallbackLetter: "A", svgPath: RAW.abliteration },
+  pi:          { id: "pi",          brandColor: "#4d9abf", fallbackLetter: "P" },
   codebuff:    { id: "codebuff",    brandColor: "#00ff95", fallbackLetter: "B", svgPath: RAW.codebuff },
   coderabbit:  { id: "coderabbit",  brandColor: "#ff5c35", fallbackLetter: "C", svgPath: RAW.coderabbit },
   codex:       { id: "codex",       brandColor: "#49a3b0", fallbackLetter: "◆", svgPath: RAW.codex },
@@ -242,6 +260,7 @@ export const PROVIDER_ICON_REGISTRY: Record<string, ProviderIcon> = {
   factory:     { id: "factory",     brandColor: "#ff6b35", fallbackLetter: "◎", svgPath: RAW.factory },
   fal:         { id: "fal",         brandColor: "#7C3AED", fallbackLetter: "F", svgPath: RAW.fal },
   flora:       { id: "flora",       brandColor: "#111111", fallbackLetter: "F", svgPath: RAW.flora },
+  futureagi:   { id: "futureagi",   brandColor: "#7857FC", fallbackLetter: "F", svgPath: RAW.futureagi },
   gemini:      { id: "gemini",      brandColor: "#ab87ea", fallbackLetter: "✦", svgPath: RAW.gemini },
   grok:        { id: "grok",        brandColor: "#10a37f", fallbackLetter: "G", svgPath: RAW.grok },
   groq:        { id: "groq",        brandColor: "#f56844", fallbackLetter: "G", svgPath: RAW.groq },
@@ -263,6 +282,7 @@ export const PROVIDER_ICON_REGISTRY: Record<string, ProviderIcon> = {
   llmproxy:    { id: "llmproxy",    brandColor: "#24b47e", fallbackLetter: "L", svgPath: RAW.llmproxy },
   minimax:     { id: "minimax",     brandColor: "#fe603c", fallbackLetter: "M", svgPath: RAW.minimax },
   mistral:     { id: "mistral",     brandColor: "#ff5229", fallbackLetter: "M", svgPath: RAW.mistral },
+  munito:      { id: "munito",      brandColor: "#702CF6", fallbackLetter: "M", svgPath: RAW.munito },
   muse:        { id: "muse",        brandColor: "#0668e1", fallbackLetter: "M", svgPath: RAW.muse },
   ollama:      { id: "ollama",      brandColor: "#888888", fallbackLetter: "○", svgPath: RAW.ollama },
   azureopenai: { id: "azureopenai", brandColor: "#0078d4", fallbackLetter: "A" },
@@ -296,6 +316,7 @@ export const PROVIDER_ICON_REGISTRY: Record<string, ProviderIcon> = {
   codebuddy:   { id: "codebuddy",   brandColor: "#0052d9", fallbackLetter: "C" },
   sakana:      { id: "sakana",      brandColor: "#2975db", fallbackLetter: "S", svgPath: RAW.sakana },
   sofya:       { id: "sofya",       brandColor: "#b0b820", fallbackLetter: "S", svgPath: RAW.sofya },
+  soniox:      { id: "soniox",      brandColor: "#253772", fallbackLetter: "S", svgPath: RAW.soniox },
   stepfun:     { id: "stepfun",     brandColor: "#2196f2", fallbackLetter: "S", svgPath: RAW.stepfun },
   sub2api:     { id: "sub2api",     brandColor: "#14b8a6", fallbackLetter: "S", svgPath: RAW.sub2api },
   venice:      { id: "venice",      brandColor: "#3c8fdd", fallbackLetter: "V", svgPath: RAW.venice },
@@ -401,6 +422,10 @@ const ALIASES: Record<string, string> = {
   "groq-cloud": "groq",
   "llm proxy": "llmproxy",
   "llm-proxy": "llmproxy",
+  "chatbox ai": "chatbox",
+  "chatbox-ai": "chatbox",
+  "abliteration.ai": "abliteration",
+  "abliteration ai": "abliteration",
   "chutes ai": "chutes",
   "chutes-ai": "chutes",
   "lite llm": "litellm",
@@ -424,11 +449,12 @@ function normalize(id: string): string {
 
 /**
  * Providers whose card bars use the label color instead of the brand color,
- * as Mac `progressColorStyle: .label` (only ElevenLabs, whose brand color is
- * near-white). The fallback is the light card's `--mac-text`.
+ * as Mac `progressColorStyle: .label` (ElevenLabs and abliteration.ai, whose
+ * brand colors are near-black). `--text-primary` is themed on every surface
+ * (Settings and the menu); `--mac-text` exists only inside the menu popover.
  */
-const LABEL_COLORED_BARS = new Set(["elevenlabs"]);
-const LABEL_BAR_COLOR = "var(--mac-text, rgba(0, 0, 0, 0.85))";
+const LABEL_COLORED_BARS = new Set(["elevenlabs", "abliteration"]);
+const LABEL_BAR_COLOR = "var(--text-primary, rgba(0, 0, 0, 0.85))";
 
 /**
  * The card's `--provider-accent`: the user's override when set, otherwise the

@@ -13,10 +13,6 @@ pub(crate) struct UserStatusResponse {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UserStatus {
-    #[allow(
-        dead_code,
-        reason = "field mirrors the Antigravity API user payload; deserialized for round-trip fidelity but not read yet"
-    )]
     email: Option<String>,
     plan_status: Option<PlanStatus>,
     user_tier: Option<UserTier>,
@@ -224,9 +220,14 @@ fn model_window_id(config: &ModelConfig) -> String {
         .as_deref()
         .or(config.id.as_deref())
         .unwrap_or_else(|| model_label(config));
-    let raw = canonical_model_id(raw);
-    let slug = raw
-        .chars()
+    let slug = slug(canonical_model_id(raw));
+    format!("model-{}", if slug.is_empty() { "unknown" } else { &slug })
+}
+
+/// Lowercase ASCII alphanumerics; every other character becomes `-`, and
+/// leading or trailing dashes are dropped.
+pub(super) fn slug(raw: &str) -> String {
+    raw.chars()
         .map(|ch| {
             if ch.is_ascii_alphanumeric() {
                 ch.to_ascii_lowercase()
@@ -236,8 +237,7 @@ fn model_window_id(config: &ModelConfig) -> String {
         })
         .collect::<String>()
         .trim_matches('-')
-        .to_string();
-    format!("model-{}", if slug.is_empty() { "unknown" } else { &slug })
+        .to_string()
 }
 
 fn rate_window_from_quota(quota: &QuotaInfo) -> RateWindow {
@@ -305,6 +305,49 @@ pub(super) fn parse_user_status(
         .and_then(|d| d.client_model_configs)
         .unwrap_or_default();
 
+    let mut snapshot = snapshot_from_model_configs(&model_configs);
+
+    if let Some(email) = first_non_empty([user_status.email.as_deref()]) {
+        snapshot = snapshot.with_email(email);
+    }
+
+    // Add plan information from the authenticated user-status response.
+    if let Some(plan) = plan_name {
+        snapshot = snapshot.with_login_method(plan);
+    }
+
+    Ok(snapshot)
+}
+
+/// One Cloud Code model quota from the remote OAuth `fetchAvailableModels` or
+/// `retrieveUserQuota` responses.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct RemoteModelQuota {
+    pub(super) label: String,
+    pub(super) model_id: String,
+    pub(super) remaining_fraction: Option<f64>,
+    pub(super) reset_time: Option<String>,
+}
+
+/// Map remote model quotas through the same slot selection as the local
+/// `GetUserStatus` model list, so both sources render identically.
+pub(super) fn snapshot_from_model_quotas(quotas: &[RemoteModelQuota]) -> UsageSnapshot {
+    let configs = quotas
+        .iter()
+        .map(|quota| ModelConfig {
+            label: quota.label.clone(),
+            model_id: Some(quota.model_id.clone()),
+            id: None,
+            quota_info: Some(QuotaInfo {
+                remaining_fraction: quota.remaining_fraction,
+                reset_time: quota.reset_time.clone(),
+            }),
+        })
+        .collect::<Vec<_>>();
+    snapshot_from_model_configs(&configs)
+}
+
+fn snapshot_from_model_configs(model_configs: &[ModelConfig]) -> UsageSnapshot {
     let mut quota_configs = model_configs
         .iter()
         .filter(|config| config.quota_info.is_some())
@@ -374,14 +417,5 @@ pub(super) fn parse_user_status(
         );
     }
 
-    if let Some(email) = first_non_empty([user_status.email.as_deref()]) {
-        snapshot = snapshot.with_email(email);
-    }
-
-    // Add plan information from the authenticated user-status response.
-    if let Some(plan) = plan_name {
-        snapshot = snapshot.with_login_method(plan);
-    }
-
-    Ok(snapshot)
+    snapshot
 }
