@@ -128,7 +128,7 @@ To build release assets on your own Windows PC, use the cached release builder:
 .\scripts\windows-release-build.ps1 -Ref vX.Y.Z
 ```
 
-It builds from a clean checkout under `-WorkRoot` (default `C:\code\Win-CodexBar-release`):
+It builds from a clean checkout under `-WorkRoot` (default `.release` in the repo, ignored by Git):
 
 - `source\` holds the checkout.
 - `cache\` keeps the pnpm store, the Cargo output and the installer downloads between runs.
@@ -151,7 +151,7 @@ Other switches:
 | `-WarmCacheOnly` | Builds the desktop binary to fill the caches, then stops before installer packaging |
 | `-SmokeInstall` | Installs and uninstalls the new installer to test it |
 | `-RefreshInstallerDependencies` | Downloads the installer bootstrappers again instead of reusing the cached copies |
-| `-RepoUrl` | The repo to clone when the managed checkout doesn't exist yet (default `https://github.com/nesszer/Win-CodexBar.git`) |
+| `-RepoUrl` | The repo to clone when the managed checkout doesn't exist yet (default this local repo, so `-Ref` can be `HEAD` or an unpushed branch) |
 
 The script only builds and tests. It has no upload switch.
 

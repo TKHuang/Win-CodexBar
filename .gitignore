@@ -128,6 +128,7 @@ codexbar-proof-*/
 proof-*/
 # verify skill run directories (may hold real account data)
 /.proof/
+/.release/
 .ai-bridge/
 .freebuff/
 .zcode/

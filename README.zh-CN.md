@@ -149,7 +149,7 @@ Winget 分发已通过 [microsoft/winget-pkgs](https://github.com/microsoft/wing
 .\scripts\windows-release-build.ps1 -Ref v0.32.2
 ```
 
-脚本会在 `C:\code\Win-CodexBar-release\source` 维护干净源码签出，在 `C:\code\Win-CodexBar-release\cache\cargo-target` 复用 Rust 构建输出，在 `C:\code\Win-CodexBar-release\cache\pnpm-store` 复用 pnpm 包，并复用已签名的 WebView2/VC++ 引导程序下载。它仍会构建真实 release 二进制、校验 Microsoft 签名、用 Inno Setup 打包，并在 `C:\code\Win-CodexBar-release\assets` 输出 GitHub Release 使用的四个资产。
+脚本会在 `.release\source` 维护干净源码签出，在 `.release\cache\cargo-target` 复用 Rust 构建输出，在 `.release\cache\pnpm-store` 复用 pnpm 包，并复用已签名的 WebView2/VC++ 引导程序下载。它仍会构建真实 release 二进制、校验 Microsoft 签名、用 Inno Setup 打包，并在 `.release\assets` 输出 GitHub Release 使用的四个资产。
 
 常用发布参数：
 
