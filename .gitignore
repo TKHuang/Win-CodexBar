@@ -123,6 +123,8 @@ proof-*.png
 proof-abc-*.py
 codexbar-proof-*/
 proof-*/
+# verify skill run directories (may hold real account data)
+/.proof/
 .ai-bridge/
 .freebuff/
 .zcode/
