@@ -8,6 +8,7 @@
 use futures::{Stream, StreamExt};
 
 pub mod abacus;
+pub mod abliteration;
 pub mod aerostack;
 pub mod aiand;
 pub mod aixy;
@@ -21,8 +22,10 @@ pub mod azureopenai;
 pub mod bedrock;
 pub mod bifrost;
 pub mod chart;
+pub mod chatbox;
 pub mod chutes;
 pub mod claude;
+pub mod claudeplatform;
 pub mod clawrouter;
 pub mod clinepass;
 pub mod codebuddy;
@@ -47,16 +50,19 @@ pub mod fal;
 pub mod fireworks;
 pub mod flora;
 pub(crate) mod format;
+pub mod futureagi;
 pub mod gemini;
 pub mod gitkraken;
 pub mod grok;
 pub mod groq;
 pub mod helmcode;
+pub(crate) mod http_util;
 pub mod huggingface;
 pub mod hyper;
 pub mod ibmbob;
 pub mod infini;
 pub mod jetbrains;
+pub(crate) mod json;
 pub mod kilo;
 pub mod kimi;
 pub mod kimik2;
@@ -73,6 +79,7 @@ pub mod meta;
 pub mod mimo;
 pub mod minimax;
 pub mod mistral;
+pub mod munito;
 pub mod muse;
 pub mod museai;
 pub mod nanogpt;
@@ -96,12 +103,16 @@ pub mod replicate;
 pub mod sailresearch;
 pub mod sakana;
 pub mod sofya;
+pub mod soniox;
 pub mod stepfun;
 pub mod sub2api;
 pub mod synthetic;
 pub mod t3chat;
 pub mod tavily;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod tinyapi;
+pub mod traecn;
 pub mod typesafe;
 pub mod v0;
 pub mod venice;
@@ -121,6 +132,7 @@ pub mod zoommate;
 
 // Re-export provider implementations
 pub use abacus::AbacusProvider;
+pub use abliteration::AbliterationProvider;
 pub use aerostack::AerostackProvider;
 pub use aiand::AiAndProvider;
 pub use aixy::AixyProvider;
@@ -133,8 +145,10 @@ pub use augment::AugmentProvider;
 pub use azureopenai::AzureOpenAIProvider;
 pub use bedrock::BedrockProvider;
 pub use bifrost::BifrostProvider;
+pub use chatbox::ChatboxProvider;
 pub use chutes::ChutesProvider;
 pub use claude::ClaudeProvider;
+pub use claudeplatform::ClaudePlatformProvider;
 pub use clawrouter::ClawRouterProvider;
 pub use clinepass::ClinePassProvider;
 pub use codebuddy::CodeBuddyProvider;
@@ -158,6 +172,7 @@ pub use factory::FactoryProvider;
 pub use fal::FalProvider;
 pub use fireworks::FireworksProvider;
 pub use flora::FloraProvider;
+pub use futureagi::FutureAgiProvider;
 pub use gemini::GeminiProvider;
 pub use gitkraken::GitKrakenProvider;
 pub use grok::GrokProvider;
@@ -184,6 +199,7 @@ pub use meta::MetaProvider;
 pub use mimo::MiMoProvider;
 pub use minimax::{MiniMaxProvider, MiniMaxRegion};
 pub use mistral::MistralProvider;
+pub use munito::MunitoProvider;
 pub use muse::MuseProvider;
 pub use museai::MuseAIProvider;
 pub use nanogpt::NanoGPTProvider;
@@ -206,12 +222,14 @@ pub use replicate::ReplicateProvider;
 pub use sailresearch::SailResearchProvider;
 pub use sakana::SakanaProvider;
 pub use sofya::SofyaProvider;
+pub use soniox::SonioxProvider;
 pub use stepfun::StepFunProvider;
 pub use sub2api::Sub2ApiProvider;
 pub use synthetic::SyntheticProvider;
 pub use t3chat::T3ChatProvider;
 pub use tavily::TavilyProvider;
 pub use tinyapi::TinyApiProvider;
+pub use traecn::TraeCnProvider;
 pub use typesafe::TypeSafeProvider;
 pub use v0::V0Provider;
 pub use venice::VeniceProvider;
@@ -336,6 +354,23 @@ pub(crate) fn browser_cookie_sessions_from<S: crate::browser::session_scan::Brow
     }
 }
 
+/// [`browser_cookie_sessions_from`] for the cookies a browser sends to one
+/// request host (see [`crate::browser::cookies::CookieRequestScope`]). The
+/// same `FetchContext::manual_cookie_missing` gate applies.
+pub(crate) fn browser_cookie_request_sessions_from<
+    S: crate::browser::session_scan::BrowserCookieStore,
+>(
+    store: S,
+    ctx: &crate::core::FetchContext,
+    scope: crate::browser::cookies::CookieRequestScope,
+) -> BrowserCookieSessions<S> {
+    BrowserCookieSessions {
+        scan: (!ctx.manual_cookie_missing).then(|| {
+            crate::browser::session_scan::BrowserCookieScan::for_request_scope(scope, store)
+        }),
+    }
+}
+
 pub(crate) struct BrowserCookieSessions<
     S: crate::browser::session_scan::BrowserCookieStore =
         crate::browser::session_scan::SystemCookieStore,
@@ -414,14 +449,33 @@ pub(crate) fn cookie_values<'a>(cookie_header: &'a str, name: &str) -> Vec<&'a s
 /// Empty values and control characters are rejected before the value reaches an
 /// HTTP client.
 pub(crate) fn normalize_cookie_header(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    let value = trimmed
-        .get(.."cookie:".len())
-        .filter(|prefix| prefix.eq_ignore_ascii_case("cookie:"))
-        .map_or(trimmed, |_| &trimmed["cookie:".len()..])
-        .trim();
-
+    let value = strip_cookie_prefix(raw.trim());
     (!value.is_empty() && !value.chars().any(char::is_control)).then(|| value.to_string())
+}
+
+/// Drops a leading, case-insensitive `Cookie:` label and the whitespace after
+/// it. Input without the label is returned unchanged.
+pub(crate) fn strip_cookie_prefix(header: &str) -> &str {
+    match header.get(.."cookie:".len()) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("cookie:") => header["cookie:".len()..].trim(),
+        _ => header,
+    }
+}
+
+/// Rebuilds a cookie header from its `name=value` pairs, trimming both sides
+/// and dropping chunks with no `=`, an empty name or an empty value. `None`
+/// when no pair remains.
+pub(crate) fn normalize_cookie_pairs(header: &str) -> Option<String> {
+    let pairs = header
+        .split(';')
+        .filter_map(|chunk| {
+            let (name, value) = chunk.trim().split_once('=')?;
+            let name = name.trim();
+            let value = value.trim();
+            (!name.is_empty() && !value.is_empty()).then(|| format!("{name}={value}"))
+        })
+        .collect::<Vec<_>>();
+    (!pairs.is_empty()).then(|| pairs.join("; "))
 }
 
 pub(crate) fn browser_cookies_for_domain(
@@ -632,7 +686,7 @@ pub(crate) fn extract_renewal(text: &str) -> Option<chrono::DateTime<chrono::Utc
 mod tests {
     use super::{
         BoundedBodyError, browser_cookie_sessions_from, normalize_cookie_header,
-        read_bounded_stream,
+        normalize_cookie_pairs, read_bounded_stream, strip_cookie_prefix,
     };
     use crate::browser::detection::BrowserType;
     use crate::browser::session_scan::test_support::FakeCookieStore;
@@ -738,5 +792,22 @@ mod tests {
             normalize_cookie_header("session=abc\r\nInjected: true"),
             None
         );
+    }
+
+    #[test]
+    fn strip_cookie_prefix_drops_only_a_leading_label() {
+        assert_eq!(strip_cookie_prefix("COOKIE:  a=1"), "a=1");
+        assert_eq!(strip_cookie_prefix("a=1; Cookie: b=2"), "a=1; Cookie: b=2");
+        assert_eq!(strip_cookie_prefix(" a=1 "), " a=1 ");
+        assert_eq!(strip_cookie_prefix("é"), "é");
+    }
+
+    #[test]
+    fn normalize_cookie_pairs_keeps_complete_pairs() {
+        assert_eq!(
+            normalize_cookie_pairs(" a = 1 ;b=;=c; junk ; d=2"),
+            Some("a=1; d=2".to_string())
+        );
+        assert_eq!(normalize_cookie_pairs("junk; b="), None);
     }
 }

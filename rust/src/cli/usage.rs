@@ -1,21 +1,24 @@
 //! Usage command implementation
 
 use clap::Args;
-use serde::Serialize;
 
-use crate::core::{FetchContext, ProviderFetchResult, ProviderId, SourceMode};
+use crate::core::{FetchContext, ProviderId, SourceMode};
 use crate::settings::Settings;
 
 mod claude_swap;
 mod fetch_helpers;
+mod parallel;
 mod render;
 
 use fetch_helpers::{fetch_provider_json_output, fetch_provider_text_output};
+#[cfg(test)]
+use render::render_text;
+use render::status_json;
 pub(super) use render::{
     append_status_line, format_percent, render_status_indicator, render_text_error,
 };
 use render::{is_terminal, print_usage_output};
-pub use render::{render_brief_text, render_text, render_text_with_status};
+pub use render::{render_brief_text, render_text_with_status};
 
 pub(super) enum UsageOutput {
     Text(Vec<String>),
@@ -192,24 +195,6 @@ impl ProviderSelection {
     }
 }
 
-/// JSON output payload
-#[derive(Debug, Serialize)]
-pub struct ProviderPayload {
-    pub provider: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
-    pub source: String,
-    #[serde(flatten)]
-    pub result: ProviderFetchResult,
-}
-
-/// Error payload for JSON output
-#[derive(Debug, Serialize)]
-struct ErrorPayload {
-    provider: String,
-    error: String,
-}
-
 /// Run the usage command
 pub async fn run(args: UsageArgs) -> anyhow::Result<()> {
     let command = UsageCommand::from_args(args)?;
@@ -241,6 +226,12 @@ struct UsageCommand {
     /// `CLIRenderer.computePace(weeklyWorkDays:)`).
     weekly_work_days: Option<u8>,
     ctx: FetchContext,
+    /// The user shares the app's usage with the CLI
+    /// ([crate::cli_usage_cache::cli_opted_in]).
+    app_cache_opted_in: bool,
+    /// The app's usage cache; None under CODEXBAR_CONFIG, whose settings
+    /// the app never sees, and in tests.
+    app_cache_path: Option<std::path::PathBuf>,
 }
 
 impl UsageCommand {
@@ -248,6 +239,13 @@ impl UsageCommand {
         let settings = Settings::load();
         let mut command = Self::from_args_with(args, || settings.get_enabled_provider_ids())?;
         command.weekly_work_days = settings.weekly_progress_work_days;
+        command.app_cache_opted_in = crate::cli_usage_cache::cli_opted_in(
+            !settings.load_state.is_unreadable_file(),
+            settings.share_usage_with_cli,
+        );
+        if crate::settings::settings_file_override().is_none() {
+            command.app_cache_path = crate::cli_usage_cache::default_path();
+        }
         Ok(command)
     }
 
@@ -281,7 +279,21 @@ impl UsageCommand {
             all_accounts: args.all_accounts,
             weekly_work_days: None,
             ctx: build_usage_fetch_context(&args, source_mode),
+            app_cache_opted_in: false,
+            app_cache_path: None,
         })
+    }
+
+    /// Fallback gate for a failed fetch, read after the fetch so a DPAPI
+    /// failure during it counts.
+    fn app_cache_gate(&self) -> crate::cli_usage_cache::FallbackGate {
+        crate::cli_usage_cache::FallbackGate {
+            opted_in: self.app_cache_opted_in,
+            default_account_fetch: self.ctx.source_mode == SourceMode::Auto
+                && self.account.is_none()
+                && !self.all_accounts,
+            dpapi_failure_observed: crate::cli_usage_cache::dpapi_decrypt_failure_observed(),
+        }
     }
 
     fn log(&self) {
@@ -308,25 +320,13 @@ fn build_usage_fetch_context(args: &UsageArgs, source_mode: SourceMode) -> Fetch
         source_mode,
         include_credits: !args.no_credits,
         web_timeout: args.web_timeout,
-        verbose: false,
-        manual_cookie_header: None,
-        manual_cookie_missing: false,
-        api_key: None,
-        token_account_kind: None,
-        token_account_isolated: false,
-        workspace_id: None,
-        seat_credit_entitlement: None,
-        api_region: None,
-        gateway_url: None,
-        auto_prefer_web: false,
-        browser_cookie_import: false,
         // `codexbar usage` is a foreground read: optional enrichment (e.g. the
         // OpenCode Go Zen balance) is worth its full bounded wait (#2583).
         requires_optional_usage_completeness: true,
         // Per-provider opt-ins live in settings, which this shared context
         // does not load; the optional breakdowns stay off here.
         optional_details_enabled: false,
-        live_usage_enabled: false,
+        ..FetchContext::default()
     }
 }
 

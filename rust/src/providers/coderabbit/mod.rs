@@ -14,7 +14,7 @@ use tokio::process::Command;
 
 use crate::core::{
     FetchContext, Provider, ProviderDisplayDetail, ProviderError, ProviderFetchResult, ProviderId,
-    ProviderMetadata, RateWindow, SourceMode, UsageSnapshot,
+    RateWindow, SourceMode, UsageSnapshot,
 };
 
 const CLI_TIMEOUT: Duration = Duration::from_secs(15);
@@ -22,6 +22,7 @@ const MAX_OUTPUT_BYTES: usize = 128 * 1024;
 const MAX_FIELD_CHARS: usize = 512;
 const DEFAULT_PROGRAM: &str = "coderabbit";
 const PROGRAM_OVERRIDE_ENV: &str = "CODERABBIT_CLI_PATH";
+const DISABLE_AUTO_UPDATE_ENV: &str = "CODERABBIT_CLI_DISABLE_AUTO_UPDATE";
 
 /// Single message for the shared 128 KiB output cap across reader boundaries.
 const OUTPUT_BUDGET_EXCEEDED: &str = "CodeRabbit CLI output exceeded 128 KiB.";
@@ -48,33 +49,12 @@ struct CliOutput {
     stderr: Vec<u8>,
 }
 
-pub struct CodeRabbitProvider {
-    metadata: ProviderMetadata,
-}
+#[derive(Default)]
+pub struct CodeRabbitProvider;
 
 impl CodeRabbitProvider {
     pub fn new() -> Self {
-        Self {
-            metadata: ProviderMetadata {
-                id: ProviderId::CodeRabbit,
-                display_name: "CodeRabbit",
-                session_label: "Reviews",
-                weekly_label: "Billing",
-                supports_opus: false,
-                supports_credits: false,
-                default_enabled: false,
-                is_primary: false,
-                dashboard_url: Some("https://app.coderabbit.ai"),
-                status_page_url: Some("https://status.coderabbit.ai"),
-                tertiary_label_key: None,
-            },
-        }
-    }
-}
-
-impl Default for CodeRabbitProvider {
-    fn default() -> Self {
-        Self::new()
+        Self
     }
 }
 
@@ -82,10 +62,6 @@ impl Default for CodeRabbitProvider {
 impl Provider for CodeRabbitProvider {
     fn id(&self) -> ProviderId {
         ProviderId::CodeRabbit
-    }
-
-    fn metadata(&self) -> &ProviderMetadata {
-        &self.metadata
     }
 
     async fn fetch_usage(&self, ctx: &FetchContext) -> Result<ProviderFetchResult, ProviderError> {
@@ -126,10 +102,6 @@ impl Provider for CodeRabbitProvider {
     fn available_sources(&self) -> Vec<SourceMode> {
         vec![SourceMode::Auto, SourceMode::Cli]
     }
-
-    fn supports_cli(&self) -> bool {
-        true
-    }
 }
 
 fn configured_program() -> String {
@@ -145,11 +117,19 @@ fn configured_program() -> String {
         })
 }
 
+/// Passive usage probes must not start CodeRabbit CLI auto-updates. The
+/// variable is documented by CodeRabbit (`CODERABBIT_CLI_DISABLE_AUTO_UPDATE`).
+fn apply_usage_environment(command: &mut Command) {
+    command
+        .env("NO_COLOR", "1")
+        .env(DISABLE_AUTO_UPDATE_ENV, "true");
+}
+
 async fn run_cli(program: &str) -> Result<CliOutput, ProviderError> {
     let mut command = Command::new(program);
+    command.arg("usage");
+    apply_usage_environment(&mut command);
     command
-        .arg("usage")
-        .env("NO_COLOR", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -558,6 +538,26 @@ mod tests {
         assert!(result.usage.login_method.is_none());
         let encoded = serde_json::to_value(result).unwrap();
         assert!(encoded.get("display_details").is_none());
+    }
+
+    #[tokio::test]
+    async fn usage_probe_disables_cli_auto_update_over_an_inherited_false() {
+        #[cfg(windows)]
+        let (program, args) = (
+            "cmd",
+            vec!["/C", "echo %CODERABBIT_CLI_DISABLE_AUTO_UPDATE%"],
+        );
+        #[cfg(not(windows))]
+        let (program, args) = (
+            "/bin/sh",
+            vec!["-c", "printf %s \"$CODERABBIT_CLI_DISABLE_AUTO_UPDATE\""],
+        );
+        // An explicit `false` stands in for an inherited value; the probe overrides it.
+        let mut command = Command::new(program);
+        command.args(args).env(DISABLE_AUTO_UPDATE_ENV, "false");
+        apply_usage_environment(&mut command);
+        let output = command.output().await.expect("test shell starts");
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "true");
     }
 
     #[test]

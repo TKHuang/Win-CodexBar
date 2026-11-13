@@ -1,5 +1,6 @@
 //! Recorded-token coverage for the OpenCode Go local reader (upstream 0.67.0).
 
+use super::test_db::{insert_message, insert_step_finish, iso_ms, open_db};
 use super::*;
 
 const FULL: &str =
@@ -7,53 +8,8 @@ const FULL: &str =
 /// Older OpenCode rows record no `total`; the five components sum to 20.
 const NO_TOTAL: &str = r#"{"input":10,"output":5,"reasoning":1,"cache":{"read":4,"write":0}}"#;
 
-fn iso_ms(iso: &str) -> i64 {
-    chrono::DateTime::parse_from_rfc3339(iso)
-        .unwrap()
-        .timestamp_millis()
-}
-
 fn now() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 3, 8, 0, 0, 0).unwrap()
-}
-
-fn open_db(path: &Path, with_part_table: bool) -> Connection {
-    let conn = Connection::open(path).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE message (id TEXT PRIMARY KEY, data TEXT, time_created INTEGER);",
-    )
-    .unwrap();
-    if with_part_table {
-        conn.execute_batch(
-            "CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, data TEXT, time_created INTEGER);",
-        )
-        .unwrap();
-    }
-    conn
-}
-
-/// `tokens` is spliced in as raw JSON so malformed shapes can be exercised.
-fn insert_message(conn: &Connection, id: &str, created_ms: i64, model: &str, tokens: Option<&str>) {
-    let tokens_json = tokens.map_or_else(String::new, |t| format!(r#","tokens":{t}"#));
-    let data = format!(
-        r#"{{"providerID":"opencode-go","role":"assistant","cost":1.5,"modelID":"{model}"{tokens_json},"time":{{"created":{created_ms}}}}}"#
-    );
-    conn.execute(
-        "INSERT INTO message (id, data, time_created) VALUES (?1, ?2, ?3)",
-        rusqlite::params![id, data, created_ms],
-    )
-    .unwrap();
-}
-
-fn insert_step_finish(conn: &Connection, id: &str, message_id: &str, ms: i64, tokens: &str) {
-    let data = format!(
-        r#"{{"type":"step-finish","cost":0.5,"tokens":{tokens},"time":{{"created":{ms}}}}}"#
-    );
-    conn.execute(
-        "INSERT INTO part (id, message_id, data, time_created) VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![id, message_id, data, ms],
-    )
-    .unwrap();
 }
 
 fn parse(json: &str) -> Option<RowTokens> {
@@ -147,11 +103,18 @@ fn daily_entries_carry_message_token_counts_per_day_and_model() {
         iso_ms("2026-03-06T11:00:00.000Z"),
         iso_ms("2026-03-06T11:30:00.000Z"),
     );
-    insert_message(&conn, "m1", first, "kimi-k2", Some(FULL));
-    insert_message(&conn, "m2", second, "kimi-k2", Some(NO_TOTAL));
+    insert_message(&conn, "m1", first, Some(1.5), Some("kimi-k2"), Some(FULL));
+    insert_message(
+        &conn,
+        "m2",
+        second,
+        Some(1.5),
+        Some("kimi-k2"),
+        Some(NO_TOTAL),
+    );
     drop(conn);
 
-    let rows = read_rows(&db).unwrap();
+    let rows = read_rows(&db, RowSource::OpenCodeGo).unwrap();
     let daily = daily_model_costs(&rows, now(), 30);
     assert_eq!(daily.len(), 1);
     let tokens = &daily[0].tokens;
@@ -167,23 +130,86 @@ fn daily_entries_carry_message_token_counts_per_day_and_model() {
 }
 
 #[test]
+fn daily_token_totals_sum_models_per_day_with_the_window_rule() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("opencode.db");
+    let conn = open_db(&db, false);
+    let day1 = iso_ms("2026-03-06T11:00:00.000Z");
+    let day2 = iso_ms("2026-03-07T11:00:00.000Z");
+    insert_message(&conn, "m1", day1, Some(1.0), Some("kimi-k2"), Some(FULL));
+    insert_message(&conn, "m2", day1, Some(1.0), Some("glm-5"), Some(NO_TOTAL));
+    insert_message(&conn, "m3", day2, Some(1.0), Some("glm-5"), Some(NO_TOTAL));
+    drop(conn);
+
+    let rows = read_rows(&db, RowSource::OpenCodeGo).unwrap();
+    let daily = daily_token_totals(&daily_model_costs(&rows, now(), 30)).expect("known");
+    let day = |date: &str| daily.iter().find(|(d, _)| d == date).map(|(_, t)| *t);
+    // input + output + cache read + cache write: FULL = 1570, NO_TOTAL = 19.
+    assert_eq!(day(&day_key_local(day1).unwrap()), Some(1570 + 19));
+    assert_eq!(day(&day_key_local(day2).unwrap()), Some(19));
+}
+
+#[test]
+fn daily_token_totals_are_unknown_when_a_row_lacks_tokens() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("opencode.db");
+    let conn = open_db(&db, false);
+    let created = iso_ms("2026-03-06T11:00:00.000Z");
+    insert_message(&conn, "m1", created, Some(1.0), Some("kimi-k2"), Some(FULL));
+    insert_message(&conn, "m2", created, Some(1.0), Some("kimi-k2"), None);
+    drop(conn);
+
+    let rows = read_rows(&db, RowSource::OpenCodeGo).unwrap();
+    assert_eq!(
+        daily_token_totals(&daily_model_costs(&rows, now(), 30)),
+        None
+    );
+}
+
+#[test]
+fn row_scan_keeps_an_unreadable_database_apart_from_no_install() {
+    let dir = tempfile::tempdir().unwrap();
+    let auth = dir.path().join("auth.json");
+    let db = dir.path().join("opencode.db");
+    let candidates = || vec![(auth.clone(), db.clone())];
+
+    assert!(matches!(
+        scan_rows_from(candidates(), &ScanCache::new(), RowSource::OpenCodeGo),
+        Ok(None)
+    ));
+
+    std::fs::write(&db, b"not a sqlite database").unwrap();
+    assert!(matches!(
+        scan_rows_from(candidates(), &ScanCache::new(), RowSource::OpenCodeGo),
+        Err(())
+    ));
+}
+
+#[test]
 fn step_finish_tokens_replace_the_parent_message_tokens() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("opencode.db");
     let conn = open_db(&db, true);
     let created = iso_ms("2026-03-06T11:00:00.000Z");
     // The parent message records the session total; the steps record each call.
-    insert_message(&conn, "m1", created, "kimi-k2", Some(FULL));
+    insert_message(&conn, "m1", created, Some(1.5), Some("kimi-k2"), Some(FULL));
     let step_a =
         r#"{"total":30,"input":10,"output":5,"reasoning":5,"cache":{"read":10,"write":0}}"#;
     let step_b = r#"{"total":20,"input":8,"output":2,"reasoning":0,"cache":{"read":10,"write":0}}"#;
-    insert_step_finish(&conn, "p1", "m1", created, step_a);
-    insert_step_finish(&conn, "p2", "m1", created, step_b);
+    insert_step_finish(&conn, "p1", "m1", created, 0.5, Some(step_a));
+    insert_step_finish(&conn, "p2", "m1", created, 0.5, Some(step_b));
     // A message with no step-finish parts keeps using its own tokens.
-    insert_message(&conn, "m2", created, "kimi-k2", Some(NO_TOTAL));
+    insert_message(
+        &conn,
+        "m2",
+        created,
+        Some(1.5),
+        Some("kimi-k2"),
+        Some(NO_TOTAL),
+    );
     drop(conn);
 
-    let rows = read_rows(&db).unwrap();
+    let rows = read_rows(&db, RowSource::OpenCodeGo).unwrap();
     assert_eq!(rows.len(), 3);
     let daily = daily_model_costs(&rows, now(), 30);
     let tokens = &daily[0].tokens;
@@ -198,13 +224,20 @@ fn rows_without_usable_tokens_leave_the_day_incomplete_not_zero() {
     let db = dir.path().join("opencode.db");
     let conn = open_db(&db, false);
     let created = iso_ms("2026-03-06T11:00:00.000Z");
-    insert_message(&conn, "m1", created, "kimi-k2", Some(FULL));
-    insert_message(&conn, "m2", created, "kimi-k2", None);
-    insert_message(&conn, "m3", created, "kimi-k2", Some("5"));
-    insert_message(&conn, "m4", created, "kimi-k2", Some(r#"{"total":-4}"#));
+    insert_message(&conn, "m1", created, Some(1.5), Some("kimi-k2"), Some(FULL));
+    insert_message(&conn, "m2", created, Some(1.5), Some("kimi-k2"), None);
+    insert_message(&conn, "m3", created, Some(1.5), Some("kimi-k2"), Some("5"));
+    insert_message(
+        &conn,
+        "m4",
+        created,
+        Some(1.5),
+        Some("kimi-k2"),
+        Some(r#"{"total":-4}"#),
+    );
     drop(conn);
 
-    let rows = read_rows(&db).unwrap();
+    let rows = read_rows(&db, RowSource::OpenCodeGo).unwrap();
     // Costs survive even when tokens do not.
     assert_eq!(rows.len(), 4);
     let daily = daily_model_costs(&rows, now(), 30);
@@ -223,19 +256,27 @@ fn model_summary_carries_per_model_tokens_and_marks_partial_models() {
     let db = dir.path().join("opencode.db");
     let conn = open_db(&db, false);
     let created = iso_ms("2026-03-06T11:00:00.000Z");
-    insert_message(&conn, "m1", created, "kimi-k2", Some(FULL));
-    insert_message(&conn, "m2", created, "kimi-k2", Some(NO_TOTAL));
-    insert_message(&conn, "m3", created, "glm-5", None);
+    insert_message(&conn, "m1", created, Some(1.5), Some("kimi-k2"), Some(FULL));
+    insert_message(
+        &conn,
+        "m2",
+        created,
+        Some(1.5),
+        Some("kimi-k2"),
+        Some(NO_TOTAL),
+    );
+    insert_message(&conn, "m3", created, Some(1.5), Some("glm-5"), None);
     insert_message(
         &conn,
         "m4",
         created,
-        "mimo",
+        Some(1.5),
+        Some("mimo"),
         Some(r#"{"total":9,"input":4}"#),
     );
     drop(conn);
 
-    let rows = read_rows(&db).unwrap();
+    let rows = read_rows(&db, RowSource::OpenCodeGo).unwrap();
     let summary = model_cost_summary_from_rows(&rows, now(), 30);
 
     let kimi = summary.by_model_tokens["kimi-k2"]
@@ -258,10 +299,72 @@ fn model_summary_carries_per_model_tokens_and_marks_partial_models() {
         .unwrap();
     assert_eq!((mimo.input_tokens, mimo.reasoning_tokens), (4, None));
     assert_eq!(summary.by_model_tokens["mimo"].complete_total(), Some(9));
+    // Its total is exact, but its output class was not recorded, so the model's
+    // input/output are unknown. kimi-k2 recorded both classes on every row.
+    assert_eq!(summary.by_model_tokens["mimo"].unknown_token_rows(), 1);
+    assert_eq!(summary.by_model_tokens["kimi-k2"].unknown_token_rows(), 0);
+    assert_eq!(summary.by_model_tokens["glm-5"].unknown_token_rows(), 1);
 
     // The window total is incomplete because one model has no usable row.
     assert_eq!(summary.tokens.complete_total(), None);
     assert_eq!(summary.tokens.total, 1600 + 20 + 9);
+    // glm-5's unusable row and mimo's partial row are both unknown.
+    assert_eq!(summary.tokens.unknown_token_rows(), 2);
+}
+
+#[test]
+fn rows_missing_input_or_output_keep_their_total_but_leave_classes_unknown() {
+    let total_only = parse(r#"{"total":7}"#).unwrap();
+    let mut sums = TokenSums::default();
+    sums.add(Some(&total_only));
+    // The recorded total is exact, so it is kept.
+    assert_eq!(sums.complete_total(), Some(7));
+    assert_eq!(sums.total, 7);
+    // Input and output were not recorded: never exposed as exact zeros.
+    assert_eq!(sums.complete_input_output(), None);
+    assert_eq!(sums.unknown_token_rows(), 1);
+    assert_eq!(sums.unusable_rows(), 0);
+    assert_eq!(sums.complete_reasoning(), None);
+
+    // A row with input but no output is equally unknown for input/output.
+    let input_only = parse(r#"{"total":9,"input":4}"#).unwrap();
+    let mut sums = TokenSums::default();
+    sums.add(Some(&parse(FULL).unwrap()));
+    sums.add(Some(&input_only));
+    assert_eq!(sums.complete_input_output(), None);
+    assert_eq!(sums.unknown_token_rows(), 1);
+    assert_eq!(sums.complete_total(), Some(1609));
+}
+
+#[test]
+fn cost_summary_marks_models_with_total_only_rows_as_unknown_tokens() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("opencode.db");
+    let conn = open_db(&db, false);
+    let created = iso_ms("2026-03-06T11:00:00.000Z");
+    insert_message(&conn, "m1", created, Some(1.5), Some("kimi-k2"), Some(FULL));
+    insert_message(
+        &conn,
+        "m2",
+        created,
+        Some(1.5),
+        Some("mimo"),
+        Some(r#"{"total":9}"#),
+    );
+    drop(conn);
+
+    let rows = read_rows(&db, RowSource::OpenCodeGo).unwrap();
+    let summary = model_cost_summary_from_rows(&rows, now(), 30).into_cost_summary();
+    // Costs are kept for both models.
+    assert_eq!(summary.by_model["mimo"], 1.5);
+    // The window and the mimo model are unknown; kimi-k2 is exact.
+    assert!(!summary.tokens_known());
+    assert_eq!(summary.unknown_token_rows, 1);
+    assert_eq!(summary.unknown_token_rows_by_model.get("mimo"), Some(&1));
+    assert!(!summary.unknown_token_rows_by_model.contains_key("kimi-k2"));
+    // Window input sums only what rows recorded: kimi-k2's FULL row (100). The
+    // mimo row is total-only, so it adds no input.
+    assert_eq!(summary.input_tokens, 100);
 }
 
 #[test]

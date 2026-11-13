@@ -7,13 +7,15 @@ use crate::core::{ProviderError, RateWindow, UsageSnapshot};
 
 use super::USER_AGENT;
 
-const CONSOLE_WORKSPACES_URL: &str = "https://opencode.ai/console/api/orgs";
-const CONSOLE_GO_STATUS_URL: &str = "https://opencode.ai/console/api/go/status";
-const CONSOLE_BILLING_STATUS_URL: &str = "https://opencode.ai/console/api/billing/status";
+// Shared with the OpenCode provider, whose migrated Console workspaces read
+// the same endpoints.
+const CONSOLE_WORKSPACES_PATH: &str = "/console/api/orgs";
+const CONSOLE_GO_STATUS_PATH: &str = "/console/api/go/status";
+pub(crate) const CONSOLE_BILLING_STATUS_PATH: &str = "/console/api/billing/status";
 const CONSOLE_WORKSPACE_HEADER: &str = "x-org-id";
 const BILLING_SCALE: f64 = 100_000_000.0;
 
-pub(super) enum ConsoleUsage {
+pub(crate) enum ConsoleUsage {
     Snapshot(Box<UsageSnapshot>),
     NoSubscription,
 }
@@ -47,14 +49,15 @@ fn is_workspace_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
-pub(super) async fn fetch_workspace_id(
+pub(crate) async fn fetch_workspace_id(
     client: &Client,
+    origin: &str,
     cookie_header: &str,
     timeout: Duration,
 ) -> Result<String, ProviderError> {
     let text = fetch_text(
         client,
-        CONSOLE_WORKSPACES_URL,
+        &format!("{origin}{CONSOLE_WORKSPACES_PATH}"),
         None,
         cookie_header,
         timeout,
@@ -64,18 +67,19 @@ pub(super) async fn fetch_workspace_id(
     parse_workspace_ids(&text)
         .into_iter()
         .next()
-        .ok_or_else(|| ProviderError::Parse("Missing OpenCode Console workspace ID".to_string()))
+        .ok_or_else(|| missing("workspace ID"))
 }
 
-pub(super) async fn fetch_usage(
+pub(crate) async fn fetch_usage(
     client: &Client,
+    origin: &str,
     workspace_id: &str,
     cookie_header: &str,
     timeout: Duration,
 ) -> Result<ConsoleUsage, ProviderError> {
     let text = fetch_text(
         client,
-        CONSOLE_GO_STATUS_URL,
+        &format!("{origin}{CONSOLE_GO_STATUS_PATH}"),
         Some(workspace_id),
         cookie_header,
         timeout,
@@ -93,7 +97,7 @@ pub(super) async fn fetch_balance(
 ) -> Result<Option<f64>, ProviderError> {
     let text = fetch_text(
         client,
-        CONSOLE_BILLING_STATUS_URL,
+        &format!("{}{CONSOLE_BILLING_STATUS_PATH}", super::BASE_URL),
         Some(workspace_id),
         cookie_header,
         timeout,
@@ -103,7 +107,10 @@ pub(super) async fn fetch_balance(
     parse_balance(&text)
 }
 
-async fn fetch_text(
+/// GET one Console endpoint. Only the workspace-discovery call omits the
+/// `x-org-id` header. A 401 is invalid credentials; any other non-200 is an
+/// API error, because a Console scope or permission failure is not expired auth.
+pub(crate) async fn fetch_text(
     client: &Client,
     url: &str,
     workspace_id: Option<&str>,
@@ -145,26 +152,21 @@ fn parse_workspace_ids(text: &str) -> Vec<String> {
 }
 
 fn parse_usage(text: &str, _now: DateTime<Utc>) -> Result<ConsoleUsage, ProviderError> {
-    let root: Value = serde_json::from_str(text)
-        .map_err(|_| ProviderError::Parse("Invalid OpenCode Console usage payload".to_string()))?;
+    let root: Value = serde_json::from_str(text).map_err(|_| invalid("usage payload"))?;
     if root.is_null() || root.get("access").is_some_and(Value::is_null) {
         return Ok(ConsoleUsage::NoSubscription);
     }
     let access = root
         .get("access")
         .and_then(Value::as_object)
-        .ok_or_else(|| {
-            ProviderError::Parse("Invalid OpenCode Console usage payload".to_string())
-        })?;
+        .ok_or_else(|| invalid("usage payload"))?;
     let meters = access
         .get("meters")
         .and_then(Value::as_object)
-        .ok_or_else(|| {
-            ProviderError::Parse("Invalid OpenCode Console usage payload".to_string())
-        })?;
-    let rolling = meters.get("fiveHour").ok_or_else(|| {
-        ProviderError::Parse("Invalid OpenCode Console usage payload".to_string())
-    })?;
+        .ok_or_else(|| invalid("usage payload"))?;
+    let rolling = meters
+        .get("fiveHour")
+        .ok_or_else(|| invalid("usage payload"))?;
     let ends_at = access.get("endsAt").and_then(date_value);
     let primary = meter_window(rolling, Some(300), None)?;
     let mut snapshot = UsageSnapshot::new(primary).with_login_method("OpenCode Go");
@@ -192,14 +194,12 @@ fn meter_window(
     window_minutes: Option<u32>,
     reset_override: Option<DateTime<Utc>>,
 ) -> Result<RateWindow, ProviderError> {
-    let object = meter
-        .as_object()
-        .ok_or_else(|| ProviderError::Parse("Invalid OpenCode Console usage meter".to_string()))?;
-    let used = numeric_value(object.get("usedMicroCents"))
-        .ok_or_else(|| ProviderError::Parse("Missing OpenCode Console usage amount".to_string()))?;
+    let object = meter.as_object().ok_or_else(|| invalid("usage meter"))?;
+    let used =
+        numeric_value(object.get("usedMicroCents")).ok_or_else(|| missing("usage amount"))?;
     let limit = numeric_value(object.get("limitMicroCents"))
         .filter(|value| *value > 0.0)
-        .ok_or_else(|| ProviderError::Parse("Missing OpenCode Console usage limit".to_string()))?;
+        .ok_or_else(|| missing("usage limit"))?;
     let resets_at = reset_override.or_else(|| object.get("resetsAt").and_then(date_value));
     Ok(RateWindow::with_details(
         ((used / limit) * 100.0).clamp(0.0, 100.0),
@@ -209,46 +209,42 @@ fn meter_window(
     ))
 }
 
-fn parse_balance(text: &str) -> Result<Option<f64>, ProviderError> {
-    let root: Value = serde_json::from_str(text).map_err(|_| {
-        ProviderError::Parse("Invalid OpenCode Console billing payload".to_string())
-    })?;
+pub(crate) fn parse_balance(text: &str) -> Result<Option<f64>, ProviderError> {
+    let root: Value = serde_json::from_str(text).map_err(|_| invalid("billing payload"))?;
     let billing_mode = root
         .get("billingMode")
         .and_then(Value::as_str)
         .filter(|mode| matches!(*mode, "prepaid" | "legacy" | "seat" | "credit"))
-        .ok_or_else(|| {
-            ProviderError::Parse("Invalid OpenCode Console billing payload".to_string())
-        })?;
+        .ok_or_else(|| invalid("billing payload"))?;
     let mode = root
         .get("mode")
         .and_then(Value::as_str)
         .filter(|mode| matches!(*mode, "pay-as-you-go" | "invoiceable"))
-        .ok_or_else(|| {
-            ProviderError::Parse("Invalid OpenCode Console billing payload".to_string())
-        })?;
+        .ok_or_else(|| invalid("billing payload"))?;
     if billing_mode != "prepaid" || mode != "pay-as-you-go" {
         return Ok(None);
     }
     let raw = root
         .get("balanceMicroCents")
         .and_then(Value::as_str)
-        .ok_or_else(|| ProviderError::Parse("Missing OpenCode Console balance".to_string()))?;
+        .ok_or_else(|| missing("balance"))?;
     let digits = raw.strip_prefix('-').unwrap_or(raw);
     if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(ProviderError::Parse(
-            "Invalid OpenCode Console balance".to_string(),
-        ));
+        return Err(invalid("balance"));
     }
-    let balance = raw
-        .parse::<f64>()
-        .map_err(|_| ProviderError::Parse("Invalid OpenCode Console balance".to_string()))?;
+    let balance = raw.parse::<f64>().map_err(|_| invalid("balance"))?;
     if !balance.is_finite() {
-        return Err(ProviderError::Parse(
-            "Invalid OpenCode Console balance".to_string(),
-        ));
+        return Err(invalid("balance"));
     }
     Ok(Some(balance / BILLING_SCALE))
+}
+
+fn invalid(what: &str) -> ProviderError {
+    ProviderError::Parse(format!("Invalid OpenCode Console {what}"))
+}
+
+fn missing(what: &str) -> ProviderError {
+    ProviderError::Parse(format!("Missing OpenCode Console {what}"))
 }
 
 fn numeric_value(value: Option<&Value>) -> Option<f64> {
@@ -294,6 +290,76 @@ mod tests {
         format!(
             r#"{{"access":{{"endsAt":"2026-10-19T00:00:00Z","meters":{{"fiveHour":{{"resetsAt":{five_hour_reset},"limitMicroCents":"1200000000","usedMicroCents":"300000000"}},"week":{{"resetsAt":"2026-09-21T00:00:00Z","limitMicroCents":"3000000000","usedMicroCents":"1200000000"}},"month":{{"limitMicroCents":"6000000000","usedMicroCents":"600000000"}}}}}}}}"#
         )
+    }
+
+    #[test]
+    fn console_parse_errors_keep_their_messages() {
+        let usage_cases = [
+            ("not json", "Invalid OpenCode Console usage payload"),
+            (r#"{"access":5}"#, "Invalid OpenCode Console usage payload"),
+            (r#"{"access":{}}"#, "Invalid OpenCode Console usage payload"),
+            (
+                r#"{"access":{"meters":{}}}"#,
+                "Invalid OpenCode Console usage payload",
+            ),
+            (
+                r#"{"access":{"meters":{"fiveHour":5}}}"#,
+                "Invalid OpenCode Console usage meter",
+            ),
+            (
+                r#"{"access":{"meters":{"fiveHour":{}}}}"#,
+                "Missing OpenCode Console usage amount",
+            ),
+            (
+                r#"{"access":{"meters":{"fiveHour":{"usedMicroCents":"1"}}}}"#,
+                "Missing OpenCode Console usage limit",
+            ),
+        ];
+        for (text, expected) in usage_cases {
+            let error = parse_usage(text, now()).err().expect(text);
+            assert!(
+                matches!(&error, ProviderError::Parse(message) if message == expected),
+                "{text}: {error:?}"
+            );
+        }
+
+        let huge = "9".repeat(400);
+        let balance_cases = [
+            (
+                "not json".to_string(),
+                "Invalid OpenCode Console billing payload",
+            ),
+            (
+                r#"{"billingMode":"other","mode":"pay-as-you-go"}"#.to_string(),
+                "Invalid OpenCode Console billing payload",
+            ),
+            (
+                r#"{"billingMode":"prepaid"}"#.to_string(),
+                "Invalid OpenCode Console billing payload",
+            ),
+            (
+                r#"{"billingMode":"prepaid","mode":"pay-as-you-go"}"#.to_string(),
+                "Missing OpenCode Console balance",
+            ),
+            (
+                r#"{"billingMode":"prepaid","mode":"pay-as-you-go","balanceMicroCents":"12a"}"#
+                    .to_string(),
+                "Invalid OpenCode Console balance",
+            ),
+            (
+                format!(
+                    r#"{{"billingMode":"prepaid","mode":"pay-as-you-go","balanceMicroCents":"{huge}"}}"#
+                ),
+                "Invalid OpenCode Console balance",
+            ),
+        ];
+        for (text, expected) in balance_cases {
+            let error = parse_balance(&text).unwrap_err();
+            assert!(
+                matches!(&error, ProviderError::Parse(message) if message == expected),
+                "{text}: {error:?}"
+            );
+        }
     }
 
     #[test]

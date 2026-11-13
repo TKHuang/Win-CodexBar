@@ -65,6 +65,7 @@ const settings: SettingsSnapshot = {
   highUsageThreshold: 70,
   criticalUsageThreshold: 90,
   predictivePaceWarningEnabled: false,
+  predictivePaceWarningLeadHours: 0,
   credentialExpiryNotificationsEnabled: false,
   trayIconMode: "single",
   switcherShowsIcons: true,
@@ -72,6 +73,7 @@ const settings: SettingsSnapshot = {
   menuBarShowsPercent: true,
   menuBarIconStyle: "percent",
   mergedOverviewSelectedProviders: [],
+  mergedOverviewAllAccounts: false,
   quotaWarningMarkersVisible: true,
   workdayTickStyle: "subtle",
   menuBarColorPace: false,
@@ -86,8 +88,12 @@ const settings: SettingsSnapshot = {
   overviewLayout: "detailed",
   windowScalePercent: 125,
   trayScalePercent: 100,
+  trayPanelStyle: "modern",
+  trayPanelWidth: 310,
   trayPanelAlwaysOnTop: false,
+  trayPanelMovable: false,
   powertoysStatusPipeEnabled: false,
+  shareUsageWithCli: false,
   hidePersonalInfo: false,
   autoDownloadUpdates: false,
   installUpdatesOnQuit: false,
@@ -113,6 +119,7 @@ const settings: SettingsSnapshot = {
   floatBarDarkText: false,
   floatBarShowResetInline: false,
   floatBarShowCost: false,
+  floatBarShowWeekly: false,
   claudeDailyRoutinesUsageVisible: true,
   claudeAllowReadingClaudeCodeCredentials: false,
   alibabaTokenPlanRegion: "cn",
@@ -221,6 +228,46 @@ describe("GeneralTab language picker", () => {
     fireEvent.click(screen.getByRole("checkbox", { name: "PredictivePaceWarnings" }));
 
     expect(set).toHaveBeenCalledWith({ predictivePaceWarningEnabled: true });
+  });
+
+  it("saves the pace warning lead time and offers Any time first", () => {
+    const set = vi.fn();
+    render(
+      <GeneralTab
+        mode="notifications"
+        settings={{ ...settings, predictivePaceWarningEnabled: true }}
+        set={set}
+        saving={false}
+      />,
+    );
+
+    const select = screen.getByRole("combobox", { name: "PredictivePaceWarningLeadLabel" }) as HTMLSelectElement;
+    expect(Array.from(select.options, (option) => option.value)).toEqual(["0", "6", "12", "24", "48"]);
+    expect(select.options[0].textContent).toBe("PredictivePaceWarningLeadAny");
+    fireEvent.change(select, { target: { value: "24" } });
+
+    expect(set).toHaveBeenCalledWith({ predictivePaceWarningLeadHours: 24 });
+  });
+
+  it("shows a saved lead time that is not a preset", () => {
+    render(
+      <GeneralTab
+        mode="notifications"
+        settings={{ ...settings, predictivePaceWarningEnabled: true, predictivePaceWarningLeadHours: 168 }}
+        set={vi.fn()}
+        saving={false}
+      />,
+    );
+
+    const select = screen.getByRole("combobox", { name: "PredictivePaceWarningLeadLabel" }) as HTMLSelectElement;
+    expect(select).toHaveValue("168");
+    expect(Array.from(select.options, (option) => option.value)).toEqual(["0", "6", "12", "24", "48", "168"]);
+  });
+
+  it("disables the pace warning lead time while pace warnings are off", () => {
+    render(<GeneralTab mode="notifications" settings={settings} set={vi.fn()} saving={false} />);
+
+    expect(screen.getByRole("combobox", { name: "PredictivePaceWarningLeadLabel" })).toBeDisabled();
   });
 
   it("updates the credential expiry alert preference", () => {
@@ -427,7 +474,7 @@ describe("GeneralTab preferred currency picker", () => {
       "AUTO", "USD ($)", "GBP (£)", "EUR (€)", "CZK (Kč)", "CNY (¥)", "JPY (¥)", "KRW (₩)",
       "CAD ($)", "AUD ($)", "HKD ($)", "TWD (NT$)", "SGD ($)", "INR (₹)", "CHF (Fr.)",
       "AED (د.إ)", "TRY (₺)", "NZD ($)", "SEK (kr)", "NOK (kr)", "DKK (kr)", "PLN (zł)",
-      "BRL (R$)", "MXN ($)", "ZAR (R)", "THB (฿)", "IDR (Rp)", "VND (₫)", "UAH (₴)",
+      "BRL (R$)", "MXN ($)", "ZAR (R)", "THB (฿)", "IDR (Rp)", "VND (₫)", "UAH (₴)", "ILS (₪)",
     ]);
   });
 
@@ -658,6 +705,7 @@ describe("GeneralTab notifications pane", () => {
       "SessionQuotaNotifications",
       "ShowNotifications",
       "PredictivePaceWarnings",
+      "PredictivePaceWarningLeadLabel",
       "LimitResetNotifications",
     ]);
   });
@@ -738,6 +786,7 @@ describe("GeneralTab notifications pane", () => {
           ...settings,
           showNotifications: false,
           predictivePaceWarningEnabled: true,
+          predictivePaceWarningLeadHours: 0,
           credentialExpiryNotificationsEnabled: true,
         }}
         set={vi.fn()}

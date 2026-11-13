@@ -287,12 +287,10 @@
   min-width: 0;
 }
 
+/* Titles wrap to their full height (upstream #4193); values stay on one line. */
 .menu-surface--tray .card-dash__kpi-title {
   font: var(--mac-text-caption2);
   color: var(--mac-text-2);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 
 .menu-surface--tray .card-dash__kpi-value {
@@ -430,6 +428,103 @@
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* Conversations list (upstream Cost submenu sessionsBlock). */
+.menu-surface--tray .card-conversations {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+
+.menu-surface--tray .card-conversations__header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.menu-surface--tray .card-conversations__toggle {
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: var(--mac-text-caption);
+  color: var(--mac-text-2);
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+.menu-surface--tray .card-conversations__toggle::before {
+  content: "\25B8\00A0";
+}
+
+.menu-surface--tray .card-conversations__toggle[aria-expanded="true"]::before {
+  content: "\25BE\00A0";
+}
+
+.menu-surface--tray .card-conversations__count {
+  flex: none;
+  font: var(--mac-text-caption2);
+  color: var(--mac-text-2);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Five 44 px rows with 5 px gaps stay visible; the rest scroll, as upstream. */
+.menu-surface--tray .card-conversations__list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  max-height: 240px;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.menu-surface--tray .card-conversations__row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  min-height: 44px;
+}
+
+.menu-surface--tray .card-conversations__text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.menu-surface--tray .card-conversations__title {
+  font: var(--mac-text-caption);
+  color: var(--mac-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.menu-surface--tray .card-conversations__meta {
+  font: var(--mac-text-caption2);
+  color: var(--mac-text-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.menu-surface--tray .card-conversations__cost {
+  flex: none;
+  font: var(--mac-text-caption);
+  color: var(--mac-text-2);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 /* ── Extra usage and cost (`MenuCardView+Costs`) ── */
@@ -582,4 +677,65 @@
 .menu-surface--tray .overview-spend__caption {
   font: var(--mac-text-caption);
   color: var(--mac-text-2);
+}
+
+
+/* ── Compact layout (Settings > Menu > Compact layout) ──────────────
+   Density only: every row still renders. Tokens set here outrank both looks
+   (same specificity as the modern block, loaded after it); the descendant rules
+   restate the few sizes tray-card-modern.css hardcodes. */
+.menu-surface--tray.menu-surface--compact {
+  --mac-text-headline: 600 13px/16px var(--mac-font);
+  --mac-text-body-medium: 600 12px/15px var(--mac-font);
+  --mac-text-subheadline: 400 11px/13px var(--mac-font);
+  --mac-text-footnote: 400 10px/12px var(--mac-font);
+  --mac-text-caption: 400 10px/12px var(--mac-font);
+  --mac-text-caption2: 400 10px/12px var(--mac-font);
+  --mac-text-section: 600 10px/12px var(--mac-font);
+  --mac-text-menu: 400 12px/15px var(--mac-font);
+  --mac-text-shortcut: 400 12px/15px var(--mac-font);
+
+  --mac-pad-x: 12px;
+  --mac-row-pl: 12px;
+  --mac-pad-header-y: 4px;
+  --mac-gap-header: 4px;
+  --mac-section-pt: 4px;
+  --mac-section-pb: 4px;
+  --mac-usage-pt: 6px;
+  --mac-header-line-gap: 2px;
+  --mac-after-divider: 8px;
+  --mac-metric-gap: 7px;
+  --mac-metric-inner: 3px;
+  --mac-kv-gap: 8px;
+  --mac-kv-section: 4px;
+  --mac-dash-gap: 6px;
+  --mac-kpi-gap: 4px;
+  --mac-chart-h: 44px;
+  --mac-bar-h: 4px;
+  --mac-row-h: 20px;
+  --mac-menu-row-h: 20px;
+}
+.menu-surface--tray.menu-surface--compact.menu-surface--modern {
+  padding: 4px 0;
+}
+.menu-surface--tray.menu-surface--compact .menu-card__content {
+  gap: 8px;
+}
+.menu-surface--tray.menu-surface--compact .menu-metric__progress {
+  height: 5px;
+}
+.menu-surface--tray.menu-surface--compact .provider-grid--tabs .provider-grid__item {
+  min-height: 28px;
+  padding: 3px 1px 5px;
+}
+.menu-surface--tray.menu-surface--compact .provider-grid--tabs {
+  padding: 2px 6px 4px;
+}
+.menu-surface--tray.menu-surface--compact .menu-surface__footer-sep,
+.menu-surface--tray.menu-surface--compact .provider-grid__divider,
+.menu-surface--tray.menu-surface--compact .menu-stack__sep {
+  margin: 3px 12px;
+}
+.menu-surface--tray.menu-surface--compact .overview-spend {
+  padding: 6px 12px;
 }

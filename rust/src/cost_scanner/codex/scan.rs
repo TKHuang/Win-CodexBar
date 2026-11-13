@@ -1,10 +1,13 @@
 use super::cache_days::days_from_codex_source_rows;
 use super::*;
+use crate::codex_costs::codex_cache_sessions_in_range;
 use crate::core::{
     CodexSourceRowCache, CodexSourceUsageRow, read_source_rows, recover_rows, row_cache,
     row_cache_matches, row_cache_needs_recovery,
 };
-use chrono::Local;
+use crate::cost_reporting_period::cost_bucket_zone;
+use crate::providers::opencodego::local::codex_history;
+use chrono::{Local, NaiveDate};
 
 /// A complete, non-forked file whose source rows may be (re)priced this pass.
 struct CodexSourceRowPlan {
@@ -38,6 +41,14 @@ fn codex_source_row_plan(
     let recoverable_cache = cache
         .codex_source_rows
         .get(&path.to_string_lossy().to_string())
+        // Source rows are filtered to the reporting partition. Comparing a
+        // different window mistakes newly included history for lost pricing
+        // evidence and turns otherwise known models into unattributed usage.
+        // A changed partition must establish its evidence from the source;
+        // durable Priority trace evidence is applied separately below. The
+        // range is checked per entry: the cache-wide range keys describe the
+        // last completed scan, and a partial pass can replace entries first.
+        .filter(|cached| cached.was_read_for(scan_range))
         .filter(|cached| !cached.rows.is_empty() && row_cache_matches(path, &metadata, cached))
         .cloned();
     Some(CodexSourceRowPlan {
@@ -50,7 +61,12 @@ fn codex_source_row_plan(
 /// Apply a source-row plan: recover cached pricing when required, retain the
 /// resulting rows as evidence, and unprice the file's day map when recovery
 /// left appended rows unvalidated.
-fn apply_codex_source_row_plan(cache: &mut CostUsageCache, key: &str, plan: CodexSourceRowPlan) {
+fn apply_codex_source_row_plan(
+    cache: &mut CostUsageCache,
+    key: &str,
+    plan: CodexSourceRowPlan,
+    scan_range: &CostUsageDayRange,
+) {
     let CodexSourceRowPlan {
         metadata,
         source_rows,
@@ -65,9 +81,10 @@ fn apply_codex_source_row_plan(cache: &mut CostUsageCache, key: &str, plan: Code
     } else {
         source_rows
     };
-    let Some(source_cache) = row_cache(&key_path(key), &metadata, rows) else {
+    let Some(mut source_cache) = row_cache(&key_path(key), &metadata, rows) else {
         return;
     };
+    source_cache.record_scan_range(scan_range);
     if requires_recovery && let Some(usage) = cache.files.get_mut(key) {
         // Rebuild from recovered rows even when a new row is intentionally
         // unresolved. Leaving the normal parser's model-priced days in place
@@ -195,7 +212,6 @@ pub(super) fn scan_codex_detailed_with_cache(
 
     let cache_root = scanner.cache_root.as_deref();
     let mut cache = JsonlScanner::load_cache(ProviderId::Codex, cache_root);
-    let sessions_dirs = scanner.get_codex_sessions_dirs();
     let priority_metadata_key = codex_priority_metadata_key(scanner);
     let pending_scan = CodexPendingScanContext::new(
         &cache,
@@ -213,8 +229,9 @@ pub(super) fn scan_codex_detailed_with_cache(
     ) {
         let mut summary = paused_codex_summary(&cache, start_date, today, &range);
         append_pi_compatible_costs(scanner, &mut summary, cancel);
+        let opencode_complete = append_opencode_history(scanner, &mut summary, start_date, today);
         summary.history_coverage_established =
-            summary.history_coverage_established && !is_cancelled(cancel);
+            summary.history_coverage_established && !is_cancelled(cancel) && opencode_complete;
         summary.known_zero = summary.history_coverage_established && summary.sessions_count == 0;
         return (summary, stats, cache);
     }
@@ -245,22 +262,15 @@ pub(super) fn scan_codex_detailed_with_cache(
         summary.total_cost_usd += cost;
         // Session count is a display field; the cache holds far fewer files than u32::MAX.
         #[allow(clippy::cast_possible_truncation, reason = "cache file counts fit u32")]
-        let sessions_count = cache
-            .files
-            .values()
-            .filter(|usage| {
-                usage.days.keys().any(|day| {
-                    CostUsageDayRange::is_in_range(day, &range.since_key, &range.until_key)
-                })
-            })
-            .count() as u32;
+        let sessions_count = codex_cache_sessions_in_range(&cache, &range) as u32;
         summary.sessions_count = sessions_count;
 
         // Pi-compatible sessions are outside the Codex JSONL cache.
         // Skip when tests inject sessions roots — avoid scanning the real home tree.
         append_pi_compatible_costs(scanner, &mut summary, cancel);
+        let opencode_complete = append_opencode_history(scanner, &mut summary, start_date, today);
         summary.history_coverage_established =
-            cached_history_coverage_established && !is_cancelled(cancel);
+            cached_history_coverage_established && !is_cancelled(cancel) && opencode_complete;
         // Upstream 0.50.1 #2932: debounce cache hit with coverage
         // established but zero sessions in-range is a known-zero.
         summary.known_zero = summary.history_coverage_established && summary.sessions_count == 0;
@@ -407,14 +417,7 @@ pub(super) fn scan_codex_detailed_with_cache(
         pending_next.retain(|pending| pending != &key);
         let observed_size = fs::metadata(&candidate.path)
             .ok()
-            .map(|metadata| {
-                #[allow(
-                    clippy::cast_possible_wrap,
-                    reason = "file sizes are clamped to i64::MAX"
-                )]
-                let size = metadata.len().min(i64::MAX as u64) as i64;
-                size
-            })
+            .map(|metadata| file_len_i64(&metadata))
             .unwrap_or(0);
         let has_unconsumed_tail = cache
             .files
@@ -424,7 +427,7 @@ pub(super) fn scan_codex_detailed_with_cache(
             incomplete_processed.push(key);
             stats.files_deferred = stats.files_deferred.saturating_add(1);
         } else if let Some(plan) = codex_source_row_plan(&cache, &candidate.path, scan_range) {
-            apply_codex_source_row_plan(&mut cache, &key, plan);
+            apply_codex_source_row_plan(&mut cache, &key, plan, scan_range);
         }
     }
     unprocessed.extend(deferred_paths);
@@ -555,15 +558,7 @@ pub(super) fn scan_codex_detailed_with_cache(
     rebuilt.total_cost_usd += native_cost;
     #[allow(clippy::cast_possible_truncation, reason = "cache file counts fit u32")]
     {
-        rebuilt.sessions_count = summary_cache
-            .files
-            .values()
-            .filter(|usage| {
-                usage.days.keys().any(|day| {
-                    CostUsageDayRange::is_in_range(day, &range.since_key, &range.until_key)
-                })
-            })
-            .count() as u32;
+        rebuilt.sessions_count = codex_cache_sessions_in_range(&summary_cache, &range) as u32;
     }
     let cancelled_with_missing_cache_rows =
         is_cancelled(cancel) && cache.files.keys().any(|path| !Path::new(path).exists());
@@ -592,14 +587,16 @@ pub(super) fn scan_codex_detailed_with_cache(
     // Skip when tests inject sessions roots — avoid scanning the real home tree.
     // A16 --provider-native-only: skip pi/OMP mirrors when disabled.
     append_pi_compatible_costs(scanner, &mut summary, cancel);
+    let opencode_complete = append_opencode_history(scanner, &mut summary, start_date, today);
 
     // v0.56.1 #3279: only publish authoritative coverage after all
     // cancellable scan work, including Pi/OMP, has completed. Persistence
     // pruning may retain `previous_report`, but that must not make a
     // completed in-memory scan stale or make a cancelled partial scan look
     // complete.
-    summary.history_coverage_established =
-        !is_cancelled(cancel) && (!cache.codex_scan_incomplete || published_current_window);
+    summary.history_coverage_established = !is_cancelled(cancel)
+        && opencode_complete
+        && (!cache.codex_scan_incomplete || published_current_window);
     // Upstream 0.50.1 #2932: a completed scan with zero results is a
     // *known* zero. An incomplete scan may publish only a non-empty validated
     // current window; it must not infer zero from historical metadata alone.
@@ -608,6 +605,24 @@ pub(super) fn scan_codex_detailed_with_cache(
         && (!cache.codex_scan_incomplete || published_current_window);
 
     (summary, stats, cache)
+}
+
+/// Opt-in OpenCode history (upstream #4786). It belongs only to the ambient
+/// ledger: injected sessions roots and an explicit `CODEX_HOME` stay excluded.
+/// Returns false when the OpenCode database could not be read.
+fn append_opencode_history(
+    scanner: &CostScanner,
+    summary: &mut CostSummary,
+    start: NaiveDate,
+    end: NaiveDate,
+) -> bool {
+    if !scanner.options.include_opencode_history
+        || scanner.sessions_dirs_override.is_some()
+        || !codex_history::codex_home_is_ambient(std::env::var("CODEX_HOME").ok().as_deref())
+    {
+        return true;
+    }
+    codex_history::append_to_codex_summary(summary, cost_bucket_zone(), start, end)
 }
 
 fn append_pi_compatible_costs(

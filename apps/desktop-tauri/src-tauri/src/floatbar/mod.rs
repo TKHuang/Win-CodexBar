@@ -28,13 +28,7 @@ pub fn install(app: &tauri::AppHandle) {
     if persisted.float_bar_enabled {
         // Best-effort floatbar show on startup; a show failure is logged
         // by the window layer and is non-fatal to app setup.
-        let _show = window::show(
-            app,
-            persisted.float_bar_opacity,
-            &persisted.float_bar_orientation,
-            &persisted.float_bar_style,
-            persisted.float_bar_click_through,
-        );
+        let _show = window::show(app, &persisted);
     }
 }
 
@@ -85,13 +79,7 @@ pub fn toggle(app: &tauri::AppHandle) {
     if settings.float_bar_enabled {
         // Best-effort show; window::show logs its own failures and the
         // toggle is fire-and-forget from the tray.
-        let _show = window::show(
-            app,
-            settings.float_bar_opacity,
-            &settings.float_bar_orientation,
-            &settings.float_bar_style,
-            settings.float_bar_click_through,
-        );
+        let _show = window::show(app, &settings);
     } else {
         // Best-effort hide; a hide failure leaves the bar visible, which
         // the next toggle corrects — non-fatal.
@@ -105,13 +93,7 @@ pub fn toggle(app: &tauri::AppHandle) {
 pub fn apply_state(app: &tauri::AppHandle, settings: &Settings) {
     let open = app.get_webview_window(FLOATBAR_LABEL).is_some();
     if settings.float_bar_enabled && !open {
-        let _show = window::show(
-            app,
-            settings.float_bar_opacity,
-            &settings.float_bar_orientation,
-            &settings.float_bar_style,
-            settings.float_bar_click_through,
-        );
+        let _show = window::show(app, settings);
     } else if !settings.float_bar_enabled && open {
         let _hide = window::hide(app);
     } else if let Some(w) = app.get_webview_window(FLOATBAR_LABEL) {
@@ -140,6 +122,7 @@ pub struct SettingsPatch {
     pub dark_text: Option<bool>,
     pub show_reset_inline: Option<bool>,
     pub show_cost: Option<bool>,
+    pub show_weekly: Option<bool>,
 }
 
 impl SettingsPatch {
@@ -154,6 +137,7 @@ impl SettingsPatch {
             && self.dark_text.is_none()
             && self.show_reset_inline.is_none()
             && self.show_cost.is_none()
+            && self.show_weekly.is_none()
     }
 
     /// Apply this patch to a mutable `Settings`. Values are clamped and
@@ -188,6 +172,9 @@ impl SettingsPatch {
         }
         if let Some(v) = self.show_cost {
             settings.float_bar_show_cost = v;
+        }
+        if let Some(v) = self.show_weekly {
+            settings.float_bar_show_weekly = v;
         }
     }
 }
@@ -242,6 +229,7 @@ mod tests {
             style: Some("taskbar".into()),
             dark_text: Some(true),
             show_reset_inline: Some(true),
+            show_weekly: Some(true),
             ..SettingsPatch::default()
         };
         patch.apply(&mut s);
@@ -251,6 +239,7 @@ mod tests {
         assert_eq!(s.float_bar_style, "taskbar");
         assert!(s.float_bar_dark_text);
         assert!(s.float_bar_show_reset_inline);
+        assert!(s.float_bar_show_weekly);
         // Orientation untouched by the patch.
         assert_eq!(s.float_bar_orientation, "horizontal");
     }

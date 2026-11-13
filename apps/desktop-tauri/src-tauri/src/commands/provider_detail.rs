@@ -41,6 +41,12 @@ pub struct ProviderDetail {
     /// allowance (upstream 0.70.0 #4072). Offers the Monthly Plan metric in
     /// the settings metric picker.
     pub monthly_plan_window_id: Option<&'static str>,
+    /// Offers the Tokens/min metric in the settings metric picker (upstream
+    /// 0.75.0 #4495).
+    pub tokens_per_minute_metric: bool,
+    /// Provider-declared named extra allowances offered as menu bar metrics
+    /// (upstream 0.73.0 #4269), available before the first refresh.
+    pub named_extra_metrics: Vec<NamedExtraMetricOption>,
     /// Metric picker label for the primary lane when it is not a session
     /// window (upstream `menuBarLayoutPrimaryLabel`).
     pub primary_metric_label: Option<&'static str>,
@@ -84,6 +90,15 @@ pub struct ProviderDetail {
     pub manual_cookie_missing: bool,
 }
 
+/// A named extra allowance the settings metric picker can offer.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NamedExtraMetricOption {
+    /// Extra rate window id; the picker value is `extra:<id>`.
+    pub id: &'static str,
+    pub label: &'static str,
+}
+
 /// Same decision the refresh path makes in `build_fetch_context`, gated on the
 /// provider's fail-closed policy so opening the pane never triggers a browser
 /// cookie import.
@@ -119,7 +134,8 @@ pub(crate) fn build_provider_detail(
     let provider = instantiate_provider(id);
     let metadata = provider.metadata();
     let resume_supported = auto_resume_supported(id);
-    let dashboard_url = provider_dashboard_url(id, &settings);
+    // The cached plan label is merged in `get_provider_detail`.
+    let dashboard_url = provider_dashboard_url(id, &settings, None);
 
     let detail = ProviderDetail {
         id: id.cli_name().to_string(),
@@ -143,6 +159,15 @@ pub(crate) fn build_provider_detail(
         tertiary: None,
         tertiary_label_key: metadata.tertiary_label_key,
         monthly_plan_window_id: provider.monthly_plan_window_id(),
+        tokens_per_minute_metric: provider.reports_tokens_per_minute(),
+        named_extra_metrics: id
+            .named_extra_metrics()
+            .iter()
+            .map(|metric| NamedExtraMetricOption {
+                id: metric.id,
+                label: metric.label,
+            })
+            .collect(),
         primary_metric_label: provider.menu_bar_primary_label(),
         extra_rate_windows: Vec::new(),
         usage_items: Vec::new(),
@@ -201,6 +226,8 @@ pub fn get_provider_detail(
         detail.email = snapshot.account_email.clone();
         detail.plan = snapshot.plan_name.clone();
         detail.organization = snapshot.account_organization.clone();
+        detail.dashboard_url =
+            provider_dashboard_url(parsed_provider_id, &settings, snapshot.plan_name.as_deref());
         if parsed_provider_id == ProviderId::Helmcode {
             detail.dashboard_url = Some(
                 codexbar::providers::helmcode::dashboard_url_for_organization(
@@ -270,10 +297,22 @@ pub fn revoke_provider_credentials(
 
     let token_store = TokenAccountStore::new();
     let mut token_accounts = token_store.load().map_err(|e| e.to_string())?;
-    if token_accounts.remove(&id).is_some() {
+    let removed_accounts = token_accounts.remove(&id);
+    if removed_accounts.is_some() {
         token_store
             .save(&token_accounts)
             .map_err(|e| e.to_string())?;
+    }
+    let removed_ids: Vec<uuid::Uuid> = removed_accounts
+        .iter()
+        .flat_map(|data| data.accounts.iter().map(|account| account.id))
+        .collect();
+    forget_provider_accounts(&app, id, &removed_ids);
+
+    let mut settings = Settings::load();
+    if settings.management_api_token(id).is_some() {
+        settings.set_management_api_token(id, None);
+        settings.save().map_err(|e| e.to_string())?;
     }
 
     Ok(())
@@ -285,6 +324,9 @@ pub struct CredentialStorageStatusBridge {
     pub manual_cookies: String,
     pub api_keys: String,
     pub token_accounts: String,
+    /// Provider access tokens kept in `settings.json` (Vercel personal budget,
+    /// OpenRouter management key).
+    pub access_tokens: String,
 }
 
 pub(crate) fn credential_file_status_label(status: SecureFileStatus) -> String {
@@ -301,6 +343,23 @@ fn optional_credential_status(path: Option<std::path::PathBuf>) -> String {
         .unwrap_or_else(|| "unavailable".to_string())
 }
 
+/// Access tokens share `settings.json` with ordinary preferences, so the file
+/// existing says nothing about them; report its protection only while a token
+/// is actually stored.
+pub(crate) fn access_token_status(
+    settings: &Settings,
+    settings_file_status: impl FnOnce() -> String,
+) -> String {
+    let any_stored = ProviderId::all()
+        .iter()
+        .any(|id| settings.management_api_token(*id).is_some());
+    if any_stored {
+        settings_file_status()
+    } else {
+        "missing".to_string()
+    }
+}
+
 #[tauri::command]
 pub fn get_credential_storage_status() -> CredentialStorageStatusBridge {
     CredentialStorageStatusBridge {
@@ -309,5 +368,8 @@ pub fn get_credential_storage_status() -> CredentialStorageStatusBridge {
         token_accounts: credential_file_status_label(secure_file::status(
             &TokenAccountStore::default_path(),
         )),
+        access_tokens: access_token_status(&Settings::load(), || {
+            optional_credential_status(Settings::settings_path())
+        }),
     }
 }

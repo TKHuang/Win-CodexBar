@@ -1,44 +1,95 @@
-# Providers (Windows)
+# Providers
 
-Windows rewrite of the *role* of upstream `docs/providers.md`: how providers are registered and fetched in **this** repo.
-Do **not** treat upstream’s full strategy table as authoritative for Win-CodexBar without checking code — IDs and auto-order drift.
+This page explains how a provider is added and fetched in Win-CodexBar, how its usage windows and pace work, and what is special about individual providers. The upstream `docs/providers.md` describes the macOS app. Its ids and fallback order differ from this port, so check the code before you copy anything from it.
 
-## Single factory
+## Add a provider
 
-All shells and the CLI construct providers through:
+1. Add a `ProviderId` variant in `rust/src/core/provider/id.rs`, and its metadata row in `rust/src/core/provider/spec.rs`: `cli_name`, `display_name`, `from_cli_name` and, if it uses cookies, the cookie domain.
+2. Implement the `Provider` trait in `rust/src/providers/<name>/`.
+3. Add a match arm in `instantiate` in `rust/src/core/provider_factory.rs`.
+4. Add a match arm in `pace_capability` in the same file. Map the provider to its own `PACE_CAPABILITY`, or to `ProviderPaceCapability::UNSUPPORTED`. See [Pace](#pace).
 
-```text
-codexbar::core::instantiate_provider  →  rust/src/core/provider_factory.rs
-```
+Both matches are exhaustive, so a missing arm doesn't compile. A test checks that every id can be built.
 
-`ProviderId` lives in `rust/src/core/provider.rs`. The factory match is **exhaustive** (missing arm = compile error). Tests ensure every id instantiates.
+`ProviderId` lives in `rust/src/core/provider/id.rs`. Its names, aliases, brand color and metadata are one row in `rust/src/core/provider/spec.rs`. The factory match is **exhaustive** (a missing arm is a compile error). Tests make sure every id instantiates.
 
-**Never** duplicate provider factories in the Tauri shell or ad-hoc commands.
+Rules:
 
-## Adding a provider
+- `instantiate_provider` is the only provider factory. The desktop shell and the CLI both use it. Don't write another one.
+- Keep parsing, auth and display choices inside the provider module. Shared code has no `if provider == X` branches. When shared code needs a provider-specific answer, add a typed field or a trait method with a default, as `menu_bar_pace_lane` and `reset_regenerates` below do.
+- Keep identity, plan and email per provider. Never show one provider's account data on another provider's card or page.
 
-1. Add a `ProviderId` variant + `cli_name` / `display_name` / cookie domain / `from_cli_name` metadata as required.
-2. Implement `Provider` in `rust/src/providers/<name>/` (or module).
-3. Add the match arm in `provider_factory.rs::instantiate`.
-4. Keep provider-specific parsing and auth **inside** that module — no cross-provider branching in shared UI paths.
-5. Keep identity / plan / email **siloed** per provider in the UI.
+`ProviderId` has 109 variants. A fresh install enables only Claude and Codex. Kimi K2 and CrossModel are deprecated and stay hidden unless they are already enabled.
 
-## Fetch strategies (concept)
+## Fetch sources
 
-Same vocabulary as upstream, implemented in Rust:
+| Source | Meaning |
+| --- | --- |
+| `auto` | The provider's own fallback order |
+| `web` | Browser cookies or a pasted cookie against the provider's web dashboard |
+| `cli` | A local CLI, PTY or RPC helper |
+| `oauth` | An OAuth flow, where the provider supports it |
 
-| Source label | Meaning (typical) |
-|--------------|-------------------|
-| `auto` | Provider-specific fallback order |
-| `web` | Cookie / dashboard HTTP |
-| `cli` | Local CLI / PTY / RPC helpers |
-| `oauth` | OAuth-backed flows where supported |
+Pick one for a single CLI run with `codexbar usage --source <source>`. Most providers look for credentials in this order: the value saved in Settings, then the credential store, then environment variables. Each module sets its own order.
 
-CLI: `codexbar usage --source auto|web|cli|oauth`.
+## Usage windows
 
-Auth resolution helpers in `rust/src/providers/` commonly try: explicit settings → keyring/entry → environment variables (exact order is provider-specific).
+A provider returns its usage as rate windows (`RateWindow` in `rust/src/core/rate_window.rs`). The tray panel draws one metric row per window, with a bar, the reset time and, where it applies, a pace line.
 
-### Devin manual authentication
+- `window_minutes` is the window length: 300 for a five-hour session, 10080 for a week, 43200 as the 30-day sentinel for a monthly window. A window with no length gets no tray pace tint and, for some rows, no pace line.
+- `reset_regenerates` makes the card say "Regenerates in ..." instead of "Resets in ...", and hides the pace line for that window. Synthetic sets it on its regenerating lanes.
+- `hidden_on_card` keeps the window for the tray icon and float bar, but the card draws no row for it. LithosAI uses it for its balance.
+- `card_title_key` on `CostSnapshot` names the cost block. ClawRouter uses "Monthly budget" when the policy has a limit and "ClawRouter spend" when it doesn't. LithosAI uses "Credits".
+
+These three fields cross to the frontend only when a provider sets them. The CLI JSON doesn't change.
+
+`Provider::automatic_metric_absent_core_window_prefix()` names extra windows that stand in when a snapshot has no core quota lane (an informational primary and no secondary, model or tertiary lane). Automatic, and Session or Weekly when their lane is missing, then show the most constrained matching window instead of the placeholder. Claude returns `claude-weekly-scoped-`, so an account with only model-scoped weekly limits shows its scoped quota (upstream #4126). Its Daily Routines window and its spend cap never stand in.
+
+Claude reads `limits[]` entry by entry for both OAuth and Web (upstream #4614). A malformed entry or a field of the wrong type does not hide its valid model-scoped siblings, a non-object entry is skipped, and a JSON Boolean is never a percentage.
+
+A successful Claude Web answer with no quota window and no spend (Claude Free returns null `five_hour` and `seven_day`) shows the informational session row `Limits not available` instead of `No active 5h session` (upstream #4687). A prepaid balance or any measured lane keeps the existing presentation.
+
+Automatic ranks its candidate windows by depletion risk (`usage_metric.rs`, upstream #4491): an exhausted window first, then a window whose current pace runs out before its reset (the soonest first), then the highest used percentage. Equal ranks keep the earlier lane. The forecast needs authoritative pace (estimates never forecast), a window with its own length and reset, and at least 3% expected use, so a fresh window doesn't win on a noisy rate. The highest-usage tray icon ranks each provider's selected metric the same way; the forecast counts only when that provider's metric is Automatic. `Provider::automatic_metric_follows_lane_order()` opts out of the ranking for ordered tiers: the first exhausted core lane wins, otherwise the first reported lane. Gemini (Pro before Flash) and Kiro (plan credits before bonus credits) return `true`.
+
+`ProviderFetchResult::with_estimated_quota()` marks quota percentages that a provider computed locally instead of reading from the provider (upstream #4423). The bridge sends `quotaEstimated: true` only for such snapshots, and the tray then puts a `~` before the percentage in the percent icon, the tooltip and the provider status label. OpenCode Go sets it when its local SQLite estimate is shown; a console usage overlay clears it.
+
+## Pace
+
+Pace compares how much of a window you have used with how much of its time has passed. The card shows it as a line such as "10% in deficit · Runs out in 9d 8h". The shell scores it into seven stages, from `far_behind` to `far_ahead` (`commands/bridge/pace.rs`).
+
+- Session and weekly windows get pace from their length and their reset time.
+- **Work days** in Settings > Menu limits weekly pace to working days. When it is set from 2 to 6, a 10080-minute window counts only Monday up to that weekday as elapsed time. Day boundaries are local midnight. Automatic, 1 and 7 use plain elapsed time.
+- The card hides the pace line at 100% used. It also hides it unless at least 3% use is expected or the quota runs out now.
+
+### Reset-window pace for monthly and billing windows
+
+Some providers refill on a billing date instead of on a fixed session or week. Those providers opt in to reset-window pace. Each one declares a `PACE_CAPABILITY` constant in its own module (`rust/src/core/pace_capability.rs` defines the type). The rule says which windows get pace and whether a 30-day sentinel becomes the real calendar month that ends at the reset, so a February cycle scores as 28 days.
+
+| Provider | Windows that get pace | Uses the calendar month |
+| --- | --- | --- |
+| Copilot | any window with a reset date | when the window has no length |
+| Cursor | any window with a length | no |
+| Kimi | exactly 10080 minutes | no |
+| Codex | a window reported as exactly 43200 minutes (`limit_window_seconds: 2592000`, seen on Free plan responses) | no, the reported 30 days are kept |
+| Grok | a window labelled weekly whose reset falls inside it | no |
+| Z.ai | the 43200-minute MCP window | yes |
+| Amp | a window with a length whose reset text starts with "renews in " | no |
+| Alibaba, Alibaba Token Plan, Command Code, Doubao, Kiro, MiMo, StepFun, Notion, Ollama, OpenCode Go | exactly 43200 minutes, or the calendar month ending at the reset | yes |
+
+Every other provider is `UNSUPPORTED` and keeps only the session and weekly pace.
+
+### Tray pace tint
+
+With **Color Pace Indicator** on (`menu_bar_color_pace`, Settings > Menu Bar), a single-provider tray icon turns green when usage is behind pace and red when it is ahead. Stacked icons keep the usage color.
+
+The tint is scored on one window:
+
+- `Provider::menu_bar_pace_lane()` can name it. Codex returns its weekly lane and Abacus its primary lane.
+- For every other provider (`None`), it is the window the icon draws for the selected metric.
+
+The window must have a length, quota left and at least 3% expected use. Copilot's windows have no length, so Copilot never gets a tint.
+
+## Devin manual authentication
 
 On Windows, Devin uses a manually pasted Bearer token; Chrome-session import is
 not available. In Devin, open Developer Tools → Network, reload **Usage &
@@ -56,10 +107,8 @@ organization.
 
 ## Cookie-backed providers
 
-Windows browser import: Chrome Stable, Beta, Dev, Canary, Chrome for Testing, Chromium, Edge, Brave (DPAPI + AES-GCM), and Firefox (SQLite). Chrome channels are detected separately and keep distinct import choices.
-Settings → **Providers** → provider detail → choose browser → Import.  
-Manual cookie header paste is the fallback (required under WSL for Chromium DPAPI).  
-Details: [COOKIES.md](./COOKIES.md).
+Providers that read a web dashboard use cookies from a browser profile, or a cookie header you paste. Choose the browser for each provider in **Settings > Providers > (provider)**, then import. A pasted header is the fallback, and the only option under WSL. [COOKIES.md](./COOKIES.md#supported-browsers) lists the supported browsers.
+
 
 ### Venice web session
 
@@ -74,6 +123,24 @@ bundled-credit quota from the session token.
   again and refresh.
 - Manual mode needs a freshly pasted Cookie header from a signed-in
   `venice.ai` request; an old header fails with the expired-session message.
+
+### Command Code saved sessions
+
+Command Code keeps several labeled subscription sessions under **Session tokens**
+(upstream #4774). Paste a bare session token, a full Cookie header, or a cURL
+capture; a bare token gets the production session cookie name. A cURL capture
+must be a single line: the token command rejects multiline values with
+"Token must be a single line".
+
+- Saved sessions count only when the cookie source is **Manual**. In Auto the
+  selected session uses browser billing even when an API key is configured, and
+  a rejected session reports an error without trying a cached or browser
+  account.
+- The **API** usage source keeps saved sessions passive and uses the configured
+  key. Cookie source **Automatic** or **Off** also keeps them passive.
+- Unlike the Mac app, an empty Manual cookie source still falls back to browser
+  cookies, because Manual is the Windows default cookie source.
+
 ### Raycast credits
 
 Raycast reads the unofficial `frontend_api/current_user/ai_credits` route of
@@ -149,11 +216,15 @@ signed-in console at `https://console.lithosai.cloud` with both session cookies,
 - Requests, in order: `GET /api/me` (active organization, email), then
   `GET /api/billing` and `GET /api/billing/spend?start=YYYY-MM-01&end=YYYY-MM-DD`
   (UTC month to date), both with `X-Organization-Id`.
-- The card shows the prepaid USD balance (1 USD = 1,000,000,000 nanos) as a
-  "Prepaid credits" cost block and a **Billing** section: Balance, Payment card,
-  Account status, Today (UTC) and This month (UTC). There is no quota bar. A
-  negative balance has no cost block and stays visible as, for example,
-  "Balance: -$1.00" in the primary line and the Balance row.
+- The prepaid USD balance (1 USD = 1,000,000,000 nanos) shows twice on the
+  detailed card, as on the Mac. First comes a **Billing** section: Balance,
+  Payment card, Account status, Today (UTC) and This month (UTC). Then comes a
+  cost block titled **Credits** that reads, for example, "Balance: $42.37".
+  There is no quota bar. The balance window is `hidden_on_card`, so it feeds
+  the tray and float bar without drawing a card row.
+- The compact Overview shows the Billing rows once and no Credits block.
+- A negative balance has no cost block. It shows in the Balance row, for
+  example "-$1.00".
 - A spend report that fails or does not parse shows "Spend: Unavailable" and
   keeps the balance; a 401 anywhere rejects that session, and an expired
   session is reported once no candidate is left.
@@ -232,9 +303,19 @@ Plans & usage page (`https://www.workbuddy.cn/profile/plans-usage`) uses:
   major. Without a Chrome version no User-Agent is sent, which WorkBuddy
   usually rejects as an expired session, so cookies should come from Chrome.
 - The card shows the credits meter with "X / Y credits left", the plan name,
-  reserved (frozen) credits, and the cycle reset from the paid and free
-  package listings (cycle ends are China Standard Time; the listings share a
-  5-second budget and a failed listing only drops the reset).
+  reserved (frozen) credits, and the cycle reset (cycle ends are China
+  Standard Time; the listings share a 5-second budget and a failed listing
+  only drops the reset).
+- The reset follows the paid subscription cycle: the earliest future cycle
+  end in the paid package listing. The free listing is queried only when the
+  paid listing has no future end, so a trial grant that closes with the
+  calendar month cannot shorten a paid cycle. Reward and purchased credits
+  that end earlier are not reflected, so the balance can drop before the
+  reset.
+- The icon is a monochrome version of the mascot from WorkBuddy's
+  [official logo](https://assets.workbuddy.cn/web/workbuddy/a5b2fb510f0e7b156f19d072fae0cd12ae1f2f19/assets/logo.svg),
+  in the app and in the `codexbar serve` dashboard. The `#0DC8A6` accent is
+  unchanged.
 - HTTP 401 on every User-Agent moves on to the next browser session and is
   reported as an expired session at the end, unless Automatic could not read
   a browser (for example Chrome behind App-Bound Encryption): then that read
@@ -331,6 +412,11 @@ Synthetic (or `SYNTHETIC_API_KEY`); the CLI also accepts `synthetic.new`.
   "76% after next regen · Full in ~3 regens". The weekly lane does the same
   when it carries `maxCredits` and `nextRegenCredits`. Like the Mac card, no
   weekly USD cost is shown (on the card or in CLI JSON).
+- Regenerating lanes keep their length (300 and 10080 minutes) and set
+  `reset_regenerates`. The card counts them down as "Regenerates in 45m"
+  instead of "Resets in", always as a relative time, and shows no pace line
+  for them. Plain lanes keep "Resets in". The tray pace tint still scores a
+  regenerating lane.
 - The plan name (`plan`, `planName`, `tier`, ...) is shown as the plan.
 - 401 and 403 report "Invalid Synthetic API credentials."; response bodies are
   never echoed in errors.
@@ -389,7 +475,9 @@ Configure the API key in Settings → Providers → Tavily (or `TAVILY_API_KEY`)
   usage percentage. Remaining credits are the nonnegative difference between
   reported cap and usage.
 - Pay-as-you-go totals, when present (`account.paygo_usage` and
-  `account.paygo_limit`), appear in a separate detail section.
+  `account.paygo_limit`), appear in a separate detail section. A null
+  pay-as-you-go limit leaves the cap unspecified: the section shows only the
+  reported usage, with no Limit or Remaining row.
 - The plan name (`account.current_plan`) identifies the account plan. No email
   or account ID is inferred; unknown plans do not create a phantom identity.
 - Non-200 responses report "Tavily returned HTTP <status>."; response bodies
@@ -429,8 +517,10 @@ credentials, a query or a fragment are rejected before the key is read.
 Redirects are never followed and response bodies are never echoed in errors.
 
 - The primary lane is the monthly budget (spent / limit), resetting on the
-  first day of the next month (UTC). The cost line shows this month's spend
-  against the limit.
+  first day of the next month (UTC). The cost block is titled "Monthly budget"
+  and shows this month's spend against the limit. Without a positive limit it
+  is titled "ClawRouter spend". Both titles stay in English in every language,
+  as on the Mac.
 - Details show requests, tokens, actual cost, the budget ledger and the
   monthly budget, then up to 20 routed providers ordered by spend and
   requests.
@@ -573,6 +663,303 @@ permission on the workspace; 404 reports an unknown workspace ID; other HTTP
 errors report their status. A response without a finite `available_cost` is
 reported as unrecognized. Response bodies are never echoed in errors.
 
+### Future AGI
+
+Future AGI is disabled by default. It needs both an **API key** and a **secret
+key**. In Settings → Providers → Future AGI, enter `API_KEY:SECRET_KEY` (split at
+the first colon), or enter only the API key and set `FI_SECRET_KEY`. Without a
+saved key the provider reads `FI_API_KEY` and `FI_SECRET_KEY`. A half saved in
+Settings overrides its environment variable. Surrounding whitespace and one pair
+of wrapping quotes are removed from each half. Upstream has two separate fields;
+Win-CodexBar has one API key slot per provider, so both halves share it. Neither
+key is written to logs, and a missing half fails before any request.
+
+The provider makes one read-only request:
+
+```text
+GET https://api.futureagi.com/usage/v2/usage-overview/
+X-Api-Key: <API key>
+X-Secret-Key: <secret key>
+```
+
+- The response must have `status: true` and a `result` object with 1 to 16
+  `dimensions`, a `billing_period_start` before `billing_period_end` (dates as
+  `YYYY-MM-DD`, read as UTC midnight, or ISO 8601 timestamps with an offset) and
+  a `total_estimated_cost`.
+- Each dimension needs a unique `key`, a `display_name` and `display_unit` (at
+  most 120 characters), and `current_usage` / `free_allowance` as non-negative
+  JSON numbers. Numeric strings are rejected so malformed usage never reads as
+  zero.
+- The **Used / free allowance** section has one row per dimension:
+  `used / allowance unit`, for example `500 / 2,000 credits`.
+- The **Billing period** section shows **Estimated usage cost** in USD.
+- The primary window is `ai_credits` and the secondary window is
+  `gateway_requests`, each as usage against a positive free allowance (clamped
+  to 100%), spanning the billing period and resetting at its end. A meter with a
+  zero allowance keeps its row but has no bar.
+- `plan_display_name` is shown as the plan. There is no cost summary.
+- 401 and 403 report that authentication is required; 429 reports that usage
+  requests are rate limited; other non-200 responses report
+  `Future AGI returned HTTP <status>.` Anything else unexpected reports
+  `Future AGI returned an unrecognized usage overview.` Response bodies are
+  never echoed in errors.
+
+### Munito
+
+Munito is disabled by default. In Settings → Providers → Munito, enter an
+**admin API key** with the "Read account data" (Admin API) permission, or set
+`MUNITO_API_KEY` (`MUNITO_ADMIN_KEY` is also read). Surrounding whitespace and
+one pair of wrapping quotes are removed. Create keys at
+[console.munito.ai/keys](https://console.munito.ai/keys). The key is stored with
+the other API keys and is never written to logs.
+
+The provider makes two read-only requests at the same time:
+
+```text
+GET https://api.munito.ai/admin/v1/limits
+GET https://api.munito.ai/admin/v1/organization
+Authorization: Bearer <admin API key>
+```
+
+The organization read is best effort. When it fails or returns something other
+than a JSON object, the spend limits still show and only the organization rows
+and name are missing.
+
+- `periods` entries with `period` `day` and `month` become the **Today** and
+  **This month** rows in the **Spend limits** section. Other periods are
+  ignored. A row shows `$spent of $limit` with a progress bar when `limit_usd`
+  is positive, otherwise only the spend.
+- **Today organization limit** / **Today account limit** (and the monthly
+  equivalents) appear when that cap is positive and differs from `limit_usd`.
+  **Today stopped until** / **This month stopped until** show `stopped_until`
+  in UTC; the daily and monthly stops stay separate.
+- **Usage tier** comes from the limits response, or else from the organization.
+- The **Organization** section shows **Status** and **Data region**. The
+  organization `name` is shown as the account organization. The provider reports
+  identity as "Admin API key".
+- The primary window is today's spend against a positive daily limit (one-day
+  window); the secondary window is this month's spend against a positive monthly
+  limit. Cost uses this month's spend and limit, or today's when no month period
+  is reported. With no periods, the card shows only the identity and the rows.
+- 401 reports that authentication is required; 403 reports that the key needs
+  the "Read account data" permission; 429 reports that API requests are rate
+  limited; other HTTP errors report `Munito returned HTTP <status>.` Amounts
+  must be non-negative numbers or numeric strings, and `stopped_until` must be
+  an ISO 8601 timestamp; anything else fails parsing. Response bodies are never
+  echoed in errors.
+
+### Soniox
+
+Soniox is disabled by default. In Settings → Providers → Soniox, enter an
+**organization API key** with the "Balance and spend" and "Usage and limits"
+permissions, or set `SONIOX_ORG_API_KEY`. Project API keys cannot read
+organization billing. Create keys in the
+[organization API guide](https://soniox.com/docs/guides/organization-api#organization-api-keys).
+The key is stored with the other API keys and is never written to logs.
+
+For proof runs and fake servers, `SONIOX_BASE_URL` replaces the organization API
+base (default `https://api.soniox.com/v1/organization`). It accepts `https://`,
+or `http://` only for a loopback host (`127.0.0.1`, `localhost`, `[::1]`), with
+no credentials, query, or fragment. The path must end in `/v1/organization`.
+Any other value, including a blank one, is ignored with a warning.
+
+The provider makes two read-only requests in order. Refresh never submits
+transcription or synthesis work:
+
+```text
+GET https://api.soniox.com/v1/organization/balance
+GET https://api.soniox.com/v1/organization/usage/monthly
+Authorization: Bearer <organization API key>
+```
+
+- The **Spend** section shows **Monthly budget** as `$used of $budget` with a
+  progress bar when the budget is positive. The budget meter itself is hidden on
+  the card and only feeds the tray and float-bar percentages. Upstream hides it
+  from the card by default; Windows has no default-hidden usage item, so the
+  card shows the same numbers as this Spend detail row instead.
+- The **Billing** section shows **Prepaid** or **Invoice billing** (value `USD`).
+  With a zero budget it also shows **Monthly budget** as `$0.00`, and no progress
+  bar or percentage.
+- Cost is this month's spend against the budget, reset at the start of the next
+  UTC month. Prepaid accounts also report the remaining balance. Invoice billing
+  accounts omit the balance so a zero prepaid amount is not shown as exhausted
+  credits. A negative prepaid balance is accepted but not shown.
+- 401 reports that authentication is required. 403 reports that the key needs
+  organization permissions. 429 reports rate limiting. Other HTTP errors report
+  the status. Amounts must be plain decimal strings, `month` must be `YYYY-MM`,
+  and `invoice_billing_enabled` must be a boolean; anything else fails parsing.
+  Response bodies are never echoed in errors.
+
+### Claude Platform
+
+Claude Platform is disabled by default and shows the prepaid API credits of a
+Claude Console (platform.claude.com) organization, including the monthly API
+credit that Max plans include. It is separate from the Claude
+provider: it never reads Claude's cookies, OAuth credentials, plan or email.
+Sign in to platform.claude.com in your browser, and CodexBar uses that
+session's `sessionKey` cookie.
+
+- **Automatic:** A previously imported Cookie header is used on its own.
+  Otherwise CodexBar tries each detected browser holding a platform.claude.com
+  `sessionKey`. If the Console rejects a session (401 or 403), it moves to the
+  next browser. No session means sign in to platform.claude.com.
+- **Manual:** Paste the Cookie header from a platform.claude.com request. It
+  must contain `sessionKey`. Manual mode does not fall back to browser sessions.
+- **Off:** Cookies are disabled.
+
+The provider makes up to three read-only requests:
+
+```text
+GET https://platform.claude.com/api/organizations
+GET https://platform.claude.com/api/organizations/<uuid>/prepaid/credits
+GET https://platform.claude.com/api/organizations/<uuid>/current_spend
+```
+
+- Only organizations whose `capabilities` include `api` are used; Claude.ai chat
+  organizations are skipped. The first API organization whose billing the member
+  can read wins (a 403 moves to the next one). An account without an API
+  organization reports that, and every organization answering 403 reports that
+  billing access was denied.
+- The **API credit** lane is the soonest-expiring `subscription_api_credit` grant
+  that still has credit. The **Purchased credit** lane is the soonest-expiring
+  purchased grant that still has credit, falling back to the first purchased
+  grant when all are spent. Each lane shows used percent and a detail such as
+  `$124.75 of $200.00 left · Expires Oct 28 (UTC)`. Expiry dates are UTC calendar
+  dates; the year is added when it is not the current year.
+- Other unexpired grants appear in **Other credit grants** with their own
+  progress. Expired grants (expiry at or before now) are dropped. A malformed
+  expiry is treated as unknown.
+- The credit balance shows in the card's Credits block as prepaid credits.
+  Amounts use the reported currency and credit exponent (0 to 4, default 2).
+- **Billing → This month (UTC)** shows month-to-date spend. Spend is optional:
+  any failure shows "Spend: Unavailable" and keeps the balance.
+- The provider reports identity as "Console session" and the Console
+  organization name. It never reports an email.
+- A missing, non-integer, or out-of-range balance fails parsing instead of
+  showing $0. 429 reports rate limiting and 5xx reports the Console as
+  unavailable. Response bodies are never echoed in errors.
+
+### Trae CN
+
+Trae CN is disabled by default and shows the credit allowance of a Trae CN
+(trae.cn) account. Sign in to trae.cn in your browser, and CodexBar uses that
+session.
+
+- **Automatic:** Trae keeps its session cookies on the parent `trae.cn` domain,
+  so CodexBar reads the `trae.cn` cookies and sends only the ones a browser
+  would send to `api.trae.cn`. It tries each detected browser holding such a
+  session. If Trae rejects a session (401, 403 or a redirect), it moves to the
+  next browser. No session means sign in to trae.cn.
+- **Manual:** Paste the Cookie header from an api.trae.cn request. Manual mode
+  does not fall back to browser sessions.
+- **Off:** Cookies are disabled.
+
+The provider makes two read-only POST requests per session and never makes a
+billable call:
+
+```text
+POST https://api.trae.cn/cloudide/api/v3/common/GetUserToken
+POST https://api.trae.cn/trae/api/v2/pay/user_current_entitlement_list
+```
+
+- The token from `GetUserToken` lives only for one refresh and is sent only to
+  api.trae.cn as a `Cloud-IDE-JWT` authorization header.
+- The gauge is consumed over total credits. A zero allowance shows the details
+  without a gauge. Used, Total and Remaining appear in the **Credits** section.
+- The gauge is labeled **Usage** and the Used / Total / Remaining block
+  **Credits**, so the two never share a name. The visibility IDs are
+  unchanged, so saved hidden choices keep working.
+- The plan name comes from the active plan entitlement and is shown as the
+  login method. Pack expiry dates do not set a reset: the provider infers no
+  renewal or reset date.
+- Malformed responses (no `is_credits_billing`, non-numeric or negative amounts,
+  or no token) fail parsing instead of showing zero usage. 429 reports rate
+  limiting, 408 and 5xx report the service as unavailable, and response bodies
+  are never echoed in errors.
+- For proof runs and fake servers, `TRAE_CN_BASE_URL` replaces the API origin
+  (default `https://api.trae.cn`). It accepts `https://`, or `http://` only for a
+  loopback host (`127.0.0.1`, `localhost`, `[::1]`), with no credentials, query,
+  or fragment. Any other value is ignored with a warning.
+
+### Chatbox AI
+
+Chatbox AI is disabled by default. In Settings → Providers → Chatbox AI, paste
+your Chatbox **license key** into the API key field, or set
+`CHATBOX_LICENSE_KEY`; the saved key wins. Signing in to the Chatbox app does
+not configure this provider, and CodexBar never reads the Chatbox desktop
+profile or activates a license. Keep the key private: it can authorize AI
+requests as well as quota reads. It is never written to logs or errors.
+
+The provider makes one read-only request per refresh and never makes a
+billable call:
+
+```text
+GET https://api.chatboxai.app/api/license/detail/realtime
+Authorization: <license key>
+Cache-Control: no-store
+```
+
+The key is sent as is, without a `Bearer` prefix, as Chatbox's public client
+does. A key longer than 4096 characters or with spaces or control characters is
+rejected before any request.
+
+- The **Remaining** section shows `remaining / total` counts: **Plan** (the
+  `plan` item of `unified_token_usage_details`), **Quota** (the combined
+  `unified_token_usage` / `unified_token_limit`, only when there is no plan
+  pool), **Credits** (`aggregated_reward_details`, or the unexpired non-plan
+  detail items), **Top-up credits** (`expansion_pack_*`) and **Image
+  Generation** (`image_*`). These are compute points and image counts, not
+  money. Empty pools are hidden; exhausted pools stay. If every allowance is
+  zero, the section shows `Quota 0 / 0`.
+- The **Plan** meter is the primary window, only for a positive plan whose
+  status is absent or `active` and that has not expired. Its reset is
+  `token_next_refresh_time` when that is in the future and before the plan
+  expiry. Other pools never inherit it. **Top-up credits** with a positive
+  limit is the secondary window, with no reset.
+- The license `name` is the plan label. `token_expire_time` (or `expires_at`)
+  is the subscription expiry.
+- 401 reports an invalid key and asks for a new one. 403 reports denied access,
+  429 rate limiting, and other statuses a failed request, each with its HTTP
+  status. A body that is not the expected JSON envelope, an `error` member,
+  negative, fractional or non-numeric counters, or a duplicate plan item fail
+  parsing. Response bodies are never echoed in errors.
+- For proof runs and fake servers, `CHATBOX_BASE_URL` replaces the API origin
+  (default `https://api.chatboxai.app`). It accepts `https://`, or `http://`
+  only for a loopback host (`127.0.0.1`, `localhost`, `[::1]`), with no
+  credentials, query, or fragment. Any other value is ignored with a warning.
+
+### abliteration.ai
+
+abliteration.ai is disabled by default. In Settings → Providers →
+abliteration.ai, enter your **API key**, or set `ABLITERATION_API_KEY`; the
+saved key wins. The key is stored with the other API keys and is never written
+to logs or errors.
+
+The provider makes one non-billable request per refresh. It never sends
+inference requests, imports browser cookies, or starts a login flow:
+
+```text
+GET https://api.abliteration.ai/v1/credits
+Authorization: Bearer <API key>
+```
+
+The response contract is `{"data":{"total_credits":50.0,"total_usage":0.010637}}`;
+both counters are USD.
+
+- The **Credits** meter is the primary window: used / total dollars (for
+  example `$0.01 / $50.00`), capped at 100% when overspent. It has no reset
+  date and no pace, because the counters are cumulative.
+- The **Credits** section shows **Balance** (total minus usage, floored at
+  zero), **Credits used** and **Total credits**. Overspent accounts keep the
+  reported spend. With zero total credits the dollar rows stay and the meter is
+  hidden, so no percentage is invented. The Mac plugin labels the total row
+  **Credits**; the Windows port says **Total credits** so it does not share a
+  name with the meter in Settings → Visible usage items.
+- Card bars use the label color, as on the Mac (`progressColorStyle: .label`).
+- Missing, negative, non-numeric or non-finite counters fail parsing. 401 and
+  403 ask you to check the API key in Settings, 429 reports rate limiting, and
+  any other status reports a failed request. Response bodies are never echoed
+  in errors.
 ### Aerostack
 
 Aerostack is disabled by default. In Settings → Providers → Aerostack, enter an
@@ -635,7 +1022,135 @@ Origin: https://app.cosmicjs.com
 - 401, 403, and 429 report their status; response bodies are never echoed in
   errors.
 
-## Listing what is enabled
+### Vercel AI Gateway
+
+By default the card shows the team's AI Gateway balance and lifetime spend. It
+reads `GET https://ai-gateway.vercel.sh/v1/credits` with `AI_GATEWAY_API_KEY`
+(or the key saved in Settings) and reports no quota percentage.
+
+The personal budget is opt-in and off until you add a Vercel access token. In
+Settings → Providers → Vercel, enter the **Access token** and the **Team ID**, or
+set `VERCEL_ACCESS_TOKEN` and `VERCEL_TEAM_ID`. The token is stored with the
+provider's secret settings, like the OpenRouter management key, is redacted from
+config dumps and is never logged. The Team ID is stored in the provider's
+workspace slot and is validated before any request. Clearing the token returns
+the card to team credits.
+
+With a token, the provider makes these read-only requests to `api.vercel.com`:
+
+```text
+GET https://api.vercel.com/v2/user
+GET https://api.vercel.com/ai-gateway/budgets/list?teamId=<team>&scopeType=user&limit=200&cursor=<next>
+Authorization: Bearer <access token>
+```
+
+- The budget list is followed by its cursor for at most 20 pages. A repeated
+  cursor or a page limit reached before the list ends fails the refresh.
+- A budget applies to the token's user when its scope ID is the user's ID or
+  the `usr_`-prefixed form. A custom budget wins over an inherited default. Two
+  budgets that both apply are ambiguous and fail the refresh.
+- With no applicable budget, the card shows "No personal budget configured",
+  not zero spend.
+- The primary window shows spend as a share of the limit. Rows under
+  **Personal budget** show Spend, Limit and Remaining (never below zero).
+- Daily, weekly and monthly budgets reset at UTC boundaries: midnight UTC each
+  day, Monday 00:00 UTC each week, and the first day of the month at 00:00 UTC.
+  A `none` budget is cumulative and has no reset.
+
+The access token is sent only to `api.vercel.com`. The AI Gateway key is sent
+only to `ai-gateway.vercel.sh`.
+
+Status handling differs by request:
+
+- `/v2/user`: 401 means Vercel did not accept the token, so the card asks you
+  to check or replace it. 403 is returned both for a bogus token and for a
+  scoped token without the `user` permission, so the card asks you to check the
+  token's scope or replace it.
+- `/ai-gateway/budgets/list`: 401 asks you to check the token. 403 means the
+  token's user needs a non-Contributor role on the team to read budgets.
+- 429 and 5xx report their status on either request.
+
+A token without a Team ID fails with a message that asks for one. Response
+bodies are never echoed in errors.
+
+## Grok
+
+Grok reads its usage from the Grok CLI login in `~/.grok/auth.json`, a saved
+account row, a token account, or a browser session. A bearer login tries these
+sources in order and stops at the first one that answers:
+
+1. Credits proxy: `GET https://cli-chat-proxy.grok.com/v1/billing?format=credits`
+   with the login's bearer token. If the answer has no quota percent, grok.com
+   gRPC-web may supply one within 6 seconds.
+2. grok.com gRPC-web billing (`POST .../GetGrokCreditsConfig`), used when the
+   proxy fails.
+3. Grok CLI ACP billing, a fallback that runs only when 1 and 2 both fail.
+
+The ACP fallback (upstream #4595) runs only for the ambient Grok CLI login. It
+also runs when that login is missing (no `~/.grok/auth.json` or no Cli entry) or
+expired, since the installed CLI may hold its own valid session. In that case
+there is no CodexBar token, so the answer has no account identity and no
+reset-credit lookup. If ACP also fails, the original login error is shown, not
+an ACP error. It never runs for an isolated token account, a saved account row,
+or an OAuth principal, so it can never read a different account's usage:
+
+- The installed `grok agent stdio` is found the same way as the login flow: the
+  native `~/.grok/bin/grok.exe` first, then `PATH`. It is started with no console
+  window and its stderr discarded. Requests are newline-delimited JSON-RPC 2.0 on
+  stdin and stdout.
+- While waiting for a reply, the client skips non-JSON lines, notifications, and
+  any message with a `method`, even when its `id` matches. Those are requests
+  from the server, not replies.
+- `initialize` is sent first with `protocolVersion` `"1"` and filesystem and
+  terminal capabilities off, with a 4-second budget. Then `_x.ai/billing` is
+  sent with empty params, with a 3-second budget. The method name is written
+  literally, without a `\/` escape.
+- The child is killed after every call, including on timeout. It is never left
+  running.
+- A current result has the nested `config` credits shape, read by the same
+  parser as the credits proxy. A top-level `subscription_tier` names the plan
+  and overrides `config.subscriptionTier`. The older top-level shape with
+  `monthlyLimit` and `usage.totalUsed` is still read.
+- A prepaid balance counts as an answer without a quota percent. A result with
+  neither a percent nor a balance is unavailable.
+- When the ACP answer from a bearer login has no quota percent, grok.com gets
+  the same bounded 6-second retry as the credits proxy (upstream #4679). Only a
+  wire-published percent or a validated zero is adopted, and the ACP period,
+  plan and balance stay. Expired or slow enrichment keeps usage unknown. A
+  missing or expired login has no bearer to send, so this retry does not run.
+- A JSON-RPC `-32601` error means this CLI does not provide billing over ACP.
+  An error that says authentication is required, or mentions `grok login`, is
+  an auth failure. In both cases the bearer path's original error is shown, so
+  auto mode continues to its next source as before.
+- Not ported: upstream's team-principal diagnostic, which turns a `-32601`
+  answer for a team login into an identity-only row with an unsupported-team
+  usage message. On Windows that case shows the original error.
+
+## Antigravity Gemini quota summary
+
+The Antigravity quota summary picks one Gemini row for the primary and secondary windows (upstream #4659).
+
+- The ordinary Gemini buckets win: `gemini-5h` (or a session alias such as `gemini-session`) and `gemini-weekly`. Their IDs are matched after lowercasing, with `_` read as `-` and a trailing ` limit` ignored. Display labels never decide this.
+- A model-specific Gemini allowance, such as `gemini-2.5-pro-5h`, represents Gemini only when the ordinary bucket of that cadence is absent, unknown or disabled.
+- Every bucket stays visible as an extra window with its own usage and reset.
+- A group named like "Gemini" with no digit is shown as **Gemini** (for example **Gemini weekly**). A versioned Gemini group keeps its own name from the usage response, so a separate Gemini 4 Argon group is shown as **Gemini 4 Argon weekly**, alongside the ordinary **Gemini weekly** quota (upstream #4585).
+
+## Window lengths that match the Mac
+
+These providers set window lengths so their rows get the same pace as in the Mac app, and the tray tint can score them. Where the stored length differs from the Mac's, the row says so:
+
+| Provider | Window | Length |
+| --- | --- | --- |
+| Codebuff | Weekly lane | 10080 minutes. The Credits lane has no length. |
+| MiniMax | Services rows from the coding-plan page | From the row's window type, for example 300 for 5 hours and 10080 for Weekly |
+| MiniMax | Remains weekly rows | Always 10080 minutes, even without a start and end |
+| Synthetic | Regenerating five-hour and weekly lanes | 300 and 10080 minutes, from the payload |
+| Grok | Credits proxy period | Kept after the period ends. An ended period has no pace. |
+| Z.ai | `TIME_LIMIT` windows | From the unit: 1 = 1440, 3 = 60, 5 = 1, 6 = 10080 minutes per unit. The monthly MCP marker keeps the 30-day sentinel. |
+| Notion | Billing lane | Labelled "Monthly". Other monthly lanes keep the "30-Day" label. |
+| Kiro | Plan credits lane | The real calendar month ending at the reset (CLI `resets on MM/DD` or the API `nextDateReset`), 28 to 31 days. The Mac stores the 43200-minute sentinel and resolves it to the same month, so the pace is identical. No reset means no length and no pace; an expired reset gives no pace. Bonus and overage lanes get no pace. |
+
+## See what is enabled
 
 ```powershell
 codexbar config providers
@@ -643,61 +1158,187 @@ codexbar config enable -p cursor
 codexbar config disable -p cursor
 ```
 
-Desktop: Settings → Providers (sidebar reorder, per-provider credential UI).
+In the app, use **Settings > Providers**. The sidebar can reorder and toggle providers, and each provider page holds its credentials. See [CONFIGURATION.md](./CONFIGURATION.md#provider-list-in-the-sidebar).
 
 ## Status pages
 
-Optional status polling (provider status pages) is available via CLI `--status` and Settings advanced toggles where wired. Mapping of Statuspage vs Google incidents is provider metadata in code — see provider modules rather than upstream-only URLs if they disagree.
+The app polls provider status pages while **Settings > General > Check provider status** (`status_checks_enabled`, on by default) is on. A full provider refresh starts a status poll for the enabled providers that have a status source. The auto-resume probe (Windows-only, 60-second exact-session watcher) does not poll status. Unforced refreshes skip a provider whose last poll started less than 30 seconds ago; forced refreshes (manual, menu open, settings toggle) always poll. One fetch times out after 10 seconds and the whole poll after 15 seconds. A failed fetch keeps the last good status.
+
+Where the status shows:
+
+- **Settings sidebar.** For a provider with a status source, a service dot replaces the fetch-status dot: green for operational, yellow for a partial outage, orange for a major outage, red for a critical issue, gray for maintenance or unknown (also before the first poll). The tooltip reads "Provider service status: ..." with the label.
+- **Tray panel.** While the selected provider has an incident, the menu shows one extra line under the provider actions: the feed's description (or the status label) and when the feed was updated.
+- **Tray icon tooltip.** Each enabled provider with an incident adds a `Provider: label` line under the tooltip title.
+
+The status source per provider is set by `status_source` in `rust/src/status/mod.rs`:
+
+| Source | Providers |
+| --- | --- |
+| Statuspage (`/api/v2/status.json`) | Claude and Claude Platform (status.claude.com), Codex and OpenAI API (status.openai.com), Copilot (githubstatus.com), Cursor, Factory, Augment, Hugging Face, ZoomMate (zoomstatus.com) |
+| Google Workspace incident feed | Gemini, Antigravity |
+
+Other providers have no status source, so they keep the fetch-status dot and never add an incident line.
+
+`codexbar usage --status` fetches the same sources from the CLI and adds them to the output. In JSON, `status.level` holds: `operational`, `degraded` (raw `minor`), `major` (raw `major` or `critical`), or `unknown` (raw `maintenance` or `unknown`). When this table and the code disagree, the code wins.
 
 ## Usage & Spend
 
-Desktop tab id: `usageSpend`. The desktop and Overview consume one shared spend catalog. Codex and Claude local logs are first-class; routed OpenCodex usage enriches the matching Codex, OpenCode Go, Kimi, or DeepSeek subscription instead of appearing as a second fake provider. xAI and OpenRouter can publish exact provider-metered daily USD spend when their management credentials are configured, while Grok local sessions contribute tokens only (the scan covers exactly the requested number of local calendar days, including today). Missing spend sources remain unknown rather than becoming a false `$0`. Do not invent cross-currency totals.
+The Settings pane id is `usageSpend`. The pane and the Overview read one shared spend catalog.
+
+- Codex and Claude local logs are first-class sources.
+- Routed OpenCodex usage is added to the matching Codex, OpenCode Go, Kimi or DeepSeek subscription. It doesn't appear as a separate provider.
+- xAI and OpenRouter can report exact daily USD spend from the provider when their management credentials are set.
+- Grok local sessions add tokens only. The scan covers exactly the requested number of local calendar days, including today.
+- A missing spend source stays unknown. It never shows as `$0`.
+- Totals are never converted across currencies.
+
+### Claude local cost history
+
+Claude local cost reads Claude transcript `.jsonl` files and prices assistant responses.
+
+- The default history, with `CLAUDE_CONFIG_DIR` unset or blank and no mapped token account, also reads Claude Desktop on Windows: `%APPDATA%\Claude` and the Microsoft Store package stores. It takes the project stores and Cowork (local agent mode) `audit.jsonl` files.
+- Cowork rows use the CLI transcript parser. A response present in both is counted once. `result` rows, which hold session totals, are never counted.
+- A mapped token account or a set `CLAUDE_CONFIG_DIR` leaves Claude Desktop out. Only the default history includes it.
+- Desktop discovery stops at 16,384 directory entries or 5 seconds. If it stops early, the Claude scan counts an unreadable root, so cost stays unavailable rather than showing a partial total.
+- Symbolic links are not followed during Desktop discovery.
+- Windows keeps no on-disk Claude cost cache. Each scan rereads the transcripts in the window.
 
 ### AWS Bedrock monitoring
 
-AWS Bedrock is a Windows provider backed by signed Cost Explorer requests and optional CloudWatch activity. It is disabled by default, and monitoring requests can add charges to your AWS bill. AWS currently charges $0.01 per Cost Explorer API request; paginated monthly-spend reads can therefore use more than one billed request, while optional CloudWatch activity is billed under CloudWatch pricing.
+AWS Bedrock uses signed Cost Explorer requests and, optionally, CloudWatch activity. It is disabled by default.
 
-The shared refresh interval controls automatic provider polling. `0` / Manual disables the recurring timer, but explicit refreshes and **Refresh when the menu opens** can still fetch Bedrock data. Disable Bedrock itself to stop its app refreshes.
+- Monitoring can add charges to your AWS bill. AWS charges $0.01 per Cost Explorer API request, and a paginated monthly-spend read can take more than one request. CloudWatch activity is billed at CloudWatch prices.
+- The shared refresh interval controls automatic polling. Manual (`0`) stops the timer, but an explicit refresh and **Refresh when the menu opens** still fetch Bedrock data. Disable Bedrock to stop its refreshes.
+- `CODEXBAR_BEDROCK_BUDGET` only changes the monthly progress shown. It doesn't cap AWS charges, stop polling or enforce a limit.
 
-`CODEXBAR_BEDROCK_BUDGET` changes only the displayed monthly progress. It does **not** cap AWS charges, stop polling, or enforce a billing limit.
+Custom pricing overlays override prices only where the local spend data has matching provider and model token evidence.
 
-Custom pricing overlays are exact-match overrides used only where the local spend contract has matching provider/model token evidence. Explicit zero rates mean free; omitted rate fields stay unknown. The Usage & Spend surface keeps provenance/coverage visible, preserves cost-only model rows when token coverage is partial, and can Copy JSON or save the same JSON contract through the native file picker.
+- An explicit zero rate means free. A rate you leave out stays unknown.
+- Usage & Spend keeps provenance and coverage visible, and keeps cost-only model rows when token coverage is partial.
+- **Copy JSON** and **Save JSON** export the same JSON contract.
 
-### OpenCode, Codex quota, and local cost boundaries
+### OpenCode, Codex quota and local cost
 
-OpenCode-held OpenAI/Codex OAuth can be reused for **remote Codex account quota** only when the Codex provider's `External OAuth sources` setting is explicitly enabled. Native Codex credentials still take precedence, an explicit `CODEX_HOME` stays isolated, and external credentials remain read-only. This does **not** import ordinary OpenCode sessions into Codex token or spend totals. OpenCode Go's local SQLite reader remains scoped to its own `opencode-go` assistant records; OpenAI API-platform usage is a separate provider. Its recorded local token counts (`tokens` on assistant messages and step-finish parts; step-finish parts win over their parent message) fill Usage & Spend token columns and per-model history; costs stay the recorded `cost` field, and rows with absent, malformed, negative, or overflowing tokens leave that window's totals incomplete instead of counting as zero.
+OpenCode can hold an OpenAI or Codex OAuth login. Win-CodexBar reuses it for **remote Codex account quota** only when the Codex provider's **External OAuth sources** setting is on.
 
-Codex local cost prices **Priority (Fast) turns** at the Fast rate. A turn counts as Priority when `<CODEX_HOME>/logs_2.sqlite` (Codex's trace database) holds a `response.create` websocket request with `service_tier == "priority"` for that turn's id. The database is opened read-only, scanned incrementally with a persisted cursor in the cost cache, and only turn ids, model names, and timestamps are kept; row bodies contain prompts and are never stored or logged. A missing or unreadable database keeps Standard pricing, and turn evidence never crosses `CODEX_HOME` scopes. Models without a Fast lane stay Standard. Older cost caches rebuild once (Codex cache schema v4 records each row's turn id).
+- Native Codex credentials still come first.
+- An explicit `CODEX_HOME` stays isolated.
+- External credentials are read-only.
+- Ordinary OpenCode sessions are never added to Codex token or spend totals.
+
+### OpenCode web usage: Console and legacy sessions
+
+OpenCode reads usage from `opencode.ai` cookies. Which API it uses depends on the session cookie (upstream #4131/#4139).
+
+- A `__Host-console_session` cookie means a migrated Console workspace. Win-CodexBar reads `/console/api/orgs` to find the workspace, then `/console/api/go/status` for the 5-hour and weekly quota. Every call except the workspace lookup sends the `x-org-id` header.
+- If the Go status is `null` or `{"access": null}`, Win-CodexBar shows spend only after `/console/api/orgs/current` reports `hasGoSubscription: false` and `/console/api/billing/status` reports `mode: "pay-as-you-go"`. The spend is `totalCostMicroCents / 1e8` from `/console/api/usage/summary?range=30d`. The card shows it as **Last 30 days** spend, with no limit and no percentage. A missing prepaid balance hides only the balance.
+- A subscribed workspace without quota, or an invoiceable account, is an error unless the legacy session succeeds. It never shows as pay-as-you-go spend.
+- A Console 401 means invalid credentials. Any other Console error is an API error, not an expired session.
+- A cookie with only a legacy session (`auth` or `__Host-auth`) keeps the legacy `_server` path and its monthly pay-as-you-go billing fallback.
+- When both cookies are present and the Console call fails, the legacy path is tried. If the legacy path also fails, the Console error is reported, unless the Console error was a 401.
+- OpenCode reuses the OpenCode Go Console client (`providers/opencodego/console.rs`). The monthly Go meter appears only on OpenCode Go.
+- For OpenCode Go, a manual cookie keeps the configured usage source (Auto, Web or Local) instead of forcing Web (upstream #4616). The cookie scopes only the web session. The source label shows the source that actually supplied the result, such as `web` or `local estimate`.
+
+OpenCode Go's local SQLite reader reads only records attributed to `opencode-go`: legacy assistant messages and v2 `session_message` assistant and compaction requests. A v2 request is skipped only when a legacy copy with the same id has a usable timestamp and a non-negative finite cost, so migrated requests count once and an invalid legacy copy never hides a valid v2 request. V2-only databases (no `message` table, no `auth.json`) still read. OpenAI API-platform usage is a separate provider.
+
+OpenCode Go reads server quota with the active OpenCode CLI login when no API key is configured (upstream #4771), so a signed-in CLI no longer falls back to the local estimate.
+
+- Unscoped Auto keeps this order over local history: a configured API key, then a usable browser session, then the CLI login. A successful CLI read reports `local+cli`. Without local history, Auto tries the API key, then the browser session, then the CLI login, which reports `cli`. An estimate that already carries a browser account's Zen balance never borrows the CLI login.
+- API mode (the `oauth` source) uses the configured key, else the CLI login, without importing cookies. A rejected configured key never falls back to the CLI login.
+- Selected accounts, manual cookies, workspace overrides and Web mode never use the CLI login. Cookie source Off disables browser discovery, not the CLI login.
+- OpenCode v2 keeps the login in the `credential` table of `opencode.db`. An active `opencode-go` row wins over the general `opencode` row, which counts only as an unexpired OAuth login. Two active rows for the same integration are ambiguous and fail. Once the credential table exists, a stale legacy `auth.json` is ignored, including after logout. Older installs use the `opencode-go` entry of type `api` in `auth.json`.
+- Lookup uses the first OpenCode data directory that has `opencode.db` or `auth.json`: `%USERPROFILE%\.local\share\opencode`, then `%LOCALAPPDATA%\opencode`. An absolute `XDG_DATA_HOME` replaces them with `<XDG_DATA_HOME>\opencode`. `OPENCODE_DB` names the database file or gives an absolute path; `:memory:` disables the lookup.
+- The credential is read-only and reread on every refresh. Win-CodexBar never refreshes tokens; renew an expired OAuth login through OpenCode. Read or decode failures report invalid credentials without database contents or tokens. In Auto they keep the marked local estimate.
+
+For `codexbar cost --provider opencodego` (upstream #4629), token counts follow the same rule per row. A row with missing, malformed, negative or overflowing tokens is unknown, not zero, and any window or model containing one has no exact token total. A row that records a total but omits input or output keeps that exact total, while its input and output are unknown. The text report says `unknown` for the affected totals while still reporting cost. The JSON payload uses `null` for them and adds `unknownTokenRowCount` and `byModelTokens`. Per-model token counts sum only what rows recorded. The `spendContract` per-model rows still carry those usable partial counts; the desktop Usage & Spend view is unchanged.
+
+- Token counts come from `tokens` on assistant messages and step-finish parts. A step-finish part wins over its parent message.
+- They fill the Usage & Spend token columns and per-model history. Costs are the recorded `cost` field.
+- A row with missing, malformed, negative or overflowing tokens marks that window's totals incomplete. It isn't counted as zero.
+
+Codex local cost prices **Priority (Fast)** turns at the Fast rate.
+
+- A turn is Priority when `<CODEX_HOME>/logs_2.sqlite`, Codex's trace database, has a `response.create` websocket request with `service_tier == "priority"` for that turn id.
+- The database is opened read-only and scanned incrementally, with a cursor saved in the cost cache.
+- Only turn ids, model names and timestamps are kept. Row bodies contain prompts and are never stored or logged.
+- A missing or unreadable database keeps Standard pricing. Turn evidence never crosses `CODEX_HOME` scopes.
+- Models without a Fast rate stay Standard.
+- Older cost caches rebuild once. Codex cache schema v4 records each row's turn id.
+
+### Cursor app session
+
+Automatic mode first reads the signed-in Cursor app's `cursorAuth/accessToken` from `%APPDATA%\Cursor\User\globalStorage\state.vscdb` (read-only) and rebuilds the session cookie from it.
+
+- Cursor 3.27 and later may store that token as a `cursor-safe-storage:v1:` envelope. CodexBar decrypts it with the DPAPI-protected key in `%APPDATA%\Cursor\Local State` (AES-256-GCM, as Chromium does on Windows). A plain JWT never reads that key.
+- An unreadable, malformed or unknown-version envelope yields no app session, and Automatic mode falls through to browser cookies.
+
+### Cursor unified personal spend
+
+Cursor accounts on a unified membership with a user-level limit (`membershipType` starts with `unified_` and `limitType` is `user`) read monthly additional spend from `GET /api/dashboard/v2/usage-status?scope=user`, using the same session cookie.
+
+- A valid, available response supplies the spend, the cap (cents converted to USD) and the reset time. Separate credit consumption is not added to the spend.
+- The read has a five-second budget. If it fails, or the response is unavailable, malformed, or outside its period, the usage-summary values stay in place.
+- A valid zero stays zero. Team budgets, legacy plans and the Grok Bot allowance keep their existing paths.
+
+## API key notes
+
+### Kimi Total usage breakdown
+
+When Kimi reports the Kimi Code share of the monthly **Total usage** pool, the provider page adds a "Total usage" section with two rows: **Kimi Code** and **Other features** (the total minus the Code share, never below 0%). Both rows are details, not quota windows, because they draw on one limit.
+
+- The Code share always comes from the source that supplied Total usage: `limit_month_code` next to the Code API `limit_month_total`, or `kimiCodeUsedRatio` next to the web membership pool. A Code API Total usage never borrows the web Code share.
+- A missing, negative or malformed Code share leaves Total usage without a breakdown and keeps every quota window.
+- A share above 0% but below 1% shows as "<1% used", as upstream does, even when it would round to 1%.
 
 ### OpenRouter keys
 
-The **API key** field (or `OPENROUTER_API_KEY`) is required and accepts either a regular API key or a Management API key. A Management key entered there also enables account Activity on the official OpenRouter API. The separate **Management API key** field (or `OPENROUTER_MANAGEMENT_API_KEY`) is an optional additional key for account Activity, only needed to use a Management key different from the one in the required field. Filling only the Management field does not select an account for quota or balance; with no primary key, the provider reports the missing-key message instead.
+- The **API key** field (or `OPENROUTER_API_KEY`) is required. It takes a regular API key or a Management API key. A Management key there also turns on account Activity from the official OpenRouter API.
+- The **Management API key** field (or `OPENROUTER_MANAGEMENT_API_KEY`) is optional. You need it only to use a different Management key for account Activity.
+- A Management key alone doesn't select an account for quota or balance. Without the main key, the provider reports the missing-key message.
 
 ### z.ai Coding Plan quotas
 
-z.ai Coding Plans accept both `TOKENS_LIMIT` and `CREDIT_LIMIT` rows. The shortest known Coding Plan window becomes primary and the longest becomes secondary; `TIME_LIMIT` is the separate MCP lane. When absolute usage/remaining counts are available they determine the used percentage, otherwise the provider percentage is used, always clamped to 0–100%. This behavior is shared by the tray, provider detail, CLI, and other Windows surfaces. Empty or wholly unrecognized limits never fabricate a 0% window; they show a "Coding Plan usage: Unavailable" detail row that points to the Usage Dashboard, and mixed responses keep the recognized windows and add "Additional quota: Unavailable". Unknown string limit types are skipped, while malformed entries and unsupported envelopes fail with Usage Dashboard guidance.
+- z.ai Coding Plans accept both `TOKENS_LIMIT` and `CREDIT_LIMIT` rows. The shortest known Coding Plan window is the primary lane and the longest is the secondary lane. `TIME_LIMIT` is the separate MCP lane.
+- When absolute used and remaining counts exist, they set the used percentage. Otherwise the provider's percentage is used. Both are clamped to 0-100%. The tray, the provider page and the CLI all use this rule.
+- Empty or unrecognized limits never invent a 0% window. They show a "Coding Plan usage: Unavailable" row that points to the Usage Dashboard. A mixed response keeps the windows it recognizes and adds "Additional quota: Unavailable".
+- Unknown string limit types are skipped. Malformed entries and unsupported envelopes fail with Usage Dashboard guidance.
 
 ### xKiro daily free tokens
 
-xKiro reads `GET https://api.xkiro.com/v1/usage` with `XKIRO_API_KEY` (or the key saved in Preferences) as a bearer token. Only the `free_tokens` counters are used: the primary lane is `used_today / limit_per_day`, resetting at the next 00:00 UTC, and a limit of `0` reads as fully used. The paid `wallet` balance is never treated as headroom and is not shown. Counters that are missing stay missing rather than becoming zero, a payload with no usable counter is reported as unrecognized, and an explicit `plan: null` is labelled "Pay as you go". There are no token accounts. The wire shape follows upstream's documented example; live account behavior has not been verified.
+xKiro reads `GET https://api.xkiro.com/v1/usage` with `XKIRO_API_KEY`, or the key saved in Settings, as a bearer token.
 
-Upstream's independent **WidgetKit** provider-widget configuration has no Windows analogue in this repository. Win-CodexBar has no WidgetKit extension; provider cards and tray entries are already independent Windows/Tauri surfaces.
+- Only the `free_tokens` counters are used. The primary lane is `used_today / limit_per_day` and resets at the next 00:00 UTC. A limit of `0` reads as fully used.
+- The paid `wallet` balance is never treated as headroom and isn't shown.
+- Missing counters stay missing; they don't become zero. A payload with no usable counter is reported as unrecognized.
+- An explicit `plan: null` is labelled "Pay as you go".
+- There are no token accounts.
+- The response shape follows upstream's documented example. It hasn't been checked against a live account.
 
 ### LiteLLM budgets
 
-LiteLLM reads a virtual key's own budgets from the proxy's management routes. Set the base URL and key in Settings → Providers → LiteLLM, or use `LITELLM_BASE_URL` and `LITELLM_API_KEY`. A trailing `/v1` is dropped. The base URL must use HTTPS unless it names `localhost`, a `.local` host, or a loopback, RFC 1918, link-local or IPv6 unique-local address, and it must not embed credentials, because the key is sent as a bearer token.
+LiteLLM reads a virtual key's own budgets from the proxy's management routes. Set the base URL and key in **Settings > Providers > LiteLLM**, or with `LITELLM_BASE_URL` and `LITELLM_API_KEY`.
 
-The provider calls `GET /key/info`, then `GET /user/info?user_id=…` for a user-bound key or `GET /team/info?team_id=…` for a team-only key, and rejects a response whose user or team ID differs from the key's. The personal budget fills the primary lane and the key's matching team budget fills the secondary lane. When only one budget exists, it takes the primary lane under its own label, and a key without any budget shows "No budget set". Amounts such as `$25.00 / $100.00` are detail lines, shown apart from a real reset date. The Automatic tray and float bar metric shows the team budget unless a budget is exhausted. Spend without a budget stays visible as API spend, and no pace is derived from budget resets.
+- A trailing `/v1` is dropped.
+- The base URL must use HTTPS unless it names `localhost`, a `.local` host, or a loopback, RFC 1918, link-local or IPv6 unique-local address. It must not embed credentials, because the key is sent as a bearer token.
+- The provider calls `GET /key/info`. Then it calls `GET /user/info?user_id=…` for a key bound to a user, or `GET /team/info?team_id=…` for a team-only key. A response whose user or team id differs from the key's is rejected.
+- The personal budget is the primary lane and the key's team budget is the secondary lane. With only one budget, it takes the primary lane under its own label. A key with no budget shows "No budget set".
+- Amounts such as `$25.00 / $100.00` are detail lines, apart from a real reset date.
+- The Automatic tray and float bar metric shows the team budget unless a budget is exhausted.
+- Spend without a budget stays visible as API spend. Budget resets give no pace.
 
-## Upstream doc warning
+## Not ported
 
-Upstream `docs/providers.md` is a large auto-strategy matrix (60+ providers) for the macOS app. Use it as **inspiration** when porting a provider. For runtime truth on Windows:
+Upstream's WidgetKit provider-widget settings have no Windows version. Win-CodexBar has no WidgetKit extension; provider cards and tray entries already work on their own.
 
-1. `rust/src/core/provider.rs` (`ProviderId`)
+## Upstream provider docs
+
+Upstream `docs/providers.md` is a large table of fallback orders for the macOS app. Use it for ideas when you port a provider. For what Windows actually does, read:
+
+1. `rust/src/core/provider/id.rs` (`ProviderId`) and `rust/src/core/provider/spec.rs` (its spec row)
 2. `rust/src/providers/<id>/`
-3. `codexbar usage -p <id> -v` / desktop provider detail errors
+3. the output of `codexbar usage -p <id> -v`, or the error on the provider's Settings page
 
-## Related
+## Related docs
 
 - [ARCHITECTURE.md](./ARCHITECTURE.md)
 - [CLI.md](./CLI.md)

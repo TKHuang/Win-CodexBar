@@ -5,11 +5,24 @@
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use std::future::Future;
+use std::io::Write;
 use std::path::Path;
 
 use super::usage::OutputFormat;
-use crate::core::{ProviderId, TokenAccountStore, instantiate_provider};
+use crate::core::{ProviderId, SourceMode, TokenAccountStore, instantiate_provider};
+use crate::providers::copilot::CopilotApi;
+use crate::providers::copilot::device_flow::CopilotDeviceFlow;
+use crate::providers::copilot::login::{
+    SavedCopilotAccount, finish_device_login, start_device_login,
+};
 use crate::settings::{ApiKeys, ManualCookies, PreferencesDocument, Settings};
+
+mod cli_login;
+mod login;
+
+pub use login::ConfigLoginError;
+use login::{ConfigLoginEvent, LoginFailure, report_outcome, write_event};
 
 /// Arguments for the config command
 #[derive(Parser, Debug)]
@@ -50,6 +63,16 @@ pub enum ConfigCommand {
         #[command(flatten)]
         output: ConfigOutputArgs,
     },
+    /// Store a provider's usage data source (auto clears the override)
+    SetSource {
+        #[command(flatten)]
+        target: ConfigProviderArg,
+        /// Persistent source: auto, web, cli, or oauth
+        #[arg(long)]
+        source: String,
+        #[command(flatten)]
+        output: ConfigOutputArgs,
+    },
     /// Store an API key for a provider
     SetApiKey {
         #[command(flatten)]
@@ -63,6 +86,42 @@ pub enum ConfigCommand {
         /// Store the key without enabling the provider
         #[arg(long = "no-enable")]
         no_enable: bool,
+    },
+    /// Store a manual cookie header for a provider and select the Manual cookie source
+    SetCookie {
+        #[command(flatten)]
+        target: ConfigProviderArg,
+        /// Cookie header to store
+        #[arg(long)]
+        cookie: Option<String>,
+        /// Read the cookie header from stdin
+        #[arg(long)]
+        stdin: bool,
+        /// Store the cookie without enabling the provider
+        #[arg(long = "no-enable")]
+        no_enable: bool,
+        #[command(flatten)]
+        output: ConfigOutputArgs,
+    },
+    /// Remove a provider's stored API key and/or manual cookie (both by default)
+    ClearCredential {
+        #[command(flatten)]
+        target: ConfigProviderArg,
+        /// Clear only the stored API key
+        #[arg(long = "api-key")]
+        api_key: bool,
+        /// Clear only the stored manual cookie
+        #[arg(long)]
+        cookie: bool,
+        #[command(flatten)]
+        output: ConfigOutputArgs,
+    },
+    /// Log in to a provider through its own sign-in (GitHub Copilot, Grok, Kiro)
+    Login {
+        #[command(flatten)]
+        target: ConfigProviderArg,
+        #[command(flatten)]
+        output: ConfigOutputArgs,
     },
     /// Show configuration file paths
     Path,
@@ -134,13 +193,7 @@ impl ConfigOutputArgs {
     }
 
     fn print_json<T: Serialize>(self, value: &T) -> anyhow::Result<()> {
-        let json = if self.pretty {
-            serde_json::to_string_pretty(value)?
-        } else {
-            serde_json::to_string(value)?
-        };
-        println!("{json}");
-        Ok(())
+        super::print_json(value, self.pretty)
     }
 }
 
@@ -187,12 +240,33 @@ pub async fn run(args: ConfigArgs) -> anyhow::Result<()> {
         ConfigCommand::Disable { target, output } => {
             set_provider_enabled(target.name(), false, output).await
         }
+        ConfigCommand::SetSource {
+            target,
+            source,
+            output,
+        } => set_provider_source(target.name(), &source, output).await,
         ConfigCommand::SetApiKey {
             target,
             api_key,
             stdin,
             no_enable,
         } => set_api_key(target.name(), api_key.as_deref(), stdin, !no_enable).await,
+        ConfigCommand::SetCookie {
+            target,
+            cookie,
+            stdin,
+            no_enable,
+            output,
+        } => set_cookie(target.name(), cookie.as_deref(), stdin, !no_enable, output),
+        ConfigCommand::ClearCredential {
+            target,
+            api_key,
+            cookie,
+            output,
+        } => clear_credential(target.name(), api_key, cookie, output),
+        ConfigCommand::Login { target, output } => login(target.name(), output)
+            .await
+            .map_err(anyhow::Error::from),
         ConfigCommand::Path => show_paths().await,
         ConfigCommand::Preferences { action } => transfer_preferences(action),
         ConfigCommand::ClaudeCodeCredentials { action, output } => {
@@ -558,6 +632,83 @@ async fn set_provider_enabled(
     Ok(())
 }
 
+/// `config set-source` JSON result (upstream `ConfigSetSourceResult`).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfigSetSourceResult {
+    provider: String,
+    display_name: String,
+    enabled: bool,
+    source: String,
+    config_path: Option<String>,
+}
+
+const SET_SOURCE_CHOICES: &str = "auto|web|cli|oauth";
+
+fn source_mode_name(mode: SourceMode) -> &'static str {
+    match mode {
+        SourceMode::Auto => "auto",
+        SourceMode::OAuth => "oauth",
+        SourceMode::Web => "web",
+        SourceMode::Cli => "cli",
+    }
+}
+
+/// Validate `set-source` arguments without reading settings, so argument
+/// errors surface before the config file is touched (upstream ordering).
+fn config_source_selection(
+    raw_provider: &str,
+    raw_source: &str,
+) -> anyhow::Result<(ProviderId, SourceMode)> {
+    let id = parse_provider(raw_provider)?;
+    let source = SourceMode::parse(raw_source.trim()).ok_or_else(|| {
+        anyhow::anyhow!("Unknown source '{raw_source}'. Use --source {SET_SOURCE_CHOICES}.")
+    })?;
+    let mut supported: Vec<&str> = instantiate_provider(id)
+        .available_sources()
+        .into_iter()
+        .map(source_mode_name)
+        .collect();
+    if !supported.contains(&source_mode_name(source)) {
+        supported.sort_unstable();
+        supported.dedup();
+        anyhow::bail!(
+            "Source {} is not supported for {}. Supported sources: {}.",
+            source_mode_name(source),
+            id.cli_name(),
+            supported.join(", ")
+        );
+    }
+    Ok((id, source))
+}
+
+/// Store a provider's usage source without touching its enablement.
+async fn set_provider_source(
+    provider: &str,
+    source: &str,
+    output: ConfigOutputArgs,
+) -> anyhow::Result<()> {
+    let (id, mode) = config_source_selection(provider, source)?;
+    let mut settings = Settings::load();
+    settings.set_usage_source(id, source_mode_name(mode));
+    settings.save()?;
+    if output.is_json() {
+        return output.print_json(&ConfigSetSourceResult {
+            provider: id.cli_name().to_string(),
+            display_name: id.display_name().to_string(),
+            enabled: settings.is_provider_enabled(id),
+            source: source_mode_name(mode).to_string(),
+            config_path: Settings::settings_path().map(|path| path.display().to_string()),
+        });
+    }
+    println!(
+        "Config: {} source set to {}",
+        id.display_name(),
+        source_mode_name(mode)
+    );
+    Ok(())
+}
+
 /// `config claude-code-credentials` JSON result.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -685,6 +836,358 @@ fn resolve_api_key_input(api_key: Option<&str>, read_from_stdin: bool) -> anyhow
     Ok(value)
 }
 
+/// `config set-cookie` JSON result (upstream `ConfigSetCookieResult`).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfigSetCookieResult {
+    provider: String,
+    enabled: bool,
+    config_path: Option<String>,
+}
+
+/// Loads a credential store that the command may save again. A missing file
+/// is an empty store. A file that exists but cannot be read or parsed stops the
+/// command, so the save cannot replace it with a store that lost its entries.
+/// The parse error is not shown because serde can quote stored values.
+fn load_credential_store<T: DeserializeOwned + Default>(
+    path: Option<std::path::PathBuf>,
+    name: &str,
+) -> anyhow::Result<T> {
+    let Some(path) = path else {
+        return Ok(T::default());
+    };
+    let content = match crate::secure_file::read_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(T::default()),
+        Err(error) => anyhow::bail!("{name} could not be read ({error}); nothing was changed."),
+    };
+    serde_json::from_str(&content)
+        .map_err(|_| anyhow::anyhow!("{name} could not be parsed; nothing was changed."))
+}
+
+/// Same ceiling the desktop manual-cookie field enforces.
+const MAX_COOKIE_HEADER_LEN: usize = 64 * 1024;
+
+/// Store a manual cookie header, select the Manual cookie source, and
+/// optionally enable the provider. The cookie is never echoed.
+fn set_cookie(
+    provider: &str,
+    cookie: Option<&str>,
+    read_from_stdin: bool,
+    enable_provider: bool,
+    output: ConfigOutputArgs,
+) -> anyhow::Result<()> {
+    let id = config_cookie_provider(provider)?;
+    if cookie.is_some() && read_from_stdin {
+        anyhow::bail!("Use either --cookie or --stdin, not both.");
+    }
+    let raw = if read_from_stdin {
+        let mut buffer = String::new();
+        use std::io::Read;
+        std::io::stdin().read_to_string(&mut buffer)?;
+        Some(buffer)
+    } else {
+        cookie.map(ToString::to_string)
+    };
+    let cookie_header = clean_cookie_header(raw.as_deref())?;
+
+    let mut cookies: ManualCookies =
+        load_credential_store(ManualCookies::cookies_path(), "manual_cookies.json")?;
+    let mut settings = Settings::load();
+    if settings.load_state.is_unreadable_file() {
+        anyhow::bail!("settings.json could not be read; nothing was changed.");
+    }
+    apply_set_cookie(
+        &mut settings,
+        &mut cookies,
+        id,
+        &cookie_header,
+        enable_provider,
+    );
+    cookies.save()?;
+    settings.save()?;
+
+    let enabled = settings.is_provider_enabled(id);
+    if output.is_json() {
+        return output.print_json(&ConfigSetCookieResult {
+            provider: id.cli_name().to_string(),
+            enabled,
+            config_path: Settings::settings_path().map(|path| path.display().to_string()),
+        });
+    }
+    let suffix = if enabled { " and enabled" } else { "" };
+    println!(
+        "Config: stored manual cookie for {}{suffix}",
+        id.display_name()
+    );
+    Ok(())
+}
+
+/// Only providers with a cookie domain read a stored manual cookie; the
+/// desktop manual-cookie field applies the same rule.
+fn config_cookie_provider(raw: &str) -> anyhow::Result<ProviderId> {
+    let id = parse_provider(raw)?;
+    if id.cookie_domain().is_none() {
+        anyhow::bail!("{raw} does not support config cookies.");
+    }
+    Ok(id)
+}
+
+fn clean_cookie_header(raw: Option<&str>) -> anyhow::Result<String> {
+    let value = raw
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("Missing cookie. Pass --cookie <header> or pipe it with --stdin.")
+        })?;
+    if value.contains(['\r', '\n']) {
+        anyhow::bail!("Cookie header must be a single line.");
+    }
+    if value.len() > MAX_COOKIE_HEADER_LEN {
+        anyhow::bail!("Cookie header is too long.");
+    }
+    Ok(value.to_string())
+}
+
+fn apply_set_cookie(
+    settings: &mut Settings,
+    cookies: &mut ManualCookies,
+    id: ProviderId,
+    cookie_header: &str,
+    enable_provider: bool,
+) {
+    cookies.set(id.cli_name(), cookie_header);
+    settings.set_cookie_source(id, "manual");
+    if enable_provider {
+        settings.enable_provider(id);
+    }
+}
+
+/// A stored credential `config clear-credential` can remove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum CredentialField {
+    ApiKey,
+    CookieHeader,
+}
+
+impl CredentialField {
+    const ALL: [CredentialField; 2] = [CredentialField::ApiKey, CredentialField::CookieHeader];
+
+    fn description(self) -> &'static str {
+        match self {
+            CredentialField::ApiKey => "API key",
+            CredentialField::CookieHeader => "manual cookie",
+        }
+    }
+}
+
+/// `config clear-credential` JSON result (upstream `ConfigClearCredentialResult`).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfigClearCredentialResult {
+    provider: String,
+    cleared: Vec<CredentialField>,
+    config_path: Option<String>,
+}
+
+/// Both credentials unless a flag narrows the command to one of them.
+fn credential_fields(api_key: bool, cookie: bool) -> Vec<CredentialField> {
+    if !api_key && !cookie {
+        return CredentialField::ALL.to_vec();
+    }
+    CredentialField::ALL
+        .into_iter()
+        .filter(|field| match field {
+            CredentialField::ApiKey => api_key,
+            CredentialField::CookieHeader => cookie,
+        })
+        .collect()
+}
+
+/// Removes the requested stored credentials and reports which ones existed.
+/// Enablement, cookie and usage sources, and token accounts are untouched,
+/// so a cleared cookie leaves Manual selected.
+fn clear_stored_credentials(
+    keys: &mut ApiKeys,
+    cookies: &mut ManualCookies,
+    id: ProviderId,
+    fields: &[CredentialField],
+) -> Vec<CredentialField> {
+    let name = id.cli_name();
+    let mut cleared = Vec::new();
+    if fields.contains(&CredentialField::ApiKey) && keys.has_key(name) {
+        keys.remove(name);
+        cleared.push(CredentialField::ApiKey);
+    }
+    if fields.contains(&CredentialField::CookieHeader) && cookies.get(name).is_some() {
+        cookies.remove(name);
+        cleared.push(CredentialField::CookieHeader);
+    }
+    cleared
+}
+
+fn describe_credentials(fields: &[CredentialField], joiner: &str) -> String {
+    fields
+        .iter()
+        .map(|field| field.description())
+        .collect::<Vec<_>>()
+        .join(&format!(" {joiner} "))
+}
+
+fn clear_credential(
+    provider: &str,
+    api_key: bool,
+    cookie: bool,
+    output: ConfigOutputArgs,
+) -> anyhow::Result<()> {
+    let id = parse_provider(provider)?;
+    let fields = credential_fields(api_key, cookie);
+    let mut keys: ApiKeys = if fields.contains(&CredentialField::ApiKey) {
+        load_credential_store(ApiKeys::keys_path(), "api_keys.json")?
+    } else {
+        ApiKeys::default()
+    };
+    let mut cookies: ManualCookies = if fields.contains(&CredentialField::CookieHeader) {
+        load_credential_store(ManualCookies::cookies_path(), "manual_cookies.json")?
+    } else {
+        ManualCookies::default()
+    };
+    let cleared = clear_stored_credentials(&mut keys, &mut cookies, id, &fields);
+    // Nothing stored means nothing to write; a missing file stays missing.
+    if cleared.contains(&CredentialField::ApiKey) {
+        keys.save()?;
+    }
+    if cleared.contains(&CredentialField::CookieHeader) {
+        cookies.save()?;
+    }
+
+    if output.is_json() {
+        return output.print_json(&ConfigClearCredentialResult {
+            provider: id.cli_name().to_string(),
+            cleared,
+            config_path: Settings::settings_path().map(|path| path.display().to_string()),
+        });
+    }
+    if cleared.is_empty() {
+        println!(
+            "Config: no stored {} for {}",
+            describe_credentials(&fields, "or"),
+            id.display_name()
+        );
+    } else {
+        println!(
+            "Config: cleared {} for {}",
+            describe_credentials(&cleared, "and"),
+            id.display_name()
+        );
+    }
+    Ok(())
+}
+
+/// Run `config login`. GitHub Copilot uses a device code; Grok and Kiro run
+/// their own CLI sign-in.
+///
+/// Output goes through `std::io::stdout()` rather than a held lock, because
+/// the Kiro sign-in link is written from the login thread.
+async fn login(provider: &str, output: ConfigOutputArgs) -> Result<(), ConfigLoginError> {
+    let id = parse_provider(provider).map_err(ConfigLoginError::usage)?;
+    let json = output.is_json();
+    let out = &mut std::io::stdout();
+    match id {
+        ProviderId::Copilot => {
+            let flow = CopilotDeviceFlow::new();
+            let api = CopilotApi::new();
+            let store = TokenAccountStore::new();
+            run_copilot_login(&flow, &api, &store, json, out, login::ctrl_c(), || {
+                enable_provider(ProviderId::Copilot)
+            })
+            .await
+            .map(|_| ())
+        }
+        ProviderId::Grok => cli_login::login_grok(json, out).await,
+        ProviderId::Kiro => cli_login::login_kiro(json, out).await,
+        _ => Err(ConfigLoginError::usage(
+            "Login is supported for copilot, grok and kiro. Use --provider copilot, grok or kiro.",
+        )),
+    }
+}
+
+/// Turns `id` on after a saved login. Only `config login` does this; the
+/// desktop sign-in keeps its current behavior.
+fn enable_provider(id: ProviderId) -> anyhow::Result<()> {
+    let mut settings = Settings::load();
+    settings.enable_provider(id);
+    settings.save()
+}
+
+/// The error for a sign-in that finished but whose settings write failed.
+/// `saved_account` is true when CodexBar itself stored the credential, so the
+/// message tells the user the account is already there.
+fn enable_failed(
+    id: ProviderId,
+    saved_account: bool,
+    error: impl std::fmt::Display,
+) -> ConfigLoginError {
+    let done = if saved_account {
+        "Signed in and saved the account"
+    } else {
+        "Signed in"
+    };
+    ConfigLoginError::other(format!(
+        "{done}, but could not enable {}: {error}",
+        id.display_name()
+    ))
+}
+
+/// Runs the Copilot device login and writes progress to `out`. In JSON mode
+/// each event is one line; in text mode the URL and code are two lines.
+///
+/// The account is saved before `enable` runs, and `enable` runs before the
+/// `authorized` event. `cancel` (Ctrl-C in the CLI) is checked first, so once
+/// it fires the flow stops before it can save anything else.
+async fn run_copilot_login(
+    flow: &CopilotDeviceFlow,
+    api: &CopilotApi,
+    store: &TokenAccountStore,
+    json: bool,
+    out: &mut impl Write,
+    cancel: impl Future<Output = ()>,
+    enable: impl FnOnce() -> anyhow::Result<()>,
+) -> Result<SavedCopilotAccount, ConfigLoginError> {
+    let result = tokio::select! {
+        biased;
+        () = cancel => Err(ConfigLoginError::new(LoginFailure::Cancelled, "Login cancelled.")),
+        saved = copilot_steps(flow, api, store, json, out) => saved,
+    };
+    let result = result.and_then(|mut saved| {
+        enable().map_err(|error| enable_failed(ProviderId::Copilot, true, error))?;
+        saved.enabled = true;
+        Ok(saved)
+    });
+    report_outcome(json, out, result)
+}
+
+async fn copilot_steps(
+    flow: &CopilotDeviceFlow,
+    api: &CopilotApi,
+    store: &TokenAccountStore,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<SavedCopilotAccount, ConfigLoginError> {
+    let device = start_device_login(flow).await?;
+    write_event(
+        out,
+        json,
+        &ConfigLoginEvent::pending(
+            &device.verification_uri,
+            &device.user_code,
+            device.expires_in,
+        ),
+    )?;
+    Ok(finish_device_login(flow, api, store, &device).await?)
+}
+
 /// Show configuration file paths
 async fn show_paths() -> anyhow::Result<()> {
     println!("Configuration paths:");
@@ -729,369 +1232,4 @@ async fn show_paths() -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        ClaudeCodeCredentialsConsent, ConfigCommand, ConfigFileError, ConfigOutputArgs,
-        ConsentAction, apply_consent_action, consent_text, provider_statuses, read_json_config,
-        sanitize_settings_for_dump,
-    };
-    use crate::cli::{Cli, Commands};
-    use crate::core::ProviderId;
-    #[cfg(windows)]
-    use crate::secure_file;
-    use crate::settings::{ManualCookies, Settings};
-    use clap::Parser;
-    use serde_json::json;
-
-    #[test]
-    fn preferences_subcommands_parse_a_path() {
-        use super::{ConfigArgs, ConfigCommand, PreferencesAction};
-        use clap::Parser;
-
-        let export =
-            ConfigArgs::try_parse_from(["config", "preferences", "export", "--file", "p.json"])
-                .expect("export parses");
-        assert!(matches!(
-            export.command,
-            ConfigCommand::Preferences {
-                action: PreferencesAction::Export { file: Some(_) }
-            }
-        ));
-        let stdout = ConfigArgs::try_parse_from(["config", "preferences", "export"])
-            .expect("export without --file parses");
-        assert!(matches!(
-            stdout.command,
-            ConfigCommand::Preferences {
-                action: PreferencesAction::Export { file: None }
-            }
-        ));
-        let import =
-            ConfigArgs::try_parse_from(["config", "preferences", "import", "--file", "p.json"])
-                .expect("import parses");
-        assert!(matches!(
-            import.command,
-            ConfigCommand::Preferences {
-                action: PreferencesAction::Import { .. }
-            }
-        ));
-        assert!(ConfigArgs::try_parse_from(["config", "preferences", "import"]).is_err());
-    }
-
-    fn parse_config(argv: &[&str]) -> Result<ConfigCommand, clap::Error> {
-        let cli = Cli::try_parse_from(["codexbar", "config"].iter().chain(argv.iter()))?;
-        match cli.command {
-            Some(Commands::Config(args)) => Ok(args.command),
-            other => panic!("expected the config command, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn config_providers_accepts_json_output_flags() {
-        let ConfigCommand::Providers { output } = parse_config(&["providers"]).unwrap() else {
-            panic!("expected providers");
-        };
-        assert!(!output.is_json());
-        for argv in [
-            &["providers", "--json"][..],
-            &["providers", "--format", "json"][..],
-            &["providers", "-f", "json", "--pretty"][..],
-        ] {
-            let ConfigCommand::Providers { output } = parse_config(argv).unwrap() else {
-                panic!("expected providers for {argv:?}");
-            };
-            assert!(output.is_json(), "{argv:?}");
-        }
-        assert!(parse_config(&["providers", "--format", "toml"]).is_err());
-    }
-
-    #[test]
-    fn provider_status_json_matches_the_upstream_shape() {
-        let mut settings = Settings::default();
-        settings.enabled_providers.clear();
-        settings.enable_provider(ProviderId::Cursor);
-
-        let statuses = provider_statuses(&settings);
-
-        assert_eq!(
-            statuses.len(),
-            ProviderId::all()
-                .iter()
-                .filter(|p| !p.is_deprecated())
-                .count()
-        );
-        let cursor = statuses
-            .iter()
-            .find(|status| status.provider == "cursor")
-            .expect("cursor row");
-        assert!(cursor.enabled);
-        let codex = statuses
-            .iter()
-            .find(|status| status.provider == "codex")
-            .expect("codex row");
-        assert!(!codex.enabled);
-
-        let value = serde_json::to_value(codex).unwrap();
-        let mut keys: Vec<&str> = value
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect();
-        keys.sort_unstable();
-        assert_eq!(
-            keys,
-            ["defaultEnabled", "displayName", "enabled", "provider"]
-        );
-        assert_eq!(value["displayName"], ProviderId::Codex.display_name());
-        assert_eq!(value["enabled"], false);
-        assert_eq!(value["defaultEnabled"], codex.default_enabled);
-    }
-
-    #[test]
-    fn deprecated_providers_are_hidden_until_enabled_then_listed() {
-        let mut settings = Settings::default();
-        settings.enabled_providers.clear();
-        let statuses = provider_statuses(&settings);
-        for retired in [ProviderId::KimiK2, ProviderId::CrossModel] {
-            assert!(retired.is_deprecated());
-            assert!(statuses.iter().all(|s| s.provider != retired.cli_name()));
-        }
-
-        settings.enable_provider(ProviderId::KimiK2);
-        let statuses = provider_statuses(&settings);
-        let kimi = statuses
-            .iter()
-            .find(|s| s.provider == "kimik2")
-            .expect("enabled deprecated provider is listed");
-        assert!(kimi.enabled);
-        assert!(statuses.iter().all(|s| s.provider != "crossmodel"));
-    }
-
-    #[test]
-    fn provider_status_text_lines_keep_the_existing_format() {
-        let mut settings = Settings::default();
-        settings.enabled_providers.clear();
-        settings.enable_provider(ProviderId::Codex);
-        let statuses = provider_statuses(&settings);
-        let codex = statuses.iter().find(|s| s.provider == "codex").unwrap();
-        let claude = statuses.iter().find(|s| s.provider == "claude").unwrap();
-
-        let marker = |default: bool| if default { " default" } else { "" };
-        assert_eq!(
-            codex.text_line(),
-            format!("codex: enabled{} (Codex)", marker(codex.default_enabled))
-        );
-        assert_eq!(
-            claude.text_line(),
-            format!(
-                "claude: disabled{} (Claude)",
-                marker(claude.default_enabled)
-            )
-        );
-    }
-
-    #[test]
-    fn provider_subcommands_accept_the_positional_or_provider_option() {
-        for argv in [
-            &["enable", "cursor"][..],
-            &["enable", "-p", "cursor"][..],
-            &["enable", "--provider", "cursor", "--json"][..],
-        ] {
-            let ConfigCommand::Enable { target, .. } = parse_config(argv).unwrap() else {
-                panic!("expected enable for {argv:?}");
-            };
-            assert_eq!(target.name(), "cursor", "{argv:?}");
-        }
-        let ConfigCommand::Disable { target, output } =
-            parse_config(&["disable", "--provider", "cursor", "--format", "json"]).unwrap()
-        else {
-            panic!("expected disable");
-        };
-        assert_eq!(target.name(), "cursor");
-        assert!(output.is_json());
-        let ConfigCommand::SetApiKey { target, stdin, .. } =
-            parse_config(&["set-api-key", "-p", "openrouter", "--stdin"]).unwrap()
-        else {
-            panic!("expected set-api-key");
-        };
-        assert_eq!(target.name(), "openrouter");
-        assert!(stdin);
-
-        assert!(parse_config(&["enable"]).is_err(), "provider is required");
-        assert!(
-            parse_config(&["enable", "cursor", "--provider", "codex"]).is_err(),
-            "positional and --provider conflict"
-        );
-    }
-
-    #[test]
-    fn default_output_args_are_text() {
-        assert!(!ConfigOutputArgs::default().is_json());
-    }
-
-    #[test]
-    fn claude_code_credentials_parses_each_action() {
-        for (word, expected) in [
-            ("allow", ConsentAction::Allow),
-            ("deny", ConsentAction::Deny),
-            ("status", ConsentAction::Status),
-        ] {
-            let ConfigCommand::ClaudeCodeCredentials { action, output } =
-                parse_config(&["claude-code-credentials", word, "--json"]).unwrap()
-            else {
-                panic!("expected claude-code-credentials for {word}");
-            };
-            assert_eq!(action, expected);
-            assert!(output.is_json());
-        }
-        assert!(parse_config(&["claude-code-credentials"]).is_err());
-        assert!(parse_config(&["claude-code-credentials", "maybe"]).is_err());
-    }
-
-    #[test]
-    fn consent_actions_toggle_only_the_claude_code_flag() {
-        let mut settings = Settings::default();
-        assert!(!settings.claude_allow_reading_claude_code_credentials);
-        let before = serde_json::to_value(&settings).unwrap();
-
-        assert!(!apply_consent_action(&mut settings, ConsentAction::Status));
-        assert!(!apply_consent_action(&mut settings, ConsentAction::Deny));
-        assert!(apply_consent_action(&mut settings, ConsentAction::Allow));
-        assert!(settings.claude_allow_reading_claude_code_credentials);
-        assert!(!apply_consent_action(&mut settings, ConsentAction::Allow));
-        assert!(!apply_consent_action(&mut settings, ConsentAction::Status));
-        assert!(settings.claude_allow_reading_claude_code_credentials);
-
-        let mut after = serde_json::to_value(&settings).unwrap();
-        after["claude_allow_reading_claude_code_credentials"] = json!(false);
-        assert_eq!(after, before, "no other setting changes");
-
-        assert!(apply_consent_action(&mut settings, ConsentAction::Deny));
-        assert!(!settings.claude_allow_reading_claude_code_credentials);
-    }
-
-    #[test]
-    fn consent_output_reports_the_choice() {
-        let value = serde_json::to_value(ClaudeCodeCredentialsConsent {
-            allowed: true,
-            config_path: Some("settings.json".to_string()),
-        })
-        .unwrap();
-        assert_eq!(
-            value,
-            json!({ "allowed": true, "configPath": "settings.json" })
-        );
-        assert!(consent_text(true).contains("allowed"));
-        assert!(consent_text(false).contains("not allowed"));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn validates_dpapi_protected_manual_cookies_without_plaintext() {
-        let dir = tempfile::tempdir().expect("create temporary directory");
-        let path = dir.path().join("manual_cookies.json");
-        let expected = r#"{"cookies":{}}"#;
-
-        secure_file::write_string(&path, expected).expect("write protected cookies");
-
-        let raw = std::fs::read_to_string(&path).expect("read protected wrapper");
-        assert!(raw.contains("\"format\": \"codexbar.secure-file\""));
-        assert!(!raw.contains(expected));
-        assert!(
-            read_json_config::<ManualCookies>(&path).is_ok(),
-            "valid protected cookies should validate"
-        );
-    }
-
-    #[test]
-    fn rejects_malformed_secure_wrapper_without_echoing_payload() {
-        let dir = tempfile::tempdir().expect("create temporary directory");
-        let path = dir.path().join("manual_cookies.json");
-        let payload = "AA==";
-        let malformed = format!(
-            r#"{{"format":"codexbar.secure-file","version":1,"protection":"unsupported","payload":"{payload}"}}"#
-        );
-        std::fs::write(&path, malformed).expect("write malformed wrapper");
-
-        let error = read_json_config::<ManualCookies>(&path)
-            .expect_err("reject malformed protected wrapper");
-        let ConfigFileError::Read(error) = error else {
-            panic!("malformed protected wrapper must be a read error");
-        };
-        let message = error.to_string();
-        assert!(message.contains("unsupported secure file protection"));
-        assert!(!message.contains(payload));
-    }
-
-    #[test]
-    fn sanitize_settings_for_dump_redacts_secret_fields() {
-        let raw = json!({
-            "http_proxy_password": "proxy-secret",
-            "provider_configs": {
-                "claude": {
-                    "manual_cookie_header": "sessionKey=abc",
-                    "api_token": "tok-123",
-                    "management_api_token": "management-secret"
-                }
-            },
-            "api_keys": {
-                "keys": {
-                    "zai": {
-                        "api_key": "cb_test_api_key_456",
-                        "label": "Work",
-                        "saved_at": "2026-01-01"
-                    }
-                }
-            },
-            "manual_cookies": {
-                "cookies": {
-                    "claude": {
-                        "cookie_header": "sessionKey=secret-cookie",
-                        "saved_at": "2026-01-01"
-                    }
-                }
-            },
-            "token_accounts": {
-                "factory": {
-                    "accounts": [{
-                        "id": "11111111-1111-1111-1111-111111111111",
-                        "label": "Team",
-                        "token": "raw-token-value",
-                        "added_at": 1
-                    }]
-                }
-            },
-            "secret_key": "top-secret"
-        });
-
-        let redacted = sanitize_settings_for_dump(raw, false);
-        let text = serde_json::to_string(&redacted).expect("serialize");
-
-        assert!(text.contains("[REDACTED]"));
-        assert!(!text.contains("proxy-secret"));
-        assert!(!text.contains("sessionKey=abc"));
-        assert!(!text.contains("tok-123"));
-        assert!(!text.contains("management-secret"));
-        assert!(!text.contains("cb_test_api_key_456"));
-        assert!(!text.contains("secret-cookie"));
-        assert!(!text.contains("raw-token-value"));
-        assert!(!text.contains("top-secret"));
-        // Non-secret identity fields stay.
-        assert!(text.contains("Work"));
-        assert!(text.contains("Team"));
-        assert!(text.contains("11111111-1111-1111-1111-111111111111"));
-    }
-
-    #[test]
-    fn sanitize_settings_for_dump_show_secrets_keeps_raw() {
-        let raw = json!({
-            "api_key": "keep-me",
-            "nested": { "token": "also-keep", "label": "Team" }
-        });
-
-        let out = sanitize_settings_for_dump(raw.clone(), true);
-        assert_eq!(out, raw);
-        assert_eq!(out["api_key"], "keep-me");
-        assert_eq!(out["nested"]["token"], "also-keep");
-    }
-}
+mod tests;

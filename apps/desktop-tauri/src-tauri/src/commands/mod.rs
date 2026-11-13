@@ -3,11 +3,11 @@ use std::sync::Mutex;
 
 use codexbar::core::{
     FetchContext, ManualEmptyCookiePolicy, ProviderAccountData, ProviderFetchResult, ProviderId,
-    ProviderMetadata, RateWindow, SourceMode, TokenAccount, TokenAccountOverride,
-    TokenAccountStore, instantiate_provider,
+    ProviderMetadata, RateWindow, SourceMode, TokenAccountStore, instantiate_provider,
 };
 use codexbar::locale;
 use codexbar::login::{self, LoginOutcome, LoginPhase};
+use codexbar::providers::copilot::login::{finish_device_login, start_device_login};
 use codexbar::providers::copilot::{CopilotApi, device_flow::CopilotDeviceFlow};
 use codexbar::secure_file::{self, SecureFileStatus};
 use codexbar::settings::{
@@ -35,6 +35,7 @@ mod bridge;
 mod browser_import;
 mod claude_accounts;
 pub(crate) mod claude_reconciliation;
+mod claude_swap_usage;
 mod claude_usage;
 mod codex_accounts;
 mod codex_workspaces;
@@ -46,7 +47,9 @@ mod grok_accounts;
 mod hooks;
 mod locale_cmd;
 mod openai_live;
+mod ordered_save;
 mod preferences_transfer;
+mod provider_account_usage;
 mod provider_detail;
 mod provider_refresh;
 mod provider_settings;
@@ -62,6 +65,7 @@ pub use agent_sessions::*;
 pub(crate) use bridge::*;
 pub use browser_import::*;
 pub use claude_accounts::*;
+pub use claude_swap_usage::*;
 pub use claude_usage::*;
 pub use codex_accounts::*;
 pub use codex_workspaces::*;
@@ -73,6 +77,7 @@ pub use hooks::*;
 pub use locale_cmd::*;
 pub use openai_live::*;
 pub use preferences_transfer::*;
+pub use provider_account_usage::*;
 pub use provider_detail::*;
 #[cfg(test)]
 pub(crate) use provider_refresh::is_provider_cache_fresh;
@@ -87,6 +92,8 @@ pub(crate) use usage_items::*;
 
 #[cfg(test)]
 mod credential_lane_tests;
+#[cfg(test)]
+mod fetch_context_tests;
 #[cfg(test)]
 mod last_good_owner_tests;
 #[cfg(test)]
@@ -126,7 +133,14 @@ fn canonical_provider_arg(provider_id: &str) -> Result<String, String> {
     Ok(parse_provider_arg(provider_id)?.cli_name().to_string())
 }
 
-fn provider_dashboard_url(id: ProviderId, settings: &Settings) -> Option<String> {
+/// `login_method` is the cached snapshot's plan label; providers whose
+/// dashboard depends on the account plan use it (for example Claude, upstream
+/// #4503). Pass `None` when no snapshot is cached.
+fn provider_dashboard_url(
+    id: ProviderId,
+    settings: &Settings,
+    login_method: Option<&str>,
+) -> Option<String> {
     match id {
         ProviderId::MiniMax => Some(
             codexbar::providers::MiniMaxProvider::dashboard_url_for_region(Some(
@@ -143,8 +157,7 @@ fn provider_dashboard_url(id: ProviderId, settings: &Settings) -> Option<String>
             settings.workspace_id(id),
         ))),
         _ => instantiate_provider(id)
-            .metadata()
-            .dashboard_url
+            .dashboard_url_for_login_method(login_method)
             .map(str::to_string),
     }
 }

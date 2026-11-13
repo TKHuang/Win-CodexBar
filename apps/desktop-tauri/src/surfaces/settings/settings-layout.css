@@ -194,19 +194,20 @@
   border-color: var(--accent, #007aff);
 }
 
-/* ── Menu-style select: borderless "Value ⌄" ──────────────────────── */
+/* ── Menu-style select ─────────────────────────────────────────────
+   Always boxed and left-aligned, like a Windows combo box. The borderless,
+   right-aligned macOS look left the value floating apart from its box and
+   right-aligned the opened option list. */
 .select.select--menu {
-  border-color: transparent;
-  background-color: transparent;
-  text-align: right;
-  text-align-last: right;
+  border-color: var(--panel-border);
+  background-color: var(--surface-elevated);
+  text-align: left;
+  text-align-last: left;
   font-size: 13px;
 }
 
-.select.select--menu:hover:not(:disabled),
-.select.select--menu:focus-visible {
-  border-color: var(--panel-border);
-  background-color: var(--surface-elevated);
+.select.select--menu option {
+  text-align: left;
 }
 
 /* ── About hero ───────────────────────────────────────────────────── */
@@ -292,6 +293,123 @@
 
 .settings-link-row__arrow {
   color: var(--text-secondary);
+}
+
+/* ── About → Acknowledgements ─────────────────────────────────────── */
+.acknowledgements__back {
+  align-self: flex-start;
+}
+
+.acknowledgements__footer {
+  text-align: center;
+}
+
+.settings-group__box > .acknowledgement + .acknowledgement {
+  border-top: 1px solid var(--panel-border);
+}
+
+.acknowledgement__summary {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 10px 0;
+  font-size: 13px;
+  color: var(--text-primary);
+  cursor: pointer;
+  list-style: none;
+}
+
+.acknowledgement__summary::-webkit-details-marker {
+  display: none;
+}
+
+.acknowledgement__summary::before {
+  content: "›";
+  flex-shrink: 0;
+  width: 10px;
+  color: var(--text-secondary);
+  transition: transform 0.15s;
+}
+
+.acknowledgement[open] > .acknowledgement__summary::before {
+  transform: rotate(90deg);
+}
+
+.acknowledgement__summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.acknowledgement__name {
+  flex-shrink: 0;
+}
+
+.acknowledgement__authors {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--text-secondary);
+}
+
+.acknowledgement__license {
+  flex-shrink: 0;
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.acknowledgement__body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 0 0 12px;
+  user-select: text;
+}
+
+.acknowledgement__detail + .acknowledgement__detail {
+  padding-top: 12px;
+  border-top: 1px solid var(--panel-border);
+}
+
+.acknowledgement__detail h4 {
+  margin: 0 0 4px;
+  font-size: 12px;
+  font-weight: 650;
+  color: var(--text-primary);
+}
+
+.acknowledgement__detail p {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-primary);
+}
+
+.acknowledgement__url {
+  display: block;
+  font-size: 12px;
+  text-align: left;
+  word-break: break-all;
+}
+
+.acknowledgement__note {
+  margin: 0 0 8px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.acknowledgement__text {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+}
+
+.acknowledgement__text + .acknowledgement__text {
+  margin-top: 12px;
 }
 
 /* ── Switcher shortcuts dialog ────────────────────────────────────── */
@@ -490,9 +608,34 @@
   border-bottom: 1px solid rgba(255, 255, 255, 0.06);
 }
 
-/* Centered like the macOS title; the left padding balances the controls. */
+/* The titlebar follows --app-bg, so under Light the controls' white strokes
+   (parity-settings.css) would vanish into it. */
+[data-theme="light"] .settings--sidebar .settings-titlebar {
+  border-bottom-color: rgba(0, 0, 0, 0.08);
+}
+
+[data-theme="light"] .settings--sidebar .settings-titlebar__control {
+  color: rgba(0, 0, 0, 0.72);
+}
+
+[data-theme="light"] .settings--sidebar .settings-titlebar__control:hover {
+  background: rgba(0, 0, 0, 0.08);
+  color: #000;
+}
+
+[data-theme="light"] .settings--sidebar .settings-titlebar__control--history:disabled {
+  color: rgba(0, 0, 0, 0.25);
+  background: transparent;
+}
+
+[data-theme="light"] .settings--sidebar .settings-titlebar__control--close:hover {
+  background: #e81123;
+  color: #fff;
+}
+
+/* Centered like the macOS title; Back/Forward on the left balance the
+   window controls on the right. */
 .settings--sidebar .settings-titlebar__title {
-  padding-left: 92px;
   text-align: center;
   font-size: 13px;
   font-weight: 650;
@@ -698,6 +841,18 @@
   background: rgba(255, 255, 255, 0.12);
 }
 
+[data-theme="light"] .settings-sidebar__pane:hover,
+[data-theme="light"] .providers-sidebar__row:hover {
+  background: rgba(0, 0, 0, 0.05);
+}
+
+[data-theme="light"] .settings-sidebar__pane--active,
+[data-theme="light"] .settings-sidebar__pane--active:hover,
+[data-theme="light"] .providers-sidebar__row--selected,
+[data-theme="light"] .providers-sidebar__row--selected:hover {
+  background: rgba(0, 0, 0, 0.08);
+}
+
 .settings-sidebar__label,
 .providers-sidebar__name {
   flex: 1;
@@ -769,6 +924,11 @@
   border-radius: 0;
   filter: brightness(0) invert(1);
   opacity: 0.85;
+}
+
+/* macOS template glyphs follow the label color, so they turn dark in light mode. */
+[data-theme="light"] .providers-sidebar__row .provider-icon {
+  filter: brightness(0);
 }
 
 .providers-sidebar__row--disabled {
@@ -1808,6 +1968,11 @@
 
 .quota-warning-field .number-input {
   width: 64px;
+  font-variant-numeric: tabular-nums;
+}
+
+.http-server-port .number-input {
+  width: 72px;
   font-variant-numeric: tabular-nums;
 }
 

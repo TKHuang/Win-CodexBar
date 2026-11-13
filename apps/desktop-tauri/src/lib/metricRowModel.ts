@@ -1,6 +1,7 @@
 import { normalizeResetDescription } from "../hooks/useFormattedResetTime";
 import type { LocaleKey } from "../i18n/keys";
 import type {
+  DailyTargetSnapshot,
   PaceStage,
   RateWindowSnapshot,
   WindowPaceSnapshot,
@@ -23,8 +24,8 @@ interface LanePolicy {
   pace: "byWindowLength" | "exactWindow" | "never";
 }
 
-const SESSION_MINUTES = 300;
-const WEEK_MINUTES = 7 * 24 * 60;
+export const SESSION_MINUTES = 300;
+export const WEEK_MINUTES = 7 * 24 * 60;
 
 const LANE_POLICY: Record<MetricLane, LanePolicy> = {
   primary: { thresholdWindow: "session", workdayTicks: false, pace: "byWindowLength" },
@@ -182,20 +183,14 @@ function absoluteResetDescription(target: Date, now: Date, t: Translate): string
 }
 
 /**
- * Upstream `UsageFormatter.resetCountdownDescription`: the unlocalized "in 2d 3h"
- * countdown that `syntheticRegenDetail` puts inside "Regenerates %@", always relative.
+ * Upstream `syntheticRegenDetail`: "Regenerates %@" around the countdown, always
+ * relative. The bare localized duration fills `RegeneratesCountdown`, which owns
+ * its own preposition per locale; zero remaining uses the whole-sentence
+ * `RegeneratesNow`.
  */
-function regenCountdown(seconds: number): string {
-  const parts = countdownParts(seconds);
-  if (!parts) return "now";
-  const { days, hours, minutes } = parts;
-  if (days > 0) {
-    if (hours > 0) return `in ${days}d ${hours}h`;
-    if (minutes > 0) return `in ${days}d ${minutes}m`;
-    return `in ${days}d`;
-  }
-  if (hours > 0) return minutes > 0 ? `in ${hours}h ${minutes}m` : `in ${hours}h`;
-  return `in ${minutes}m`;
+function regenText(seconds: number, t: Translate): string {
+  const duration = formatCountdown(seconds, DURATION_KEYS, t);
+  return duration === null ? t("RegeneratesNow") : fill(t("RegeneratesCountdown"), duration);
 }
 
 export function metricResetText(
@@ -209,7 +204,7 @@ export function metricResetText(
     return normalizeResetDescription(resetDescriptionFallback(snap), t);
   }
   if (snap.resetRegenerates) {
-    return fill(t("RegeneratesCountdown"), regenCountdown((target - now) / 1000));
+    return regenText((target - now) / 1000, t);
   }
   if (!relative) {
     return fill(t("ResetsAtLabel"), absoluteResetDescription(new Date(target), new Date(now), t));
@@ -265,6 +260,26 @@ function paceMetaText(pace: WindowPaceSnapshot, kind: PaceKind, t: Translate): s
     }
   }
   return right ? `${left} · ${right}` : left;
+}
+
+const DAILY_TARGET_KEYS: Record<string, LocaleKey> = {
+  "%": "PaceDailyTargetPercent",
+  credits: "PaceDailyTargetCredits",
+  requests: "PaceDailyTargetRequests",
+};
+
+/**
+ * Upstream `UsagePaceText.dailyTarget`: the per-day share in the allowance's
+ * own unit. Units without a key (for example a currency) show no target.
+ */
+function dailyTargetText(target: DailyTargetSnapshot, t: Translate): string | null {
+  const key = DAILY_TARGET_KEYS[target.unit];
+  if (!key || !Number.isFinite(target.amount)) return null;
+  const digits = target.unit === "%" ? 1 : 2;
+  const amount = new Intl.NumberFormat(intlLocale(t), { maximumFractionDigits: digits }).format(
+    Math.max(0, target.amount),
+  );
+  return fill(t(key), amount);
 }
 
 function normalizedMarkerPercents(values: number[]): number[] {
@@ -342,6 +357,15 @@ export function metricRowPresentation(input: MetricRowInput, t: Translate): Metr
     input.showResetWhenExhausted && snap.isExhausted && resetTarget > input.now && input.resetText !== null;
   const visible = visiblePace(input);
   const markers = barMarkers(input);
+  // The daily target shares the pace setting and the non-compact meta line.
+  const dailyTarget =
+    input.paceEnabled && !input.compact && snap.dailyTarget
+      ? dailyTargetText(snap.dailyTarget, t)
+      : null;
+  const metaParts = [
+    visible && !input.compact ? paceMetaText(visible.pace, visible.kind, t) : null,
+    dailyTarget,
+  ].filter((part): part is string => part !== null);
   const valuePercent = Math.round(shown);
   const pacePercent =
     visible && PACE_DIRECTION[visible.pace.stage] !== "onPace"
@@ -352,7 +376,7 @@ export function metricRowPresentation(input: MetricRowInput, t: Translate): Metr
       ? null
       : percentLabel(shown, t(showAsUsed ? "PanelUsedSuffix" : "PanelLeftSuffix")),
     resetText: input.compact && !replacesPercent ? null : input.resetText,
-    metaText: visible && !input.compact ? paceMetaText(visible.pace, visible.kind, t) : null,
+    metaText: metaParts.length > 0 ? metaParts.join(" · ") : null,
     bar: {
       fillPercent: renderedFillPercent(shown),
       valuePercent,

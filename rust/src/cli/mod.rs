@@ -6,16 +6,11 @@
 //! - `codexbar cost` - print local token cost usage
 //! - `codexbar autostart` - manage Windows auto-start
 
-#![allow(
-    dead_code,
-    reason = "CLI subcommand types reserved for future command expansion"
-)]
-
 pub mod account;
 pub mod autostart;
 pub mod config;
 pub mod cost;
-mod cost_period;
+pub(crate) mod cost_period;
 pub mod dashboard;
 pub mod diagnose;
 mod error_kind;
@@ -45,6 +40,14 @@ pub mod exit_codes {
     pub const USAGE_ERROR: i32 = 64;
     /// Quota could not be checked (`EX_UNAVAILABLE`); used by `codexbar guard`.
     pub const UNAVAILABLE: i32 = 69;
+    /// `config login`: the user denied the device or sign-in request.
+    pub const LOGIN_DENIED: i32 = 5;
+    /// `config login`: the device code expired before it was approved.
+    pub const LOGIN_EXPIRED: i32 = 6;
+    /// `config login`: stopped with Ctrl-C before the credential was saved.
+    pub const LOGIN_CANCELLED: i32 = 7;
+    /// `config login --provider grok|kiro`: the provider's CLI is not installed.
+    pub const LOGIN_MISSING_BINARY: i32 = 8;
 }
 
 /// CodexBar - Monitor AI provider usage limits
@@ -109,6 +112,27 @@ pub enum Commands {
 
     /// List local Codex project/workspace usage
     Workspaces(workspaces::WorkspacesArgs),
+}
+
+/// Serialize `value` as pretty or compact JSON.
+pub(crate) fn to_json<T: serde::Serialize + ?Sized>(
+    value: &T,
+    pretty: bool,
+) -> serde_json::Result<String> {
+    if pretty {
+        serde_json::to_string_pretty(value)
+    } else {
+        serde_json::to_string(value)
+    }
+}
+
+/// Print `value` as pretty or compact JSON on stdout.
+pub(crate) fn print_json<T: serde::Serialize + ?Sized>(
+    value: &T,
+    pretty: bool,
+) -> anyhow::Result<()> {
+    println!("{}", to_json(value, pretty)?);
+    Ok(())
 }
 
 #[cfg(test)]

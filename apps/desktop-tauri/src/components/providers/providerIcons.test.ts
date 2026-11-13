@@ -8,20 +8,16 @@ import { PROVIDER_ICON_REGISTRY, brandColorOnDark, providerBarAccent } from "./p
 const REPO_ROOT = import.meta.dirname + "/../../../../../";
 
 /**
- * The `ProviderId::X => "#RRGGBB"` rows of the Rust `brand_color` table in
- * `rust/src/core/provider.rs`, keyed by the lowercased variant name (which
- * is the registry id for every provider).
+ * The `spec(P::X, "cli", "Display", "#RRGGBB")` rows of the Rust provider spec
+ * table in `rust/src/core/provider/spec.rs`, keyed by the lowercased variant
+ * name (which is the registry id for every provider).
  */
 function rustBrandColors(): Map<string, string> {
-  // CI checks out with CRLF line endings; normalize so the "\n}\n" search below matches.
-  const source = readFileSync(REPO_ROOT + "rust/src/core/provider.rs", "utf8").replace(/\r\n/g, "\n");
-  const start = source.indexOf("pub fn brand_color(id: ProviderId)");
-  const end = source.indexOf("\n}\n", start);
+  const source = readFileSync(REPO_ROOT + "rust/src/core/provider/spec.rs", "utf8");
   const rows = new Map<string, string>();
-  if (start < 0 || end < 0) return rows;
-  for (const match of source
-    .slice(start, end)
-    .matchAll(/ProviderId::(\w+) => "(#[0-9A-Fa-f]{6})"/g)) {
+  for (const match of source.matchAll(
+    /spec\(\s*P::(\w+),\s*"[^"]*",\s*"[^"]*",\s*"(#[0-9A-Fa-f]{6})"/g,
+  )) {
     rows.set(match[1].toLowerCase(), match[2].toLowerCase());
   }
   return rows;
@@ -81,6 +77,7 @@ const MAC_PARITY_ACCENTS: Array<[string, string]> = [
   ["openaiapi", "#0f826e"],
   ["openrouter", "#6467f2"],
   ["perplexity", "#20b2aa"],
+  ["pi", "#4d9abf"],
   ["poe", "#5d5cde"],
   ["qoder", "#10b981"],
   ["sakana", "#2975db"],
@@ -117,6 +114,12 @@ describe("provider icon registry", () => {
     expect(entry.brandColor.toLowerCase()).toBe("#317cff");
   });
 
+  it("uses the official WorkBuddy mascot with the existing teal accent", () => {
+    expect(PROVIDER_ICON_REGISTRY.workbuddy.svgPath).toContain("M18.777 1.647");
+    expect(PROVIDER_ICON_REGISTRY.workbuddy.svgPath).toContain('fill="currentColor"');
+    expect(PROVIDER_ICON_REGISTRY.workbuddy.brandColor.toLowerCase()).toBe("#0dc8a6");
+  });
+
   it("does not expose the retired Crof provider", () => {
     expect(PROVIDER_ICON_REGISTRY).not.toHaveProperty("crof");
   });
@@ -139,10 +142,17 @@ describe("provider icon registry", () => {
   });
 
   it("paints ElevenLabs bars in the label color, as Mac does", () => {
-    expect(providerBarAccent("elevenlabs")).toBe("var(--mac-text, rgba(0, 0, 0, 0.85))");
-    expect(providerBarAccent("ElevenLabs", null)).toBe("var(--mac-text, rgba(0, 0, 0, 0.85))");
+    expect(providerBarAccent("elevenlabs")).toBe("var(--text-primary, rgba(0, 0, 0, 0.85))");
+    expect(providerBarAccent("ElevenLabs", null)).toBe("var(--text-primary, rgba(0, 0, 0, 0.85))");
     // The icon keeps its brand color.
     expect(PROVIDER_ICON_REGISTRY.elevenlabs.brandColor.toLowerCase()).toBe("#111827");
+  });
+
+  it("paints abliteration.ai bars in the label color and resolves its display name", () => {
+    expect(providerBarAccent("abliteration")).toBe("var(--text-primary, rgba(0, 0, 0, 0.85))");
+    expect(providerBarAccent("abliteration.ai")).toBe("var(--text-primary, rgba(0, 0, 0, 0.85))");
+    expect(PROVIDER_ICON_REGISTRY.abliteration.brandColor.toLowerCase()).toBe("#1b1b1b");
+    expect(PROVIDER_ICON_REGISTRY.abliteration.svgPath).toContain('fill="currentColor"');
   });
 
   it("uses the user's override, else the brand color, for card bars", () => {
@@ -169,6 +179,7 @@ describe("provider icon registry", () => {
       .map(([id]) => id)
       .sort();
     expect(lifted).toEqual([
+      "abliteration",
       "aixy",
       "deepinfra",
       "elevenlabs",
@@ -177,6 +188,7 @@ describe("provider icon registry", () => {
       "manus",
       "parallel",
       "replicate",
+      "soniox",
       "synthetic",
       "typesafe",
       "v0",

@@ -1,4 +1,4 @@
-use crate::host::{CommandError, CommandOptions, CommandRunner};
+use crate::host::{CommandError, CommandOptions, CommandResult, CommandRunner};
 use chrono::{DateTime, Duration as ChronoDuration, Local, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -7,6 +7,7 @@ use std::fs::File;
 use std::future::Future;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -316,7 +317,11 @@ pub struct ClaudeTranscriptMetadata {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentSessionDiscoveryMode {
     Disabled,
-    Enabled { ssh_hosts: Vec<String> },
+    /// Local sessions only: no Tailscale probe and no SSH polling.
+    LocalOnly,
+    Enabled {
+        ssh_hosts: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -338,13 +343,15 @@ pub struct AgentSessionDiscovery {
     remote: RemoteSessionFetcher,
 }
 
-mod claude_desktop;
+pub(crate) mod claude_desktop;
 mod focus;
 mod native_processes;
 mod parsers;
 pub mod pi_family;
 mod remote;
 pub use focus::{focus_session, request_session_attention};
+pub(crate) use remote::RemoteDiscoveryGate;
+use remote::{HiddenProcessSpawner, RemoteContext};
 
 struct CodexRollout {
     path: PathBuf,
@@ -883,20 +890,66 @@ impl AgentSessionDiscovery {
         Self { local, remote }
     }
 
+    /// Desktop discovery. Remote work follows the Agent sessions settings, re-read per spawn.
     pub async fn scan(&self, mode: AgentSessionDiscoveryMode) -> AgentSessionDiscoveryResult {
-        let AgentSessionDiscoveryMode::Enabled { ssh_hosts } = mode else {
-            return AgentSessionDiscoveryResult::Disabled;
+        self.scan_with_gate(mode, RemoteDiscoveryGate::from_settings())
+            .await
+    }
+
+    /// Discovery with an explicit remote gate. The CLI passes
+    /// `RemoteDiscoveryGate::explicit_request()` because its `--ssh-host` and Tailscale
+    /// discovery are direct requests that do not depend on desktop settings.
+    pub(crate) async fn scan_with_gate(
+        &self,
+        mode: AgentSessionDiscoveryMode,
+        gate: RemoteDiscoveryGate,
+    ) -> AgentSessionDiscoveryResult {
+        let ctx = RemoteContext {
+            gate,
+            spawner: Arc::new(HiddenProcessSpawner),
+            path_var: std::env::var_os("PATH"),
         };
-        let (local, automatic) =
-            tokio::join!(self.local.scan(), RemoteSessionFetcher::tailscale_hosts());
+        self.scan_guarded(mode, &ctx).await
+    }
+
+    /// Scan with the gate, spawner and `PATH` injected so tests can record every remote
+    /// spawn. `Disabled` and `LocalOnly` never reach a remote seam. For `Enabled`, the
+    /// gate is re-read before each remote spawn and again before results are merged, so
+    /// a mode captured before "Local sessions only" was turned on cannot spawn SSH or
+    /// Tailscale afterwards, and results gathered after it closed are dropped.
+    async fn scan_guarded(
+        &self,
+        mode: AgentSessionDiscoveryMode,
+        ctx: &RemoteContext,
+    ) -> AgentSessionDiscoveryResult {
+        let ssh_hosts = match mode {
+            AgentSessionDiscoveryMode::Disabled => return AgentSessionDiscoveryResult::Disabled,
+            AgentSessionDiscoveryMode::LocalOnly => {
+                let local = self.local.scan().await;
+                return AgentSessionDiscoveryResult::Hosts(vec![local]);
+            }
+            AgentSessionDiscoveryMode::Enabled { ssh_hosts } => ssh_hosts,
+        };
+        if !ctx.gate.allows() {
+            let local = self.local.scan().await;
+            return AgentSessionDiscoveryResult::Hosts(vec![local]);
+        }
+        let (local, automatic) = tokio::join!(
+            self.local.scan(),
+            RemoteSessionFetcher::tailscale_hosts(ctx)
+        );
         let (automatic_hosts, tailscale_error) = match automatic {
             Ok(hosts) => (hosts, None),
             Err(error) => (Vec::new(), Some(error)),
         };
         let merged_hosts = RemoteSessionFetcher::merge_hosts(&ssh_hosts, &automatic_hosts);
-        let mut remote = self.remote.fetch(&merged_hosts).await;
+        let mut remote = self.remote.fetch(&merged_hosts, ctx).await;
         if let Some(error) = tailscale_error {
             remote.push(AgentSessionHostResult::failed("tailscale", error));
+        }
+        if !ctx.gate.allows() {
+            // "Local sessions only" was turned on while remote work was in flight.
+            return AgentSessionDiscoveryResult::Hosts(vec![local]);
         }
         let mut hosts = Vec::with_capacity(remote.len() + 1);
         hosts.push(local);

@@ -1,11 +1,6 @@
-import { useCallback, useEffect, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
-import type {
-  CodexAccount,
-  CodexAccountsStateBridge,
-  CodexAccountUsageSnapshot,
-  CodexSwitchResult,
-} from "../../../../../types/bridge";
+import { useState } from "react";
+import type { CodexAccountUsageSnapshot, CodexSwitchResult } from "../../../../../types/bridge";
+import { useCodexAccountsState } from "../../../../../hooks/useCodexAccountsState";
 import type { LocaleKey } from "../../../../../i18n/keys";
 import {
   codexAccountAdd,
@@ -14,13 +9,14 @@ import {
   codexAccountRemove,
   codexAccountRestartDesktop,
   codexAccountSwitch,
-  getCodexAccountsState,
 } from "../../../../../lib/tauri";
 import { buildCodexAccountSurfaceLabels } from "../../../../../components/codexAccountDisplay";
 
 interface Props {
   t: (key: LocaleKey) => string;
   hidePersonalInfo?: boolean;
+  /** Settings `showAsUsed`; usage windows read as used instead of left. */
+  showAsUsed?: boolean;
 }
 
 /**
@@ -34,55 +30,25 @@ interface Props {
  * ambient identity, and remove managed homes. For MSIX Codex Desktop installs
  * a restart action is offered when a session snapshot is available to restore.
  */
-export function CodexAccountsSection({ t, hidePersonalInfo = false }: Props) {
-  const [accounts, setAccounts] = useState<CodexAccount[]>([]);
-  const [snapshots, setSnapshots] = useState<
-    Record<string, CodexAccountUsageSnapshot>
-  >({});
-  const [displayNames, setDisplayNames] = useState<Record<string, string>>({});
-  const [accountOrdinals, setAccountOrdinals] = useState<Record<string, number>>({});
-  const [accountNeedsAuthentication, setAccountNeedsAuthentication] = useState<Record<string, boolean>>({});
-  const [loaded, setLoaded] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+export function CodexAccountsSection({ t, hidePersonalInfo = false, showAsUsed = false }: Props) {
+  const {
+    accounts,
+    snapshots,
+    displayNames,
+    accountOrdinals,
+    needsAuthentication: accountNeedsAuthentication,
+    loaded,
+    loading,
+    error,
+    setError,
+    load,
+    setSnapshot,
+  } = useCodexAccountsState();
+  const [acting, setBusy] = useState(false);
+  const busy = loading || acting;
   const [switchResult, setSwitchResult] = useState<CodexSwitchResult | null>(
     null,
   );
-
-  const load = useCallback(async () => {
-    setBusy(true);
-    setError(null);
-    try {
-      const next: CodexAccountsStateBridge = await getCodexAccountsState();
-      setAccounts(next.accounts);
-      setDisplayNames(next.displayNames ?? {});
-      setAccountOrdinals(next.accountOrdinals);
-      setSnapshots(next.snapshots);
-      setAccountNeedsAuthentication(next.needsAuthentication ?? {});
-      setLoaded(true);
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    void load();
-  }, [load]);
-
-  // Live-refresh after the provider engine runs the per-account lanes
-  // (ADR 0003 multi-account refresh) so the panel stays current.
-  useEffect(() => {
-    let cancelled = false;
-    const unlistenPromise = listen("codex-accounts-updated", () => {
-      if (!cancelled) void load();
-    });
-    return () => {
-      cancelled = true;
-      void unlistenPromise.then((fn) => fn());
-    };
-  }, [load]);
 
   const handleAdd = async () => {
     setBusy(true);
@@ -118,7 +84,7 @@ export function CodexAccountsSection({ t, hidePersonalInfo = false }: Props) {
     setError(null);
     try {
       const snapshot = await codexAccountFetch(id);
-      setSnapshots((prev) => ({ ...prev, [id]: snapshot }));
+      setSnapshot(id, snapshot);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -247,7 +213,7 @@ export function CodexAccountsSection({ t, hidePersonalInfo = false }: Props) {
                             : t("CodexAccountsSourceManaged")}
                         </span>
                         {snapshot ? (
-                          <CodexUsagePill snapshot={snapshot} t={t} />
+                          <CodexUsagePill snapshot={snapshot} t={t} showAsUsed={showAsUsed} />
                         ) : (
                           <span className="credential-card__date">
                             {t("CodexAccountsUsageUnavailable")}
@@ -317,16 +283,21 @@ export function CodexAccountsSection({ t, hidePersonalInfo = false }: Props) {
 function CodexUsagePill({
   snapshot,
   t,
+  showAsUsed,
 }: {
   snapshot: CodexAccountUsageSnapshot;
   t: (key: LocaleKey) => string;
+  showAsUsed: boolean;
 }) {
   const plan = snapshot.plan ?? "";
   const blocked = snapshot.allowed === false || snapshot.limitReached === true;
   const windows = [snapshot.primaryWindow, snapshot.secondaryWindow]
     .filter((window): window is NonNullable<typeof window> => window != null)
     .map((window) => {
-      const pct = `${Math.round(window.usedPercent)}%`;
+      const used = Math.max(0, Math.min(100, Math.round(window.usedPercent)));
+      const pct = showAsUsed
+        ? `${used}% ${t("PanelUsedSuffix")}`
+        : `${100 - used}% ${t("PanelLeftSuffix")}`;
       if (window.limitWindowSeconds % 86_400 === 0) {
         return `${window.limitWindowSeconds / 86_400}d ${pct}`;
       }

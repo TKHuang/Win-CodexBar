@@ -116,6 +116,7 @@ describe("metricResetText", () => {
     [45 * MINUTE, false, "Regenerates in 45m"],
     [2 * HOUR + 5 * MINUTE, true, "Regenerates in 2h 5m"],
     [DAY + 3 * HOUR, true, "Regenerates in 1d 3h"],
+    [2 * DAY + 3 * HOUR, true, "Regenerates in 2d 3h"],
     [2 * DAY, true, "Regenerates in 2d"],
     [500, true, "Regenerates now"],
   ])("counts a regen lane %d ms down to %j (relative %s)", (ms, relative, expected) => {
@@ -128,12 +129,19 @@ describe("metricResetText", () => {
     expect(metricResetText(snap, relative, NOW, en)).toBe(expected);
   });
 
-  it("uses the Mac translation of Regenerates around the English countdown", () => {
+  // The countdown is a bare localized duration; each template supplies its own
+  // preposition, so no locale inherits the English "in " prefix.
+  it.each([
+    ["uk-UA.ftl", 45 * MINUTE, "Регенерує через 45 хв"],
+    ["uk-UA.ftl", 2 * DAY + 3 * HOUR, "Регенерує через 2 дн. 3 год"],
+    ["uk-UA.ftl", 500, "Регенерує зараз"],
+    ["ja-JP.ftl", 45 * MINUTE, "45 分後に再生成"],
+  ])("localizes the regen countdown in %s for %d ms", (file, ms, expected) => {
     const snap = rateWindow({
-      resetsAt: new Date(NOW + 45 * MINUTE).toISOString(),
+      resetsAt: new Date(NOW + ms).toISOString(),
       resetRegenerates: true,
     });
-    expect(metricResetText(snap, true, NOW, fromFtl("ja-JP.ftl"))).toBe("in 45m に再生成");
+    expect(metricResetText(snap, true, NOW, fromFtl(file))?.replace(/\u202f/g, " ")).toBe(expected);
   });
 });
 
@@ -508,5 +516,60 @@ describe("metricRowPresentation bar", () => {
     expect(
       metricRowPresentation(input({ lane: "extra", snap: weekly({ pace: null }) }), en).bar.valueText,
     ).toBe("63%");
+  });
+});
+
+describe("monthly daily target", () => {
+  // A calendar-month allowance on the secondary lane with a synthetic target.
+  function monthly(dailyTarget: RateWindowSnapshot["dailyTarget"]): RateWindowSnapshot {
+    return rateWindow({
+      usedPercent: 79,
+      remainingPercent: 21,
+      windowMinutes: 43_200,
+      pace: pace(),
+      dailyTarget,
+    });
+  }
+
+  it("shows the per-day share when the window has no pace", () => {
+    const snap = { ...monthly({ amount: 0, unit: "%" }), pace: null };
+    expect(metricRowPresentation(input({ lane: "secondary", snap }), en).metaText).toContain(
+      "≈ 0% / day to last until reset",
+    );
+  });
+
+  it("shows a credit allowance's per-day share in the allowance's unit", () => {
+    const row = metricRowPresentation(
+      input({ lane: "secondary", snap: monthly({ amount: 21.0909, unit: "credits" }) }),
+      en,
+    );
+    expect(row.metaText).toContain("≈ 21.09 credits / day to last until reset");
+  });
+
+  it("formats percent, request and unknown units", () => {
+    const text = (dailyTarget: RateWindowSnapshot["dailyTarget"]) =>
+      metricRowPresentation(input({ lane: "secondary", snap: monthly(dailyTarget) }), en).metaText ?? "";
+
+    expect(text({ amount: 2.46, unit: "%" })).toContain("≈ 2.5% / day to last until reset");
+    expect(text({ amount: 10.714, unit: "requests" })).toContain(
+      "≈ 10.71 requests / day to last until reset",
+    );
+    expect(text({ amount: 5, unit: "tokens" })).not.toContain("/ day");
+  });
+
+  it("follows the pace setting and hides on compact rows", () => {
+    const target = { amount: 21.09, unit: "credits" };
+    expect(
+      metricRowPresentation(input({ lane: "secondary", snap: monthly(target), paceEnabled: false }), en)
+        .metaText,
+    ).toBeNull();
+    expect(
+      metricRowPresentation(input({ lane: "secondary", snap: monthly(target), compact: true }), en).metaText,
+    ).toBeNull();
+  });
+
+  it("shows nothing when the window carries no target", () => {
+    const row = metricRowPresentation(input({ lane: "secondary", snap: monthly(null) }), en);
+    expect(row.metaText ?? "").not.toContain("/ day");
   });
 });

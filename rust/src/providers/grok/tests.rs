@@ -172,6 +172,116 @@ fn auto_tries_switched_login_before_cookies() {
 }
 
 #[test]
+fn isolated_account_auto_skips_ambient_login_and_browser() {
+    assert_eq!(
+        grok_steps_for_context(true, true, true, true),
+        vec![GrokAutoStep::ApiKey, GrokAutoStep::ManualCookie]
+    );
+    assert_eq!(
+        grok_steps_for_context(false, true, true, true),
+        vec![GrokAutoStep::ManualCookie]
+    );
+    assert!(grok_steps_for_context(false, false, true, true).is_empty());
+    assert_eq!(
+        grok_steps_for_context(true, false, true, false),
+        grok_auto_steps(true, false, true)
+    );
+}
+
+fn isolated_cookie_account_context(cookie_source: &str, usage_source: &str) -> FetchContext {
+    let mut settings = crate::settings::Settings::default();
+    settings.set_cookie_source(ProviderId::Grok, cookie_source);
+    settings.set_usage_source(ProviderId::Grok, usage_source);
+    let account = crate::core::TokenAccount::new("work", "Cookie: sso=account-session");
+    let mut ctx = crate::core::build_fetch_context(
+        ProviderId::Grok,
+        &settings,
+        &crate::settings::ManualCookies::default(),
+        &crate::settings::ApiKeys::default(),
+        Some(&account),
+    );
+    ctx.token_account_isolated = true;
+    ctx
+}
+
+#[test]
+fn isolated_cookie_account_with_cli_source_uses_its_cookie() {
+    let ctx = isolated_cookie_account_context("manual", "cli");
+    assert_eq!(ctx.source_mode, SourceMode::Cli);
+    assert_eq!(
+        grok_isolated_route(&ctx),
+        GrokIsolatedRoute::Cookie("Cookie: sso=account-session")
+    );
+}
+
+#[test]
+fn isolated_cookie_account_with_cookie_source_off_fails_closed() {
+    for usage_source in ["auto", "cli", "oauth"] {
+        let ctx = isolated_cookie_account_context("off", usage_source);
+        assert!(
+            matches!(ctx.source_mode, SourceMode::Cli | SourceMode::OAuth),
+            "{usage_source}: {:?}",
+            ctx.source_mode
+        );
+        assert_eq!(
+            grok_isolated_route(&ctx),
+            GrokIsolatedRoute::Missing,
+            "{usage_source}"
+        );
+    }
+}
+
+#[test]
+fn isolated_cookie_account_with_cookie_source_auto_keeps_its_cookie() {
+    let ctx = isolated_cookie_account_context("auto", "cli");
+    assert_eq!(ctx.source_mode, SourceMode::Cli);
+    assert_eq!(
+        grok_isolated_route(&ctx),
+        GrokIsolatedRoute::Cookie("Cookie: sso=account-session")
+    );
+}
+
+#[test]
+fn isolated_route_prefers_account_bearer_over_cookie() {
+    let ctx = FetchContext {
+        api_key: Some(" bearer-token ".into()),
+        manual_cookie_header: Some("sso=x".into()),
+        token_account_isolated: true,
+        ..FetchContext::default()
+    };
+    assert_eq!(
+        grok_isolated_route(&ctx),
+        GrokIsolatedRoute::Bearer("bearer-token")
+    );
+    let blank = FetchContext {
+        api_key: Some("  ".into()),
+        manual_cookie_header: Some(String::new()),
+        token_account_isolated: true,
+        ..FetchContext::default()
+    };
+    assert_eq!(grok_isolated_route(&blank), GrokIsolatedRoute::Missing);
+}
+
+#[tokio::test]
+async fn isolated_account_without_credential_fails_closed_for_every_explicit_source() {
+    for source_mode in [SourceMode::Cli, SourceMode::OAuth, SourceMode::Web] {
+        let ctx = FetchContext {
+            source_mode,
+            token_account_isolated: true,
+            ..FetchContext::default()
+        };
+        let error = GrokProvider::new()
+            .fetch_usage(&ctx)
+            .await
+            .expect_err("missing account credential must fail closed");
+        assert!(
+            matches!(&error, ProviderError::Other(message) if message.contains("Grok account")),
+            "{source_mode:?}: {error}"
+        );
+    }
+}
+
+#[test]
 fn cookie_refresh_uses_cache_when_present() {
     assert_eq!(
         cookie_refresh_action(true, None),
@@ -396,4 +506,70 @@ fn account_usage_marks_informational_windows_unavailable() {
     let usage = account_usage_from_result(&result);
     assert!(!usage.usage_available);
     assert_eq!(usage.used_percent, None);
+}
+
+#[test]
+fn terminal_sign_in_failure_names_the_grok_login_fix() {
+    let error = sign_in_hint_for_terminal_error(ProviderError::AuthRequired);
+
+    assert!(error.to_string().contains("grok login"), "{error}");
+    assert_eq!(
+        error.state_kind(),
+        crate::core::ProviderStateKind::NeedsAuthentication
+    );
+    assert!(!matches!(error, ProviderError::AuthRequired));
+}
+
+#[test]
+fn terminal_mapping_leaves_other_errors_unchanged() {
+    let error = sign_in_hint_for_terminal_error(ProviderError::Timeout);
+
+    assert!(matches!(error, ProviderError::Timeout), "{error}");
+    let other = sign_in_hint_for_terminal_error(ProviderError::Other("kept".to_string()));
+    assert_eq!(other.to_string(), "kept");
+}
+
+fn hint_context(
+    source_mode: SourceMode,
+    api_key: Option<&str>,
+    manual_cookie_header: Option<&str>,
+    token_account_isolated: bool,
+) -> FetchContext {
+    FetchContext {
+        source_mode,
+        api_key: api_key.map(str::to_string),
+        manual_cookie_header: manual_cookie_header.map(str::to_string),
+        token_account_isolated,
+        ..FetchContext::default()
+    }
+}
+
+#[test]
+fn sign_in_hint_applies_to_ambient_login_routes() {
+    for ctx in [
+        hint_context(SourceMode::Cli, None, None, false),
+        hint_context(SourceMode::Cli, Some("key"), Some("sso=x"), false),
+        hint_context(SourceMode::OAuth, None, Some("sso=x"), false),
+        hint_context(SourceMode::Web, Some("key"), None, false),
+        hint_context(SourceMode::Auto, None, None, false),
+        hint_context(SourceMode::Auto, Some("  "), Some(" "), false),
+    ] {
+        assert!(sign_in_hint_applies(&ctx), "{:?}", ctx.source_mode);
+    }
+}
+
+#[test]
+fn sign_in_hint_skips_supplied_and_isolated_credentials() {
+    for ctx in [
+        hint_context(SourceMode::Web, None, Some("sso=x"), false),
+        hint_context(SourceMode::OAuth, Some("key"), None, false),
+        hint_context(SourceMode::Auto, Some("key"), None, false),
+        hint_context(SourceMode::Auto, None, Some("sso=x"), false),
+        hint_context(SourceMode::Auto, Some("key"), None, true),
+        hint_context(SourceMode::Web, None, Some("sso=x"), true),
+        hint_context(SourceMode::Cli, Some("key"), None, true),
+        hint_context(SourceMode::OAuth, None, Some("sso=x"), true),
+    ] {
+        assert!(!sign_in_hint_applies(&ctx), "{:?}", ctx.source_mode);
+    }
 }

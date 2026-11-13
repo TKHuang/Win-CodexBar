@@ -3,36 +3,33 @@
 //! Fetches usage data from Kiro (Amazon's AI coding assistant)
 //! Uses kiro-cli for authentication and usage fetching
 
+mod cli_path;
 #[cfg(test)]
 mod tests;
 mod usage_limits;
-pub mod version;
 
-// Re-exports for version compatibility checking
-#[allow(
-    unused_imports,
-    reason = "imports needed for future Kiro provider wiring"
-)]
-pub use version::{
-    KiroVersion, detect_version, find_kiro_cli, get_version, is_compatible, is_installed,
-};
+pub use cli_path::find_kiro_cli;
 
 use async_trait::async_trait;
 use chrono::Datelike;
 use regex_lite::Regex;
-use std::path::PathBuf;
-use std::process::Stdio;
+use std::path::Path;
+use std::process::{Output, Stdio};
 use tokio::process::Command;
 
 use crate::core::{
-    FetchContext, Provider, ProviderError, ProviderFetchResult, ProviderId, ProviderMetadata,
-    RateWindow, SourceMode, UsageSnapshot,
+    FetchContext, Provider, ProviderError, ProviderFetchResult, ProviderId, RateWindow,
+    RefreshInteraction, SourceMode, UsageSnapshot, current_refresh_interaction,
 };
 
+/// Upstream `KiroProviderDescriptor.pace` (`.calendarMonthResetWindow`): the
+/// plan-credit window carries the calendar month ending at its reset.
+pub(crate) const PACE_CAPABILITY: crate::core::ProviderPaceCapability =
+    crate::core::ProviderPaceCapability::CALENDAR_MONTH_RESET_WINDOW;
+
 /// Kiro provider (AWS AI assistant)
-pub struct KiroProvider {
-    metadata: ProviderMetadata,
-}
+#[derive(Default)]
+pub struct KiroProvider;
 struct KiroCliUsage {
     plan_name: String,
     matched_new_format: bool,
@@ -50,62 +47,34 @@ struct KiroCliUsage {
 
 impl KiroProvider {
     pub fn new() -> Self {
-        Self {
-            metadata: ProviderMetadata {
-                id: ProviderId::Kiro,
-                display_name: "Kiro",
-                session_label: "Session",
-                weekly_label: "Monthly",
-                supports_opus: false,
-                supports_credits: true,
-                default_enabled: false,
-                is_primary: false,
-                dashboard_url: Some("https://kiro.dev/account"),
-                status_page_url: Some("https://health.aws.amazon.com"),
-                tertiary_label_key: None,
-            },
-        }
+        Self
     }
 
-    /// Get Kiro config directory
-    fn get_kiro_config_path() -> Option<PathBuf> {
-        #[cfg(target_os = "windows")]
-        {
-            dirs::config_dir().map(|p| p.join("Kiro"))
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            dirs::home_dir().map(|p| p.join(".kiro"))
-        }
-    }
-
-    /// Find Kiro CLI binary
-    fn which_kiro() -> Option<PathBuf> {
-        version::find_kiro_cli()
-    }
-
-    /// Check if user is logged in by running `kiro-cli whoami`
-    async fn ensure_logged_in(&self) -> Result<(), ProviderError> {
-        let cli_path = Self::which_kiro().ok_or_else(|| {
-            ProviderError::NotInstalled(
-                "kiro-cli not found. Install from https://kiro.dev".to_string(),
-            )
-        })?;
-
+    /// Runs `kiro-cli` with piped output and no console window.
+    async fn run_kiro(
+        cli_path: &Path,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> Result<Output, ProviderError> {
         #[cfg(windows)]
         const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-        let mut cmd = Command::new(&cli_path);
-        cmd.arg("whoami")
+        let mut cmd = Command::new(cli_path);
+        cmd.args(args)
+            .envs(env.iter().copied())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         #[cfg(windows)]
         cmd.creation_flags(CREATE_NO_WINDOW);
 
-        let output = cmd
-            .output()
+        cmd.output()
             .await
-            .map_err(|e| ProviderError::Other(format!("Failed to run kiro-cli: {}", e)))?;
+            .map_err(|e| ProviderError::Other(format!("Failed to run kiro-cli: {}", e)))
+    }
+
+    /// Check if user is logged in by running `kiro-cli whoami`
+    async fn ensure_logged_in(cli_path: &Path) -> Result<(), ProviderError> {
+        let output = Self::run_kiro(cli_path, &["whoami"], &[]).await?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
         let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
@@ -127,31 +96,28 @@ impl KiroProvider {
 
     /// Fetch usage via kiro-cli
     async fn fetch_via_cli(&self) -> Result<UsageSnapshot, ProviderError> {
-        // First ensure we're logged in
-        self.ensure_logged_in().await?;
+        let cli_path = cli_path::find_kiro_cli().ok_or_else(|| {
+            ProviderError::NotInstalled(
+                "kiro-cli not found. Install from https://kiro.dev".to_string(),
+            )
+        })?;
+        // Background refreshes check the usage host before any CLI command runs,
+        // including `whoami`. Offline, the CLI's sign-in attempt opens browser tabs.
+        // Manual refreshes skip the check and keep the existing path.
+        if current_refresh_interaction() == RefreshInteraction::Background {
+            usage_limits::ensure_reachable().await?;
+        }
+        Self::ensure_logged_in(&cli_path).await?;
 
-        let cli_path = Self::which_kiro()
-            .ok_or_else(|| ProviderError::NotInstalled("kiro-cli not found".to_string()))?;
-
-        // Run the usage command.
         // Windows intentionally uses pipe-first (stdout/stderr Stdio::piped) rather than a dual
         // ConPTY path: kiro-cli `/usage` under --no-interactive emits parseable text on pipes, and
         // a second ConPTY probe would add flaky process-lifetime cost without better quota data.
-        #[cfg(windows)]
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-
-        let mut cmd = Command::new(&cli_path);
-        cmd.args(["chat", "--no-interactive", "/usage"])
-            .env("TERM", "xterm-256color")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        #[cfg(windows)]
-        cmd.creation_flags(CREATE_NO_WINDOW);
-
-        let output = cmd
-            .output()
-            .await
-            .map_err(|e| ProviderError::Other(format!("Failed to run kiro-cli: {}", e)))?;
+        let output = Self::run_kiro(
+            &cli_path,
+            &["chat", "--no-interactive", "/usage"],
+            &[("TERM", "xterm-256color")],
+        )
+        .await?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -242,8 +208,12 @@ impl KiroProvider {
     }
 
     fn usage_with_metrics(parsed: &KiroCliUsage) -> UsageSnapshot {
-        let primary =
-            RateWindow::with_details(parsed.credits_percent, None, parsed.reset_date, None);
+        let primary = RateWindow::with_details(
+            parsed.credits_percent,
+            RateWindow::monthly_window_minutes(parsed.reset_date),
+            parsed.reset_date,
+            None,
+        );
         UsageSnapshot::new(primary).with_login_method(&parsed.plan_name)
     }
 
@@ -454,20 +424,24 @@ impl KiroProvider {
     }
 }
 
-impl Default for KiroProvider {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[async_trait]
 impl Provider for KiroProvider {
     fn id(&self) -> ProviderId {
         ProviderId::Kiro
     }
 
-    fn metadata(&self) -> &ProviderMetadata {
-        &self.metadata
+    // Plan credits (primary) represent Kiro; the bonus pool (secondary)
+    // only takes over once a lane is exhausted.
+    fn automatic_metric_follows_lane_order(&self) -> bool {
+        true
+    }
+
+    // A background refresh that fails its reachability check keeps the last good
+    // usage instead of showing an error. Note: the shared transport classification
+    // also covers timeouts and connection failures from any refresh, including manual
+    // ones; Kiro's CLI parse and auth errors are unaffected.
+    fn retains_last_good_on_transport_failure(&self) -> bool {
+        true
     }
 
     async fn fetch_usage(&self, ctx: &FetchContext) -> Result<ProviderFetchResult, ProviderError> {
@@ -493,14 +467,6 @@ impl Provider for KiroProvider {
 
     fn available_sources(&self) -> Vec<SourceMode> {
         vec![SourceMode::Auto, SourceMode::Cli]
-    }
-
-    fn supports_web(&self) -> bool {
-        false
-    }
-
-    fn supports_cli(&self) -> bool {
-        true
     }
     /// Kiro's CLI probes raise `NotInstalled` when the `kiro-cli` binary is
     /// missing ("kiro-cli not found. Install from https://kiro.dev") — an

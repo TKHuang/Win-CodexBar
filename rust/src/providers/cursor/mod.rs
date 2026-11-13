@@ -16,12 +16,18 @@ use async_trait::async_trait;
 
 use crate::core::{
     CostSnapshot, FetchContext, Provider, ProviderError, ProviderFetchResult, ProviderId,
-    ProviderMetadata, RateWindow, SourceMode, UsageSnapshot,
+    RateWindow, SourceMode, UsageSnapshot,
 };
 
 pub use api::CursorApi;
 use cost_cooldown::{CostCooldown, credential_fingerprint};
 use token_cost::TokenCostError;
+
+/// Quota usage plus the best-effort token-cost report.
+type CursorFetch = (
+    api::CursorUsageResult,
+    Option<token_cost::CursorTokenCostReport>,
+);
 
 /// Reset-window pace (upstream `CursorProviderDescriptor.pace`, v0.70.0): any
 /// window with a billing-cycle length.
@@ -30,9 +36,19 @@ pub(crate) const PACE_CAPABILITY: crate::core::ProviderPaceCapability =
         crate::core::PaceWindowRule::WindowDurationPresent,
     );
 
+/// Grok Bot is Cursor's named extra allowance (upstream 0.73.0 #4269),
+/// published through [`ProviderId::named_extra_metrics`]. A unified weekly
+/// pool replaces the Grok Bot extra, and a saved Grok Bot choice reads that
+/// pool (upstream `CursorProviderDescriptor.menuBarExtras`).
+pub const NAMED_EXTRA_METRICS: &[crate::core::NamedExtraMetric] =
+    &[crate::core::NamedExtraMetric {
+        id: api::GROK_BOT_WINDOW_ID,
+        label: api::GROK_BOT_TITLE,
+        promoted_primary_label: Some(api::SHARED_WEEKLY_POOL_LABEL),
+    }];
+
 /// Cursor provider for fetching AI usage limits
 pub struct CursorProvider {
-    metadata: ProviderMetadata,
     api: CursorApi,
     /// Per-credential back-off for forbidden cost requests. The store is
     /// process-wide because the shell builds a fresh provider per refresh.
@@ -44,36 +60,13 @@ pub struct CursorProvider {
 impl CursorProvider {
     pub fn new() -> Self {
         Self {
-            metadata: ProviderMetadata {
-                id: ProviderId::Cursor,
-                display_name: "Cursor",
-                session_label: "Plan",
-                weekly_label: "Cursor",
-                supports_opus: false,
-                // Upstream #2338: Cursor has no account credit balance to advertise.
-                supports_credits: false,
-                default_enabled: true,
-                is_primary: false,
-                dashboard_url: Some("https://cursor.com/dashboard/usage"),
-                status_page_url: None,
-                tertiary_label_key: None,
-            },
             api: CursorApi::new(),
             cost_cooldown: CostCooldown::shared(),
             clock: Arc::new(Instant::now),
         }
     }
 
-    async fn fetch_web_usage(
-        &self,
-        ctx: &FetchContext,
-    ) -> Result<
-        (
-            api::CursorUsageResult,
-            Option<token_cost::CursorTokenCostReport>,
-        ),
-        ProviderError,
-    > {
+    async fn fetch_web_usage(&self, ctx: &FetchContext) -> Result<CursorFetch, ProviderError> {
         if let Some(cookie_header) = ctx.manual_cookie_header.as_deref() {
             return self.fetch_usage_and_token_report(cookie_header).await;
         }
@@ -98,14 +91,21 @@ impl CursorProvider {
         Err(rejected.unwrap_or_else(|| sessions.exhaustion_error()))
     }
 
+    async fn fetch_usage_and_token_report(
+        &self,
+        cookie_header: &str,
+    ) -> Result<CursorFetch, ProviderError> {
+        let usage = self
+            .api
+            .fetch_usage_with_cookie_header(cookie_header)
+            .await?;
+        let token_report = self.fetch_token_report_best_effort(cookie_header).await;
+        Ok((usage, token_report))
+    }
+
     /// One usage pass with the app's local session; `None` means the app
     /// session was unavailable or rejected (caller falls back to cookies).
-    async fn fetch_via_app_session(
-        &self,
-    ) -> Option<(
-        api::CursorUsageResult,
-        Option<token_cost::CursorTokenCostReport>,
-    )> {
+    async fn fetch_via_app_session(&self) -> Option<CursorFetch> {
         let app_cookie = app_auth::preferred_auto_cookie_header()?;
         let usage = match self.api.fetch_usage_with_cookie_header(&app_cookie).await {
             Ok(usage) => usage,
@@ -119,24 +119,6 @@ impl CursorProvider {
         app_auth::store_validated_app_session(&app_cookie);
         let token_report = self.fetch_token_report_best_effort(&app_cookie).await;
         Some((usage, token_report))
-    }
-
-    async fn fetch_usage_and_token_report(
-        &self,
-        cookie_header: &str,
-    ) -> Result<
-        (
-            api::CursorUsageResult,
-            Option<token_cost::CursorTokenCostReport>,
-        ),
-        ProviderError,
-    > {
-        let usage = self
-            .api
-            .fetch_usage_with_cookie_header(cookie_header)
-            .await?;
-        let token_report = self.fetch_token_report_best_effort(cookie_header).await;
-        Ok((usage, token_report))
     }
 
     /// Best-effort token-cost page; never fail the main usage fetch.
@@ -248,7 +230,6 @@ impl CursorProvider {
             api: CursorApi::with_base_url(base_url),
             cost_cooldown,
             clock,
-            ..Self::new()
         }
     }
 }
@@ -267,10 +248,6 @@ impl Provider for CursorProvider {
 
     fn id(&self) -> ProviderId {
         ProviderId::Cursor
-    }
-
-    fn metadata(&self) -> &ProviderMetadata {
-        &self.metadata
     }
 
     fn retains_last_good_on_transport_failure(&self) -> bool {
@@ -295,6 +272,7 @@ impl Provider for CursorProvider {
                             email,
                             plan_type,
                             grok_bot,
+                            primary_label,
                         } = result;
                         let mut usage = Self::build_usage_snapshot(
                             primary,
@@ -304,6 +282,9 @@ impl Provider for CursorProvider {
                             plan_type,
                             token_report.as_ref(),
                         );
+                        if let Some(label) = primary_label {
+                            usage = usage.with_primary_label(label);
+                        }
                         if let Some(grok_bot) = grok_bot {
                             usage.extra_rate_windows.push(grok_bot);
                         }
@@ -328,7 +309,9 @@ impl Provider for CursorProvider {
         vec![SourceMode::Auto, SourceMode::Web]
     }
 
-    fn supports_web(&self) -> bool {
+    /// The shell would pin the first browser's header; this provider tries each
+    /// browser so a rejected session can move on to the next one.
+    fn owns_browser_cookie_resolution(&self) -> bool {
         true
     }
 }
@@ -339,6 +322,28 @@ mod tests {
     use crate::core::{FetchContext, LastGoodFailurePolicy};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn grok_bot_is_the_declared_named_extra_metric() {
+        let metrics = ProviderId::Cursor.named_extra_metrics();
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].id, "cursor-grok-bot");
+        assert_eq!(metrics[0].label, "Grok Bot");
+        assert_eq!(metrics[0].promoted_primary_label, Some("Weekly"));
+        assert_eq!(
+            ProviderId::Cursor.named_extra_metric("cursor-grok-bot"),
+            Some(metrics[0])
+        );
+        assert_eq!(
+            ProviderId::Cursor.named_extra_metric("cursor-retired"),
+            None
+        );
+        assert!(ProviderId::Codex.named_extra_metrics().is_empty());
+        assert_eq!(
+            ProviderId::Codex.named_extra_metric("cursor-grok-bot"),
+            None
+        );
+    }
 
     #[tokio::test]
     async fn cli_mode_does_not_return_unsupported_source() {
@@ -387,6 +392,36 @@ mod tests {
     fn does_not_advertise_unsupported_credits() {
         let provider = CursorProvider::new();
         assert!(!provider.metadata().supports_credits);
+    }
+
+    #[test]
+    fn cursor_owns_browser_cookie_resolution() {
+        // The shell must not pre-resolve the first browser's header for Cursor;
+        // this provider tries each browser session itself.
+        assert!(CursorProvider::new().owns_browser_cookie_resolution());
+    }
+
+    #[tokio::test]
+    async fn missing_manual_cookie_gate_reports_no_cookies_without_any_request() {
+        // Cookie source Off reaches the provider as Cli with the gate set; no
+        // browser may be read and no Cursor request may be sent.
+        let mut server = mockito::Server::new_async().await;
+        let usage = usage_mock(&mut server, 0).await;
+        let harness = Harness::new(&server);
+        let ctx = FetchContext {
+            source_mode: SourceMode::Cli,
+            manual_cookie_missing: true,
+            ..FetchContext::default()
+        };
+
+        let err = harness
+            .provider
+            .fetch_usage(&ctx)
+            .await
+            .expect_err("import is forbidden, so no session is available");
+
+        usage.assert_async().await;
+        assert!(matches!(err, ProviderError::NoCookies), "got {err:?}");
     }
 
     #[test]
@@ -589,5 +624,54 @@ mod tests {
 
         usage.assert_async().await;
         allowed.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn unified_weekly_pool_is_the_weekly_primary_without_grok_bot_extra() {
+        let mut server = mockito::Server::new_async().await;
+        let reset = chrono::Utc::now() + chrono::Duration::days(5);
+        let start = reset - chrono::Duration::days(7);
+        let sand_body = format!(
+            r#"{{"currentPeriodStart":"{}","nextResetTimestampUtc":"{}",
+                "usagePercent":10.5,"hasNonZeroIncludedLimit":true,"isUnified":true}}"#,
+            start.to_rfc3339(),
+            reset.to_rfc3339()
+        );
+        let _summary = server
+            .mock("GET", "/api/usage-summary")
+            .with_status(200)
+            .with_body(SUMMARY)
+            .create_async()
+            .await;
+        let _me = server
+            .mock("GET", "/api/auth/me")
+            .with_status(500)
+            .create_async()
+            .await;
+        let sand = server
+            .mock("POST", "/api/dashboard/get-sand-usage-status")
+            .with_status(200)
+            .with_body(sand_body)
+            .expect(1)
+            .create_async()
+            .await;
+        let harness = Harness::new(&server);
+
+        let result = harness.fetch(COOKIE_A).await;
+
+        sand.assert_async().await;
+        let usage = result.usage;
+        assert!((usage.primary.used_percent - 10.5).abs() < 1e-9);
+        assert_eq!(usage.primary.window_minutes, Some(10080));
+        assert_eq!(usage.primary_label.as_deref(), Some("Weekly"));
+        assert!(usage.secondary.is_none());
+        assert!(usage.model_specific.is_none());
+        assert!(
+            usage
+                .extra_rate_windows
+                .iter()
+                .all(|extra| extra.id != api::GROK_BOT_WINDOW_ID),
+            "Grok Bot must not repeat the promoted pool"
+        );
     }
 }

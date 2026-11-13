@@ -1,5 +1,7 @@
 //! `codexbar hooks` — list / enable / disable / test / watch external hook rules.
 
+use super::print_json;
+use super::usage::ProviderSelection;
 use clap::{Args, Subcommand};
 use serde::Serialize;
 use std::sync::Arc;
@@ -24,29 +26,20 @@ pub struct HooksArgs {
 #[derive(Subcommand, Debug, Clone)]
 pub enum HooksCommand {
     /// Print configured hook rules
-    List(HooksListArgs),
+    List(HooksOutputArgs),
     /// Enable hooks in hooks.json (master switch)
-    Enable(HooksToggleArgs),
+    Enable(HooksOutputArgs),
     /// Disable hooks in hooks.json (master switch)
-    Disable(HooksToggleArgs),
+    Disable(HooksOutputArgs),
     /// Run matching rules for a sample event
     Test(HooksTestArgs),
     /// Continuously poll providers and fire hooks on real transitions
     Watch(HooksWatchArgs),
 }
 
+/// `--json` / `--pretty`, shared by `hooks list|enable|disable|test`.
 #[derive(Args, Debug, Clone)]
-pub struct HooksListArgs {
-    /// Emit JSON
-    #[arg(long)]
-    pub json: bool,
-    /// Pretty-print JSON
-    #[arg(long)]
-    pub pretty: bool,
-}
-
-#[derive(Args, Debug, Clone)]
-pub struct HooksToggleArgs {
+pub struct HooksOutputArgs {
     /// Emit JSON
     #[arg(long)]
     pub json: bool,
@@ -62,12 +55,8 @@ pub struct HooksTestArgs {
     /// Provider CLI name
     #[arg(long)]
     pub provider: String,
-    /// Emit JSON
-    #[arg(long)]
-    pub json: bool,
-    /// Pretty-print JSON
-    #[arg(long)]
-    pub pretty: bool,
+    #[command(flatten)]
+    pub output: HooksOutputArgs,
 }
 
 /// Default poll period (seconds). Longer than serve cache TTL — watch originates
@@ -84,7 +73,7 @@ pub struct HooksWatchArgs {
     #[arg(long, default_value_t = HOOKS_WATCH_DEFAULT_INTERVAL)]
     pub interval: u64,
 
-    /// Provider CLI name(s); comma-separated or repeated. Default: enabled providers.
+    /// Provider CLI name(s), `both` (codex + claude) or `all`; comma-separated or repeated. Default: enabled providers.
     #[arg(long, value_delimiter = ',')]
     pub provider: Vec<String>,
 
@@ -249,10 +238,18 @@ fn decode_hooks_watch_providers(names: &[String]) -> anyhow::Result<Option<Vec<P
     }
     let mut selected = Vec::new();
     for name in names {
-        let id = ProviderId::from_cli_name(name)
-            .ok_or_else(|| anyhow::anyhow!("Unknown provider: {name}"))?;
-        if !selected.contains(&id) {
-            selected.push(id);
+        let ids = match name.to_ascii_lowercase().as_str() {
+            "both" => ProviderSelection::Both.as_list(),
+            "all" => ProviderSelection::All.as_list(),
+            other => vec![
+                ProviderId::from_cli_name(other)
+                    .ok_or_else(|| anyhow::anyhow!("Unknown provider: {name}"))?,
+            ],
+        };
+        for id in ids {
+            if !selected.contains(&id) {
+                selected.push(id);
+            }
         }
     }
     Ok(Some(selected))
@@ -288,39 +285,29 @@ async fn hooks_watch_observation(
     let region = settings.api_region(provider_id);
     let gateway = settings.gateway_url(provider_id);
 
-    let mut ctx = FetchContext {
+    let ctx = FetchContext {
         source_mode,
         include_credits: false,
         web_timeout,
         verbose,
-        manual_cookie_header: None,
-        manual_cookie_missing: false,
-        api_key: None,
-        token_account_kind: None,
-        token_account_isolated: false,
+        api_key: ApiKeys::load()
+            .get(provider_id.cli_name())
+            .map(|s| s.to_string()),
         workspace_id: (!workspace.is_empty()).then(|| workspace.to_string()),
         seat_credit_entitlement: settings.seat_credit_entitlement(provider_id),
         api_region: (!region.is_empty()).then(|| region.to_string()),
         gateway_url: (!gateway.is_empty()).then(|| gateway.to_string()),
-        auto_prefer_web: false,
-        browser_cookie_import: false,
         // Hook watches keep the short optional-join grace.
         requires_optional_usage_completeness: false,
         optional_details_enabled: settings.optional_details_enabled(provider_id),
-        live_usage_enabled: false,
+        ..FetchContext::default()
     };
-
-    if ctx.api_key.is_none() {
-        ctx.api_key = ApiKeys::load()
-            .get(provider_id.cli_name())
-            .map(|s| s.to_string());
-    }
 
     let provider = instantiate_provider(provider_id);
     match provider.fetch_usage(&ctx).await {
         Ok(result) => {
             let usage = &result.usage;
-            let account = usage.account_email.clone();
+            let account = hook_account_display_name(settings, usage);
             let account_discriminator = result
                 .account_identity()
                 .map(str::trim)
@@ -346,6 +333,23 @@ async fn hooks_watch_observation(
             account_discriminator: None,
         },
     }
+}
+
+/// Account shown in hook payloads; `None` when personal info is hidden,
+/// matching the desktop hook dispatchers.
+fn hook_account_display_name(
+    settings: &Settings,
+    usage: &crate::core::UsageSnapshot,
+) -> Option<String> {
+    if settings.hide_personal_info {
+        return None;
+    }
+    usage
+        .account_email
+        .as_deref()
+        .map(str::trim)
+        .filter(|email| !email.is_empty())
+        .map(str::to_string)
 }
 
 fn hooks_watch_lanes(
@@ -452,7 +456,7 @@ fn report_hook_event(event: &HookEvent, json: bool, pretty: bool) -> anyhow::Res
     Ok(())
 }
 
-fn run_list(args: HooksListArgs) -> anyhow::Result<()> {
+fn run_list(args: HooksOutputArgs) -> anyhow::Result<()> {
     let config = HooksConfig::load();
     let settings = Settings::load();
     let path = HooksConfig::path().map(|p| p.display().to_string());
@@ -521,7 +525,7 @@ fn run_list(args: HooksListArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_set_enabled(enabled: bool, args: HooksToggleArgs) -> anyhow::Result<()> {
+fn run_set_enabled(enabled: bool, args: HooksOutputArgs) -> anyhow::Result<()> {
     let mut config = HooksConfig::load();
     config.enabled = enabled;
     let path = config.save().map_err(anyhow::Error::msg)?;
@@ -576,26 +580,18 @@ fn run_test(args: HooksTestArgs) -> anyhow::Result<()> {
     let base_env = std::env::vars().collect();
     let mut results = Vec::new();
     for rule in rules {
-        match HookRunner::run(rule, &event, &base_env) {
-            Ok(()) => results.push(HookTestResult {
-                executable: rule.executable.display().to_string(),
-                event: event_type.as_str().into(),
-                provider: provider.cli_name().into(),
-                ok: true,
-                error: None,
-            }),
-            Err(err) => results.push(HookTestResult {
-                executable: rule.executable.display().to_string(),
-                event: event_type.as_str().into(),
-                provider: provider.cli_name().into(),
-                ok: false,
-                error: Some(err),
-            }),
-        }
+        let error = HookRunner::run(rule, &event, &base_env).err();
+        results.push(HookTestResult {
+            executable: rule.executable.display().to_string(),
+            event: event_type.as_str().into(),
+            provider: provider.cli_name().into(),
+            ok: error.is_none(),
+            error,
+        });
     }
 
-    if args.json {
-        print_json(&results, args.pretty)?;
+    if args.output.json {
+        print_json(&results, args.output.pretty)?;
     } else {
         for r in &results {
             if r.ok {
@@ -652,18 +648,77 @@ fn parse_event(raw: &str) -> anyhow::Result<HookEventType> {
     }
 }
 
-fn print_json<T: Serialize>(value: &T, pretty: bool) -> anyhow::Result<()> {
-    if pretty {
-        println!("{}", serde_json::to_string_pretty(value)?);
-    } else {
-        println!("{}", serde_json::to_string(value)?);
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `hooks <sub> --help` exactly as printed, so arg refactors keep the CLI text.
+    const EXPECTED_HOOKS_HELP: &str = r#"@@list
+Print configured hook rules
+
+Usage: codexbar hooks list [OPTIONS]
+
+Options:
+      --json         Emit JSON
+  -v, --verbose      Enable verbose logging
+      --json-output  Emit machine-readable logs (JSON) to stderr
+      --pretty       Pretty-print JSON
+      --no-color     Disable ANSI colors in output
+  -h, --help         Print help
+@@enable
+Enable hooks in hooks.json (master switch)
+
+Usage: codexbar hooks enable [OPTIONS]
+
+Options:
+      --json         Emit JSON
+  -v, --verbose      Enable verbose logging
+      --json-output  Emit machine-readable logs (JSON) to stderr
+      --pretty       Pretty-print JSON
+      --no-color     Disable ANSI colors in output
+  -h, --help         Print help
+@@disable
+Disable hooks in hooks.json (master switch)
+
+Usage: codexbar hooks disable [OPTIONS]
+
+Options:
+      --json         Emit JSON
+  -v, --verbose      Enable verbose logging
+      --json-output  Emit machine-readable logs (JSON) to stderr
+      --pretty       Pretty-print JSON
+      --no-color     Disable ANSI colors in output
+  -h, --help         Print help
+@@test
+Run matching rules for a sample event
+
+Usage: codexbar hooks test [OPTIONS] --provider <PROVIDER> <EVENT>
+
+Arguments:
+  <EVENT>  Event name (quota_low, quota_reached, quota_reset, usage_updated, provider_unavailable, provider_recovered, refresh_failed)
+
+Options:
+      --provider <PROVIDER>  Provider CLI name
+  -v, --verbose              Enable verbose logging
+      --json                 Emit JSON
+      --json-output          Emit machine-readable logs (JSON) to stderr
+      --no-color             Disable ANSI colors in output
+      --pretty               Pretty-print JSON
+  -h, --help                 Print help
+"#;
+
+    #[test]
+    fn hooks_subcommand_help_is_pinned() {
+        use clap::CommandFactory;
+        let mut out = String::new();
+        for sub in ["list", "enable", "disable", "test"] {
+            let err = crate::cli::Cli::command()
+                .try_get_matches_from(["codexbar", "hooks", sub, "--help"])
+                .unwrap_err();
+            out.push_str(&format!("@@{sub}\n{}", err.render()));
+        }
+        assert_eq!(out, EXPECTED_HOOKS_HELP);
+    }
 
     #[test]
     fn browser_sign_in_failures_report_auth_required() {
@@ -692,6 +747,38 @@ mod tests {
     }
 
     #[test]
+    fn hide_personal_info_omits_the_hook_account() {
+        let mut usage = crate::core::UsageSnapshot::new(RateWindow::new(40.0));
+        usage.account_email = Some("person@example.com".to_string());
+        let mut settings = Settings::default();
+
+        assert_eq!(
+            hook_account_display_name(&settings, &usage).as_deref(),
+            Some("person@example.com")
+        );
+        let lanes = hooks_watch_lanes(
+            ProviderId::Codex,
+            &usage,
+            &settings,
+            hook_account_display_name(&settings, &usage).as_deref(),
+        );
+        assert_eq!(
+            lanes[0].account_display_name.as_deref(),
+            Some("person@example.com")
+        );
+
+        settings.hide_personal_info = true;
+        assert_eq!(hook_account_display_name(&settings, &usage), None);
+        let lanes = hooks_watch_lanes(
+            ProviderId::Codex,
+            &usage,
+            &settings,
+            hook_account_display_name(&settings, &usage).as_deref(),
+        );
+        assert!(lanes.iter().all(|lane| lane.account_display_name.is_none()));
+    }
+
+    #[test]
     fn watch_interval_rejects_below_floor() {
         assert!(decode_hooks_watch_interval(59).is_err());
         assert!(decode_hooks_watch_interval(60).is_ok());
@@ -709,5 +796,45 @@ mod tests {
             .unwrap();
         assert_eq!(got, vec![ProviderId::Codex]);
         assert!(decode_hooks_watch_providers(&[]).unwrap().is_none());
+    }
+
+    #[test]
+    fn watch_providers_expand_both_and_all() {
+        let both = decode_hooks_watch_providers(&["BOTH".into()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(both, vec![ProviderId::Codex, ProviderId::Claude]);
+
+        let all = decode_hooks_watch_providers(&["all".into()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(all, ProviderId::all().to_vec());
+
+        let mixed = decode_hooks_watch_providers(&["claude".into(), "both".into()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(mixed, vec![ProviderId::Claude, ProviderId::Codex]);
+    }
+
+    #[test]
+    fn watch_provider_flag_accepts_aliases_in_lists() {
+        use clap::Parser;
+        let cli = crate::cli::Cli::try_parse_from([
+            "codexbar",
+            "hooks",
+            "watch",
+            "--provider",
+            "both,cursor",
+            "--provider",
+            "all",
+        ])
+        .unwrap();
+        let Some(crate::cli::Commands::Hooks(HooksArgs {
+            command: HooksCommand::Watch(args),
+        })) = cli.command
+        else {
+            panic!("expected hooks watch");
+        };
+        assert_eq!(args.provider, vec!["both", "cursor", "all"]);
     }
 }

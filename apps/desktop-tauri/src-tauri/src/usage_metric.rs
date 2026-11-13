@@ -3,7 +3,8 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
 
-use codexbar::core::{IconLane, ProviderId};
+use chrono::{DateTime, Utc};
+use codexbar::core::{IconLane, NamedExtraMetric, ProviderId, UsagePace};
 use codexbar::settings::{MetricPreference, Settings};
 
 use crate::commands::{ProviderUsageSnapshot, RateWindowSnapshot};
@@ -12,16 +13,29 @@ pub(crate) fn selected_usage_window(
     snapshot: &ProviderUsageSnapshot,
     settings: &Settings,
 ) -> RateWindowSnapshot {
-    select_window(&with_icon_fallbacks(snapshot), settings)
+    selected_usage_window_at(snapshot, settings, Utc::now())
 }
 
-fn select_window(snapshot: &ProviderUsageSnapshot, settings: &Settings) -> RateWindowSnapshot {
+/// [`selected_usage_window`] with Automatic's depletion forecast scored at `now`.
+pub(crate) fn selected_usage_window_at(
+    snapshot: &ProviderUsageSnapshot,
+    settings: &Settings,
+    now: DateTime<Utc>,
+) -> RateWindowSnapshot {
+    select_window(&with_icon_fallbacks(snapshot), settings, now)
+}
+
+fn select_window(
+    snapshot: &ProviderUsageSnapshot,
+    settings: &Settings,
+    now: DateTime<Utc>,
+) -> RateWindowSnapshot {
     let provider = ProviderId::from_cli_name(&snapshot.provider_id);
     let preference = provider
         .map(|id| settings.get_provider_metric(id))
         .unwrap_or_default();
 
-    if let Some(selected) = preferred_window(snapshot, provider, preference) {
+    if let Some(selected) = preferred_window(snapshot, provider, preference, now) {
         return selected;
     }
     // Providers with Automatic-only fallback lanes (seat credits) keep an
@@ -32,7 +46,7 @@ fn select_window(snapshot: &ProviderUsageSnapshot, settings: &Settings) -> RateW
     }) {
         return snapshot.primary.clone();
     }
-    automatic_window(snapshot, provider).unwrap_or_else(|| snapshot.primary.clone())
+    automatic_window(snapshot, provider, now).unwrap_or_else(|| snapshot.primary.clone())
 }
 
 /// Let provider-declared extra windows stand in for an absent core lane.
@@ -90,9 +104,19 @@ fn declares_icon_lanes(snapshot: &ProviderUsageSnapshot) -> bool {
 /// Select the primary tray metric and, when there are multiple meaningful core
 /// quotas, one distinct companion lane. Keeping this policy beside canonical
 /// metric selection prevents tray rendering from duplicating the selected lane.
+#[cfg(test)]
 pub(crate) fn selected_usage_icon_windows(
     snapshot: &ProviderUsageSnapshot,
     settings: &Settings,
+) -> (RateWindowSnapshot, Option<RateWindowSnapshot>) {
+    selected_usage_icon_windows_at(snapshot, settings, Utc::now())
+}
+
+/// The icon metric pair with Automatic's depletion forecast scored at `now`.
+pub(crate) fn selected_usage_icon_windows_at(
+    snapshot: &ProviderUsageSnapshot,
+    settings: &Settings,
+    now: DateTime<Utc>,
 ) -> (RateWindowSnapshot, Option<RateWindowSnapshot>) {
     let snapshot = with_icon_fallbacks(snapshot);
     if declares_icon_lanes(&snapshot) && icon_metric_is_automatic(&snapshot, settings) {
@@ -104,7 +128,7 @@ pub(crate) fn selected_usage_icon_windows(
                 .filter(|window| !window.is_informational),
         );
     }
-    let selected = select_window(&snapshot, settings);
+    let selected = select_window(&snapshot, settings, now);
     let meaningful_count = std::iter::once(&snapshot.primary)
         .chain(snapshot.secondary.iter())
         .chain(snapshot.tertiary.iter())
@@ -145,9 +169,21 @@ fn preferred_window(
     snapshot: &ProviderUsageSnapshot,
     provider: Option<ProviderId>,
     preference: MetricPreference,
+    now: DateTime<Utc>,
 ) -> Option<RateWindowSnapshot> {
     match preference {
-        MetricPreference::Automatic => automatic_window(snapshot, provider),
+        // Upstream 0.73.0 (#4269): a declared allowance with no reading shows
+        // as unknown instead of borrowing another lane. An id the provider
+        // does not declare falls through like any unavailable choice.
+        MetricPreference::NamedExtra(id) => {
+            let declared = provider?.named_extra_metric(&id)?;
+            Some(
+                named_extra_reading(snapshot, declared)
+                    .cloned()
+                    .unwrap_or_else(unknown_window),
+            )
+        }
+        MetricPreference::Automatic => automatic_window(snapshot, provider, now),
         // A missing session is represented by an informational zero-percent
         // placeholder. Fall through to Automatic instead of displaying it.
         MetricPreference::Session if snapshot.primary.is_informational => None,
@@ -169,6 +205,9 @@ fn preferred_window(
             extra_usage_window(snapshot).or_else(|| cost_window(snapshot))
         }
         MetricPreference::Average => average_window(snapshot),
+        // A rate, not a quota: the meter keeps the Automatic lane and the tray
+        // status text carries the Tokens/min value (`tray_presentation`).
+        MetricPreference::TokensPerMinute => automatic_window(snapshot, provider, now),
         // Upstream 0.70.0 (#4072): the provider's plan allowance. A missing
         // or unknown plan falls back to the primary (included API) allowance,
         // never to a spend window. Providers without a plan window fall
@@ -192,8 +231,46 @@ pub(crate) fn monthly_plan_window(
     plan_window(snapshot, provider.and_then(monthly_plan_window_id)?)
 }
 
+/// Whether the selected metric is a declared named extra allowance that the
+/// snapshot has no reading for, so the meter must show it as unknown.
+pub(crate) fn selected_named_extra_is_unknown(
+    snapshot: &ProviderUsageSnapshot,
+    settings: &Settings,
+) -> bool {
+    let Some(provider) = ProviderId::from_cli_name(&snapshot.provider_id) else {
+        return false;
+    };
+    settings
+        .get_provider_metric(provider)
+        .named_extra_id()
+        .and_then(|id| provider.named_extra_metric(id))
+        .is_some_and(|declared| named_extra_reading(snapshot, declared).is_none())
+}
+
+fn unknown_window() -> RateWindowSnapshot {
+    RateWindowSnapshot {
+        is_informational: true,
+        ..Default::default()
+    }
+}
+
 fn monthly_plan_window_id(provider: ProviderId) -> Option<&'static str> {
     codexbar::core::instantiate_provider(provider).monthly_plan_window_id()
+}
+
+/// The known reading for a declared named extra allowance: its own extra
+/// window, or the primary window once the provider has promoted the
+/// allowance into it (see [`NamedExtraMetric::promoted_primary_label`]).
+pub(crate) fn named_extra_reading(
+    snapshot: &ProviderUsageSnapshot,
+    declared: NamedExtraMetric,
+) -> Option<&RateWindowSnapshot> {
+    let promoted = declared.promoted_primary_label.is_some()
+        && snapshot.primary_label.as_deref() == declared.promoted_primary_label;
+    if promoted {
+        return non_informational(Some(&snapshot.primary));
+    }
+    plan_window(snapshot, declared.id)
 }
 
 fn plan_window<'a>(
@@ -211,6 +288,7 @@ fn plan_window<'a>(
 fn automatic_window(
     snapshot: &ProviderUsageSnapshot,
     provider: Option<ProviderId>,
+    now: DateTime<Utc>,
 ) -> Option<RateWindowSnapshot> {
     // Cursor's Auto usage is the monthly included allowance, surfaced by the
     // provider in the semantic secondary slot. Do not let a higher percentage
@@ -239,6 +317,10 @@ fn automatic_window(
 
     let policy = automatic_metric_policy(provider);
 
+    if let Some(window) = absent_core_window(snapshot, policy.absent_core_window_prefix) {
+        return Some(window.clone());
+    }
+
     if snapshot.primary.is_informational
         && policy.missing_core_is_terminal
         && snapshot.secondary.is_none()
@@ -256,6 +338,22 @@ fn automatic_window(
             .or(secondary)
             .or(primary);
         if let Some(window) = preferred {
+            return Some(window.clone());
+        }
+    }
+
+    if policy.follows_lane_order {
+        let lanes = || {
+            std::iter::once(&snapshot.primary)
+                .chain(snapshot.secondary.iter())
+                .chain(snapshot.model_specific.iter())
+                .chain(snapshot.tertiary.iter())
+                .filter(|window| !window.is_informational)
+        };
+        if let Some(window) = lanes()
+            .find(|window| automatic_window_is_exhausted(window))
+            .or_else(|| lanes().next())
+        {
             return Some(window.clone());
         }
     }
@@ -286,13 +384,133 @@ fn automatic_window(
         .filter(|window| !window.is_informational);
     let selected = if policy.prefers_available_window {
         highest_available_window(windows)
-    } else if policy.prioritizes_exhausted_window {
-        highest_automatic_window(windows)
     } else {
-        highest_window(windows)
+        let eta = |window: &RateWindowSnapshot| depletion_eta_seconds(snapshot, window, now);
+        ranked_automatic_window(windows, policy.prioritizes_exhausted_window, eta)
     };
 
     selected.cloned()
+}
+
+/// Ranking key of one Automatic candidate (upstream
+/// `AutomaticQuotaSelection.Selection`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AutomaticRank {
+    exhausted: bool,
+    eta_seconds: Option<f64>,
+    used_percent: f64,
+}
+
+impl AutomaticRank {
+    /// `exhausted_flag_counts` also treats a provider-flagged exhausted window
+    /// below 100% as exhausted.
+    fn new(
+        window: &RateWindowSnapshot,
+        exhausted_flag_counts: bool,
+        eta_seconds: Option<f64>,
+    ) -> Self {
+        Self {
+            exhausted: window.used_percent >= 100.0
+                || (exhausted_flag_counts && window.is_exhausted),
+            eta_seconds,
+            used_percent: window.used_percent,
+        }
+    }
+
+    /// Upstream `AutomaticQuotaSelection.precedes(self, other)` negated:
+    /// whether `self` strictly outranks `other`. An exhausted window comes
+    /// first, then one forecast to run out before its reset (sooner first),
+    /// then the higher used percentage. Equal ranks keep the earlier window.
+    pub(crate) fn outranks(&self, other: &Self) -> bool {
+        if self.exhausted != other.exhausted {
+            return self.exhausted;
+        }
+        match (self.eta_seconds, other.eta_seconds) {
+            (Some(_), None) => return true,
+            (None, Some(_)) => return false,
+            (Some(left), Some(right)) if left != right => return left < right,
+            _ => {}
+        }
+        self.used_percent > other.used_percent
+    }
+}
+
+/// Rank of a provider's selected metric for the highest-usage tray icon
+/// (upstream `UsageStore.providerWithHighestUsage`). The depletion forecast
+/// only counts when the provider's metric is Automatic; an explicit metric
+/// ranks by exhaustion and used percentage alone.
+pub(crate) fn highest_usage_rank(
+    snapshot: &ProviderUsageSnapshot,
+    settings: &Settings,
+    now: DateTime<Utc>,
+) -> AutomaticRank {
+    let window = selected_usage_window_at(snapshot, settings, now);
+    let eta = icon_metric_is_automatic(snapshot, settings)
+        .then(|| depletion_eta_seconds(snapshot, &window, now))
+        .flatten();
+    AutomaticRank::new(&window, false, eta)
+}
+
+/// Upstream `AutomaticQuotaSelection.select`: the best-ranked usable window.
+fn ranked_automatic_window<'a>(
+    windows: impl Iterator<Item = &'a RateWindowSnapshot>,
+    exhausted_flag_counts: bool,
+    eta: impl Fn(&RateWindowSnapshot) -> Option<f64>,
+) -> Option<&'a RateWindowSnapshot> {
+    windows
+        .filter(|window| window.used_percent.is_finite() && window.used_percent >= 0.0)
+        .map(|window| {
+            (
+                window,
+                AutomaticRank::new(window, exhausted_flag_counts, eta(window)),
+            )
+        })
+        .fold(
+            None,
+            |best: Option<(&RateWindowSnapshot, AutomaticRank)>, candidate| match best {
+                Some(best) if !candidate.1.outranks(&best.1) => Some(best),
+                _ => Some(candidate),
+            },
+        )
+        .map(|(window, _)| window)
+}
+
+/// Seconds until `window` runs out at its current pace, when that happens
+/// before its reset (upstream `AutomaticQuotaSelection.selection`). The fetch
+/// must allow pace (estimates do not forecast), the window needs its own
+/// length and reset, and a pace expecting under 3% use is too young to trust.
+fn depletion_eta_seconds(
+    snapshot: &ProviderUsageSnapshot,
+    window: &RateWindowSnapshot,
+    now: DateTime<Utc>,
+) -> Option<f64> {
+    const MINIMUM_EXPECTED_PERCENT: f64 = 3.0;
+    if !snapshot.pace_authoritative || window.is_informational {
+        return None;
+    }
+    window.window_minutes?;
+    let rate_window = window.to_rate_window();
+    let resets_at = rate_window.resets_at?;
+    let pace_window = match ProviderId::from_cli_name(&snapshot.provider_id) {
+        Some(id) => id
+            .pace_capability()
+            .resolved_reset_window_for_pace(&rate_window),
+        None => rate_window,
+    };
+    let pace = UsagePace::weekly(
+        &pace_window,
+        Some(now),
+        crate::commands::pace::WEEKLY_FALLBACK_MINUTES,
+        None,
+    )?;
+    if pace.expected_used_percent < MINIMUM_EXPECTED_PERCENT {
+        return None;
+    }
+    let eta = pace
+        .eta_seconds
+        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)?;
+    let until_reset = (resets_at - now).num_milliseconds() as f64 / 1000.0;
+    (eta < until_reset).then_some(eta)
 }
 
 #[derive(Clone, Copy)]
@@ -307,6 +525,35 @@ struct AutomaticMetricPolicy {
     /// Whether the secondary lane represents the provider unless a core lane
     /// is exhausted (upstream's LiteLLM team-budget resolver).
     prefers_secondary_window: bool,
+    /// Extra-window id prefix that stands in when no core lane is reported.
+    absent_core_window_prefix: Option<&'static str>,
+    /// Whether the core lanes are ordered by importance: the first exhausted
+    /// lane wins, otherwise the first reported lane (upstream's Gemini tiers).
+    follows_lane_order: bool,
+}
+
+/// The most constrained provider-declared extra window that stands in for a
+/// snapshot without any core quota lane.
+fn absent_core_window<'a>(
+    snapshot: &'a ProviderUsageSnapshot,
+    prefix: Option<&str>,
+) -> Option<&'a RateWindowSnapshot> {
+    let prefix = prefix?;
+    let core_absent = snapshot.primary.is_informational
+        && non_informational(snapshot.secondary.as_ref()).is_none()
+        && non_informational(snapshot.model_specific.as_ref()).is_none()
+        && non_informational(snapshot.tertiary.as_ref()).is_none();
+    if !core_absent {
+        return None;
+    }
+    highest_window(
+        snapshot
+            .extra_rate_windows
+            .iter()
+            .filter(|extra| extra.id.starts_with(prefix))
+            .map(|extra| &extra.window)
+            .filter(|window| !window.is_informational),
+    )
 }
 
 fn automatic_metric_policy(provider: Option<ProviderId>) -> AutomaticMetricPolicy {
@@ -319,6 +566,12 @@ fn automatic_metric_policy(provider: Option<ProviderId>) -> AutomaticMetricPolic
     let prefers_secondary = |id: ProviderId| {
         codexbar::core::instantiate_provider(id).automatic_metric_prefers_secondary_window()
     };
+    let absent_core_window_prefix = |id: ProviderId| {
+        codexbar::core::instantiate_provider(id).automatic_metric_absent_core_window_prefix()
+    };
+    let follows_lane_order = |id: ProviderId| {
+        codexbar::core::instantiate_provider(id).automatic_metric_follows_lane_order()
+    };
     match provider {
         Some(ProviderId::Antigravity) => AutomaticMetricPolicy {
             prefers_available_window: true,
@@ -326,6 +579,8 @@ fn automatic_metric_policy(provider: Option<ProviderId>) -> AutomaticMetricPolic
             uses_extra_windows: false,
             missing_core_is_terminal: true,
             prefers_secondary_window: false,
+            absent_core_window_prefix: None,
+            follows_lane_order: false,
         },
         // Cursor's monthly Auto lane is the semantic weekly pace. Grok Bot is
         // a named extra allowance and must stay available through the explicit
@@ -336,6 +591,8 @@ fn automatic_metric_policy(provider: Option<ProviderId>) -> AutomaticMetricPolic
             uses_extra_windows: false,
             missing_core_is_terminal: true,
             prefers_secondary_window: false,
+            absent_core_window_prefix: None,
+            follows_lane_order: false,
         },
         Some(id) => AutomaticMetricPolicy {
             prefers_available_window: false,
@@ -343,6 +600,8 @@ fn automatic_metric_policy(provider: Option<ProviderId>) -> AutomaticMetricPolic
             uses_extra_windows: true,
             missing_core_is_terminal: missing_core_is_terminal(id),
             prefers_secondary_window: prefers_secondary(id),
+            absent_core_window_prefix: absent_core_window_prefix(id),
+            follows_lane_order: follows_lane_order(id),
         },
         None => AutomaticMetricPolicy {
             prefers_available_window: false,
@@ -350,6 +609,8 @@ fn automatic_metric_policy(provider: Option<ProviderId>) -> AutomaticMetricPolic
             uses_extra_windows: true,
             missing_core_is_terminal: false,
             prefers_secondary_window: false,
+            absent_core_window_prefix: None,
+            follows_lane_order: false,
         },
     }
 }
@@ -392,20 +653,9 @@ fn derived_window(used_percent: f64, resets_at: Option<String>) -> RateWindowSna
     RateWindowSnapshot {
         used_percent,
         remaining_percent: 100.0 - used_percent,
-        window_minutes: None,
         resets_at,
-        reset_description: None,
         is_exhausted: used_percent >= 100.0,
-        is_informational: false,
-        reserve_percent: None,
-        reserve_description: None,
-        reserve_will_last_to_reset: false,
-        reserve_eta_seconds: None,
-        pace: None,
-        monthly_limit_block: None,
-        description_is_detail: false,
-        reset_regenerates: false,
-        hidden_on_card: false,
+        ..Default::default()
     }
 }
 
@@ -436,802 +686,9 @@ fn highest_available_window<'a>(
     .or_else(|| highest_window(windows.into_iter()))
 }
 
-fn highest_automatic_window<'a>(
-    windows: impl Iterator<Item = &'a RateWindowSnapshot>,
-) -> Option<&'a RateWindowSnapshot> {
-    windows.max_by(|a, b| {
-        automatic_window_is_exhausted(a)
-            .cmp(&automatic_window_is_exhausted(b))
-            .then_with(|| {
-                a.used_percent
-                    .partial_cmp(&b.used_percent)
-                    .unwrap_or(Ordering::Equal)
-            })
-    })
-}
-
 fn automatic_window_is_exhausted(window: &RateWindowSnapshot) -> bool {
     window.is_exhausted || window.used_percent >= 100.0
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use codexbar::providers::copilot::SEAT_CREDIT_WINDOW_ID;
-
-    fn window(used_percent: f64) -> RateWindowSnapshot {
-        derived_window(used_percent, None)
-    }
-
-    fn snapshot() -> ProviderUsageSnapshot {
-        ProviderUsageSnapshot {
-            provider_id: "codex".to_string(),
-            display_name: "Codex".to_string(),
-            primary: window(20.0),
-            primary_label: None,
-            secondary: Some(window(60.0)),
-            secondary_label: None,
-            secondary_label_key: None,
-            model_specific: None,
-            tertiary: None,
-            tertiary_label: None,
-            extra_rate_windows: Vec::new(),
-            inventory: Vec::new(),
-            display_details: Vec::new(),
-            cost: None,
-            plan_name: None,
-            account_email: None,
-            account_label: None,
-            subscription: None,
-            source_label: "test".to_string(),
-            has_successful_claude_cli_quota: false,
-            updated_at: "2026-08-16T00:00:00Z".to_string(),
-            error: None,
-            error_state: codexbar::core::ProviderStateKind::Ready,
-            pace: None,
-            pace_authoritative: true,
-            account_organization: None,
-            tray_status_label: None,
-            fetch_duration_ms: None,
-            wayfinder_usage: None,
-            quota_burndown: None,
-            open_ai_api_usage: None,
-            throughput: None,
-            session_equivalent_forecast: None,
-        }
-    }
-
-    #[test]
-    fn weekly_preference_selects_the_weekly_window() {
-        let snapshot = snapshot();
-        let mut settings = Settings::default();
-        settings.set_provider_metric(ProviderId::Codex, MetricPreference::Weekly);
-
-        assert_eq!(
-            selected_usage_window(&snapshot, &settings).used_percent,
-            60.0
-        );
-    }
-
-    #[test]
-    fn missing_selected_session_falls_back_to_a_real_window() {
-        let mut snapshot = snapshot();
-        snapshot.primary.is_informational = true;
-        snapshot.primary.used_percent = 0.0;
-        let mut settings = Settings::default();
-        settings.set_provider_metric(ProviderId::Codex, MetricPreference::Session);
-
-        assert_eq!(
-            selected_usage_window(&snapshot, &settings).used_percent,
-            60.0
-        );
-    }
-
-    #[test]
-    fn automatic_selects_the_highest_real_window() {
-        let snapshot = snapshot();
-
-        assert_eq!(
-            selected_usage_window(&snapshot, &Settings::default()).used_percent,
-            60.0
-        );
-    }
-
-    #[test]
-    fn copilot_automatic_uses_seat_credit_progress_without_metered_quota() {
-        let mut snapshot = snapshot();
-        snapshot.provider_id = "copilot".to_string();
-        snapshot.primary = RateWindowSnapshot {
-            is_informational: true,
-            ..window(0.0)
-        };
-        snapshot.secondary = None;
-        snapshot.extra_rate_windows = vec![crate::commands::NamedRateWindowSnapshot {
-            id: SEAT_CREDIT_WINDOW_ID.to_string(),
-            title: "Credits used".to_string(),
-            window: window(35.0),
-            fallback_lane: true,
-            icon_fallback: None,
-        }];
-
-        assert_eq!(
-            selected_usage_window(&snapshot, &Settings::default()).used_percent,
-            35.0
-        );
-    }
-
-    #[test]
-    fn copilot_automatic_keeps_metered_quota_authoritative_over_seat_credits() {
-        let mut snapshot = snapshot();
-        snapshot.provider_id = "copilot".to_string();
-        snapshot.primary = window(20.0);
-        snapshot.secondary = None;
-        snapshot.extra_rate_windows = vec![crate::commands::NamedRateWindowSnapshot {
-            id: SEAT_CREDIT_WINDOW_ID.to_string(),
-            title: "Credits used".to_string(),
-            window: window(90.0),
-            fallback_lane: true,
-            icon_fallback: None,
-        }];
-
-        assert_eq!(
-            selected_usage_window(&snapshot, &Settings::default()).used_percent,
-            20.0
-        );
-    }
-
-    #[test]
-    fn copilot_explicit_session_does_not_fall_back_to_seat_credits() {
-        let mut snapshot = snapshot();
-        snapshot.provider_id = "copilot".to_string();
-        snapshot.primary = RateWindowSnapshot {
-            is_informational: true,
-            ..window(0.0)
-        };
-        snapshot.secondary = None;
-        snapshot.extra_rate_windows = vec![crate::commands::NamedRateWindowSnapshot {
-            id: SEAT_CREDIT_WINDOW_ID.to_string(),
-            title: "Credits used".to_string(),
-            window: window(35.0),
-            fallback_lane: true,
-            icon_fallback: None,
-        }];
-        let mut settings = Settings::default();
-        let provider = ProviderId::from_cli_name(&snapshot.provider_id).expect("copilot provider");
-        settings.set_provider_metric(provider, MetricPreference::Session);
-
-        let selected = selected_usage_window(&snapshot, &settings);
-        assert!(selected.is_informational);
-        assert_eq!(selected.used_percent, 0.0);
-    }
-
-    #[test]
-    fn cursor_automatic_uses_semantic_monthly_lane_and_keeps_grok_bot_explicit() {
-        let mut snapshot = snapshot();
-        snapshot.provider_id = "cursor".to_string();
-        snapshot.primary = window(85.0);
-        snapshot.secondary = Some(window(20.0));
-        snapshot.extra_rate_windows = vec![crate::commands::NamedRateWindowSnapshot {
-            id: "cursor-grok-bot".to_string(),
-            title: "Grok Bot".to_string(),
-            window: window(95.0),
-            fallback_lane: false,
-            icon_fallback: None,
-        }];
-
-        assert_eq!(
-            selected_usage_window(&snapshot, &Settings::default()).used_percent,
-            20.0
-        );
-
-        let mut settings = Settings::default();
-        settings.set_provider_metric(ProviderId::Cursor, MetricPreference::ExtraUsage);
-        assert_eq!(
-            selected_usage_window(&snapshot, &settings).used_percent,
-            95.0
-        );
-    }
-
-    #[test]
-    fn kimi_monthly_only_snapshot_selects_the_total_usage_lane() {
-        // Upstream 0.60.5 #3694: a Code API response may report only the
-        // monthly Total usage pool. The weekly lane is then an informational
-        // placeholder, and every metric preference lands on the monthly lane.
-        let mut snapshot = snapshot();
-        snapshot.provider_id = "kimi".to_string();
-        snapshot.primary = RateWindowSnapshot {
-            is_informational: true,
-            ..window(0.0)
-        };
-        snapshot.secondary = None;
-        snapshot.extra_rate_windows = vec![crate::commands::NamedRateWindowSnapshot {
-            id: "kimi-monthly".to_string(),
-            title: "Total usage".to_string(),
-            window: window(100.0),
-            fallback_lane: false,
-            icon_fallback: None,
-        }];
-
-        for preference in [
-            MetricPreference::Automatic,
-            MetricPreference::Session,
-            MetricPreference::Weekly,
-        ] {
-            let mut settings = Settings::default();
-            settings.set_provider_metric(ProviderId::Kimi, preference);
-            let selected = selected_usage_window(&snapshot, &settings);
-            assert!(!selected.is_informational, "{preference:?}");
-            assert_eq!(selected.used_percent, 100.0, "{preference:?}");
-        }
-    }
-
-    #[test]
-    fn opencodego_automatic_prefers_explicitly_exhausted_window_over_higher_percentage() {
-        let mut snapshot = snapshot();
-        snapshot.provider_id = "opencodego".to_string();
-        snapshot.primary.is_exhausted = true;
-
-        let selected = selected_usage_window(&snapshot, &Settings::default());
-
-        assert_eq!(selected.used_percent, 20.0);
-        assert!(selected.is_exhausted);
-    }
-
-    #[test]
-    fn claude_and_codex_automatic_keep_highest_used_window() {
-        for provider_id in ["claude", "codex"] {
-            let mut snapshot = snapshot();
-            snapshot.provider_id = provider_id.to_string();
-            snapshot.primary.is_exhausted = true;
-
-            let selected = selected_usage_window(&snapshot, &Settings::default());
-
-            assert_eq!(
-                selected.used_percent, 60.0,
-                "{provider_id} should keep highest-used automatic selection"
-            );
-            assert!(!selected.is_exhausted);
-        }
-    }
-
-    #[test]
-    fn automatic_treats_a_full_window_as_exhausted_even_without_the_flag() {
-        let mut snapshot = snapshot();
-        let mut full = window(100.0);
-        full.is_exhausted = false;
-        snapshot.tertiary = Some(full);
-
-        let selected = selected_usage_window(&snapshot, &Settings::default());
-
-        assert_eq!(selected.used_percent, 100.0);
-        assert!(!selected.is_exhausted);
-    }
-
-    #[test]
-    fn non_automatic_highest_window_keeps_percentage_order() {
-        let healthy = window(80.0);
-        let mut exhausted = window(20.0);
-        exhausted.is_exhausted = true;
-
-        let selected = highest_window([&healthy, &exhausted].into_iter()).expect("window");
-
-        assert_eq!(selected.used_percent, 80.0);
-    }
-
-    #[test]
-    fn antigravity_automatic_prefers_active_core_quota_over_exhausted_extra_window() {
-        let mut snapshot = snapshot();
-        snapshot.provider_id = "antigravity".to_string();
-        snapshot.primary = window(100.0);
-        snapshot.primary.is_exhausted = true;
-        snapshot.primary_label = Some("Gemini 5h".to_string());
-        snapshot.secondary = Some(window(88.0));
-        snapshot.secondary_label = Some("Gemini Weekly".to_string());
-        snapshot.extra_rate_windows = vec![crate::commands::NamedRateWindowSnapshot {
-            id: "antigravity-quota-summary-3p-weekly".to_string(),
-            title: "Claude/GPT weekly".to_string(),
-            window: window(100.0),
-            fallback_lane: false,
-            icon_fallback: None,
-        }];
-
-        let selected = selected_usage_window(&snapshot, &Settings::default());
-
-        assert_eq!(selected.used_percent, 88.0);
-        assert!(!selected.is_exhausted);
-    }
-
-    #[test]
-    fn antigravity_automatic_uses_core_slots_only() {
-        let mut snapshot = snapshot();
-        snapshot.provider_id = "antigravity".to_string();
-        snapshot.primary = window(80.0);
-        snapshot.secondary = Some(window(20.0));
-        snapshot.model_specific = Some(window(90.0));
-        snapshot.extra_rate_windows = vec![crate::commands::NamedRateWindowSnapshot {
-            id: "legacy-other".to_string(),
-            title: "Other".to_string(),
-            window: window(100.0),
-            fallback_lane: false,
-            icon_fallback: None,
-        }];
-
-        let selected = selected_usage_window(&snapshot, &Settings::default());
-
-        assert_eq!(selected.used_percent, 90.0);
-    }
-
-    #[test]
-    fn single_meaningful_quota_omits_the_companion_icon_lane() {
-        let mut snapshot = snapshot();
-        snapshot
-            .secondary
-            .as_mut()
-            .expect("fixture has a secondary window")
-            .is_informational = true;
-
-        let (selected, companion) = selected_usage_icon_windows(&snapshot, &Settings::default());
-
-        assert_eq!(selected.used_percent, 20.0);
-        assert!(companion.is_none());
-    }
-
-    #[test]
-    fn average_preference_derives_the_combined_percentage() {
-        let mut snapshot = snapshot();
-        snapshot.provider_id = "gemini".to_string();
-        let mut settings = Settings::default();
-        settings.set_provider_metric(ProviderId::Gemini, MetricPreference::Average);
-
-        let selected = selected_usage_window(&snapshot, &settings);
-        assert_eq!(selected.used_percent, 40.0);
-        assert_eq!(selected.remaining_percent, 60.0);
-    }
-
-    fn mistral_snapshot(plan: Option<RateWindowSnapshot>) -> ProviderUsageSnapshot {
-        let mut snapshot = snapshot();
-        snapshot.provider_id = "mistral".to_string();
-        snapshot.display_name = "Mistral".to_string();
-        snapshot.primary = window(2.0);
-        snapshot.primary_label = Some("Included API".to_string());
-        snapshot.secondary = None;
-        snapshot.extra_rate_windows = plan
-            .map(|window| crate::commands::NamedRateWindowSnapshot {
-                id: codexbar::providers::mistral::MONTHLY_PLAN_WINDOW_ID.to_string(),
-                title: "Monthly Plan".to_string(),
-                window,
-                fallback_lane: false,
-                icon_fallback: None,
-            })
-            .into_iter()
-            .collect();
-        snapshot
-    }
-
-    fn metric_settings(provider: ProviderId, preference: MetricPreference) -> Settings {
-        let mut settings = Settings::default();
-        settings.set_provider_metric(provider, preference);
-        settings
-    }
-
-    #[test]
-    fn mistral_monthly_plan_selects_the_vibe_plan_window() {
-        let mut snapshot = mistral_snapshot(Some(window(42.0)));
-        snapshot.primary = window(80.0);
-
-        let monthly_plan = metric_settings(ProviderId::Mistral, MetricPreference::MonthlyPlan);
-        assert_eq!(
-            selected_usage_window(&snapshot, &monthly_plan).used_percent,
-            42.0
-        );
-        // Included API and Automatic stay separate choices (upstream #4072).
-        let included_api = metric_settings(ProviderId::Mistral, MetricPreference::Session);
-        assert_eq!(
-            selected_usage_window(&snapshot, &included_api).used_percent,
-            80.0
-        );
-        assert_eq!(
-            selected_usage_window(&snapshot, &Settings::default()).used_percent,
-            80.0
-        );
-        let presentation =
-            crate::commands::ProviderUsagePresentationSnapshot::new(snapshot, &monthly_plan);
-        assert_eq!(presentation.selected_metric.used_percent, 42.0);
-    }
-
-    #[test]
-    fn mistral_monthly_plan_falls_back_to_included_api_without_a_known_plan() {
-        let settings = metric_settings(ProviderId::Mistral, MetricPreference::MonthlyPlan);
-        let unknown_plan = RateWindowSnapshot {
-            is_informational: true,
-            ..window(0.0)
-        };
-
-        for snapshot in [mistral_snapshot(None), mistral_snapshot(Some(unknown_plan))] {
-            let selected = selected_usage_window(&snapshot, &settings);
-            assert_eq!(selected.used_percent, 2.0);
-            assert!(!selected.is_informational);
-        }
-    }
-
-    #[test]
-    fn mistral_monthly_plan_never_selects_a_spend_window() {
-        let mut snapshot = mistral_snapshot(None);
-        snapshot.cost = Some(crate::commands::CostSnapshotBridge {
-            used: 45.0,
-            limit: Some(50.0),
-            remaining: Some(5.0),
-            currency_code: "EUR".to_string(),
-            currency_symbol: Some("€".to_string()),
-            period: "month".to_string(),
-            resets_at: None,
-            formatted_used: "€45.00".to_string(),
-            formatted_limit: Some("€50.00".to_string()),
-            balance: None,
-            balance_updated_at: None,
-            account_id: None,
-            formatted_balance: None,
-            daily: Vec::new(),
-            always_visible: false,
-            folded_into_primary: false,
-            title_key: None,
-        });
-        let settings = metric_settings(ProviderId::Mistral, MetricPreference::MonthlyPlan);
-
-        assert_eq!(
-            selected_usage_window(&snapshot, &settings).used_percent,
-            2.0
-        );
-    }
-
-    #[test]
-    fn monthly_plan_without_a_provider_plan_window_falls_through_to_automatic() {
-        let mut snapshot = snapshot();
-        snapshot.extra_rate_windows = vec![crate::commands::NamedRateWindowSnapshot {
-            id: codexbar::providers::mistral::MONTHLY_PLAN_WINDOW_ID.to_string(),
-            title: "Monthly Plan".to_string(),
-            window: window(90.0),
-            fallback_lane: false,
-            icon_fallback: None,
-        }];
-        let settings = metric_settings(ProviderId::Codex, MetricPreference::MonthlyPlan);
-
-        // Codex declares no plan window, so a same-named lane is not special
-        // and the choice resolves like Automatic (highest real window).
-        assert_eq!(
-            selected_usage_window(&snapshot, &settings).used_percent,
-            selected_usage_window(&snapshot, &Settings::default()).used_percent
-        );
-        assert!(monthly_plan_window(&snapshot, Some(ProviderId::Codex)).is_none());
-    }
-
-    #[test]
-    fn presentation_payload_flattens_the_snapshot_and_selected_metric() {
-        let presentation = crate::commands::ProviderUsagePresentationSnapshot::new(
-            snapshot(),
-            &Settings::default(),
-        );
-        let value = serde_json::to_value(presentation).expect("serialize presentation");
-
-        assert_eq!(value["providerId"], "codex");
-        assert_eq!(value["selectedMetric"]["usedPercent"], 60.0);
-        assert!(value.get("snapshot").is_none());
-    }
-
-    #[test]
-    fn hidden_usage_items_are_presentation_metadata_and_do_not_change_selected_metric() {
-        let mut settings = Settings::default();
-        settings.set_hidden_usage_item_ids(ProviderId::Codex, vec!["metric:secondary".to_string()]);
-
-        let presentation =
-            crate::commands::ProviderUsagePresentationSnapshot::new(snapshot(), &settings);
-
-        assert!(presentation.snapshot.secondary.is_some());
-        assert_eq!(presentation.selected_metric.used_percent, 60.0);
-        assert_eq!(
-            presentation.hidden_usage_item_ids,
-            vec!["metric:secondary".to_string()]
-        );
-        let value = serde_json::to_value(presentation).expect("serialize presentation");
-        assert_eq!(
-            value["hiddenUsageItemIds"],
-            serde_json::json!(["metric:secondary"])
-        );
-    }
-
-    #[test]
-    fn claude_routines_hide_and_restore_preserve_raw_data_and_selected_metric() {
-        let mut raw = snapshot();
-        raw.provider_id = "claude".to_string();
-        raw.extra_rate_windows = vec![crate::commands::NamedRateWindowSnapshot {
-            id: "claude-routines".to_string(),
-            title: "Daily Routines".to_string(),
-            window: window(95.0),
-            fallback_lane: false,
-            icon_fallback: None,
-        }];
-
-        let baseline = crate::commands::ProviderUsagePresentationSnapshot::new(
-            raw.clone(),
-            &Settings::default(),
-        );
-        assert_eq!(baseline.selected_metric.used_percent, 95.0);
-
-        let mut settings = Settings::default();
-        settings.set_hidden_usage_item_ids(
-            ProviderId::Claude,
-            vec![codexbar::settings::CLAUDE_DAILY_ROUTINES_USAGE_ITEM_ID.to_string()],
-        );
-        let hidden =
-            crate::commands::ProviderUsagePresentationSnapshot::new(raw.clone(), &settings);
-
-        assert_eq!(hidden.selected_metric.used_percent, 95.0);
-        assert_eq!(hidden.snapshot.extra_rate_windows[0].id, "claude-routines");
-        assert_eq!(
-            hidden.snapshot.extra_rate_windows[0].window.used_percent,
-            95.0
-        );
-
-        settings.set_hidden_usage_item_ids(ProviderId::Claude, Vec::new());
-        let restored = crate::commands::ProviderUsagePresentationSnapshot::new(raw, &settings);
-
-        assert_eq!(restored.selected_metric.used_percent, 95.0);
-        assert_eq!(
-            restored.snapshot.extra_rate_windows[0].id,
-            "claude-routines"
-        );
-        assert!(restored.hidden_usage_item_ids.is_empty());
-    }
-
-    fn litellm_budgets(personal: f64, team: Option<f64>) -> ProviderUsageSnapshot {
-        let mut snapshot = snapshot();
-        snapshot.provider_id = "litellm".to_string();
-        snapshot.primary = window(personal);
-        snapshot.secondary = team.map(window);
-        snapshot
-    }
-
-    const AGENT_RESET: &str = "2026-08-16T05:00:00Z";
-
-    fn agent_window(used_percent: f64, minutes: u32) -> RateWindowSnapshot {
-        RateWindowSnapshot {
-            window_minutes: Some(minutes),
-            resets_at: Some(AGENT_RESET.to_string()),
-            ..window(used_percent)
-        }
-    }
-
-    fn agent_extra(
-        id: &str,
-        window: RateWindowSnapshot,
-        icon_fallback: Option<IconLane>,
-    ) -> crate::commands::NamedRateWindowSnapshot {
-        crate::commands::NamedRateWindowSnapshot {
-            id: id.to_string(),
-            title: id.to_string(),
-            window,
-            fallback_lane: false,
-            icon_fallback,
-        }
-    }
-
-    /// Bridge shape of a Doubao Coding Plan snapshot that also reports Agent
-    /// Plan lanes (`doubao-agent-*`), with optional Coding Plan session/weekly.
-    fn doubao_snapshot(
-        coding_session: Option<f64>,
-        coding_weekly: Option<f64>,
-    ) -> ProviderUsageSnapshot {
-        let mut snapshot = snapshot();
-        snapshot.provider_id = "doubao".to_string();
-        snapshot.primary = coding_session.map_or_else(
-            || RateWindowSnapshot {
-                window_minutes: Some(300),
-                is_informational: true,
-                ..window(0.0)
-            },
-            window,
-        );
-        snapshot.secondary = coding_weekly.map(window);
-        snapshot.extra_rate_windows = vec![
-            agent_extra(
-                "doubao-agent-session",
-                agent_window(0.0, 300),
-                Some(IconLane::Primary),
-            ),
-            agent_extra(
-                "doubao-agent-weekly",
-                agent_window(31.0, 10_080),
-                Some(IconLane::Secondary),
-            ),
-            agent_extra("doubao-agent-monthly", agent_window(72.0, 43_200), None),
-        ];
-        snapshot
-    }
-
-    #[test]
-    fn litellm_automatic_prefers_the_team_budget_over_a_fuller_personal_budget() {
-        let snapshot = litellm_budgets(60.0, Some(7.0));
-
-        assert_eq!(
-            selected_usage_window(&snapshot, &Settings::default()).used_percent,
-            7.0
-        );
-        let (selected, companion) = selected_usage_icon_windows(&snapshot, &Settings::default());
-        assert_eq!(selected.used_percent, 7.0);
-        assert_eq!(companion.map(|window| window.used_percent), Some(60.0));
-    }
-
-    #[test]
-    fn litellm_automatic_shows_an_exhausted_budget_first() {
-        let personal_exhausted = litellm_budgets(100.0, Some(7.0));
-        assert_eq!(
-            selected_usage_window(&personal_exhausted, &Settings::default()).used_percent,
-            100.0
-        );
-
-        let team_exhausted = litellm_budgets(40.0, Some(100.0));
-        assert_eq!(
-            selected_usage_window(&team_exhausted, &Settings::default()).used_percent,
-            100.0
-        );
-    }
-
-    #[test]
-    fn litellm_automatic_uses_the_only_budget_and_explicit_choices_still_win() {
-        let personal_only = litellm_budgets(25.0, None);
-        assert_eq!(
-            selected_usage_window(&personal_only, &Settings::default()).used_percent,
-            25.0
-        );
-
-        let mut settings = Settings::default();
-        settings.set_provider_metric(ProviderId::LiteLLM, MetricPreference::Session);
-        assert_eq!(
-            selected_usage_window(&litellm_budgets(60.0, Some(7.0)), &settings).used_percent,
-            60.0
-        );
-    }
-
-    #[test]
-    fn doubao_icon_windows_fall_back_to_agent_plan_lanes() {
-        let mut settings = Settings::default();
-        settings.set_provider_metric(ProviderId::Doubao, MetricPreference::Session);
-
-        for (has_session, has_weekly) in
-            [(false, false), (false, true), (true, false), (true, true)]
-        {
-            let snapshot = doubao_snapshot(has_session.then_some(10.0), has_weekly.then_some(20.0));
-            let (primary, secondary) = selected_usage_icon_windows(&snapshot, &settings);
-            let secondary = secondary.expect("secondary icon lane");
-
-            assert_eq!(primary.used_percent, if has_session { 10.0 } else { 0.0 });
-            assert_eq!(secondary.used_percent, if has_weekly { 20.0 } else { 31.0 });
-            assert!(!primary.is_informational);
-            assert_eq!(
-                primary.window_minutes,
-                if has_session { None } else { Some(300) }
-            );
-            assert_eq!(
-                secondary.window_minutes,
-                if has_weekly { None } else { Some(10_080) }
-            );
-            assert_eq!(
-                primary.resets_at.as_deref(),
-                (!has_session).then_some(AGENT_RESET)
-            );
-            assert_eq!(
-                secondary.resets_at.as_deref(),
-                (!has_weekly).then_some(AGENT_RESET)
-            );
-        }
-    }
-
-    #[test]
-    fn doubao_icon_fallback_does_not_change_the_reported_snapshot() {
-        let raw = doubao_snapshot(None, None);
-        let presentation = crate::commands::ProviderUsagePresentationSnapshot::new(
-            raw.clone(),
-            &Settings::default(),
-        );
-
-        assert!(presentation.snapshot.primary.is_informational);
-        assert!(presentation.snapshot.secondary.is_none());
-        assert!(presentation.snapshot.tertiary.is_none());
-        assert_eq!(
-            presentation
-                .snapshot
-                .extra_rate_windows
-                .iter()
-                .map(|extra| extra.id.as_str())
-                .collect::<Vec<_>>(),
-            [
-                "doubao-agent-session",
-                "doubao-agent-weekly",
-                "doubao-agent-monthly"
-            ]
-        );
-        assert!(!presentation.selected_metric.is_informational);
-    }
-
-    #[test]
-    fn doubao_icon_windows_preserve_missing_lanes() {
-        let no_hints = |levels: &[(&str, f64, u32)]| {
-            let mut snapshot = doubao_snapshot(None, None);
-            snapshot.extra_rate_windows = levels
-                .iter()
-                .map(|(id, percent, minutes)| {
-                    agent_extra(id, agent_window(*percent, *minutes), None)
-                })
-                .collect();
-            snapshot
-        };
-        // Monthly and team buckets never stand in for the session/weekly lanes.
-        for id in ["doubao-agent-monthly", "doubao-agent-team-session"] {
-            let snapshot = no_hints(&[(id, 25.0, 300)]);
-            let resolved = with_icon_fallbacks(&snapshot);
-            assert!(matches!(resolved, Cow::Borrowed(_)), "{id}");
-            assert!(resolved.primary.is_informational, "{id}");
-            assert!(resolved.secondary.is_none(), "{id}");
-        }
-
-        // Agent weekly alone fills only the weekly lane; no session is invented.
-        let mut snapshot = doubao_snapshot(None, None);
-        snapshot
-            .extra_rate_windows
-            .retain(|extra| extra.id == "doubao-agent-weekly");
-        let resolved = with_icon_fallbacks(&snapshot);
-        assert!(resolved.primary.is_informational);
-        assert_eq!(resolved.secondary.as_ref().unwrap().used_percent, 31.0);
-
-        // Coding session alone (agent lanes absent): unchanged, nothing invented.
-        let mut snapshot = doubao_snapshot(Some(25.0), None);
-        snapshot.extra_rate_windows.clear();
-        let resolved = with_icon_fallbacks(&snapshot);
-        assert!(matches!(resolved, Cow::Borrowed(_)));
-        let (primary, companion) = selected_usage_icon_windows(&snapshot, &Settings::default());
-        assert_eq!(primary.used_percent, 25.0);
-        assert!(companion.is_none());
-    }
-
-    #[test]
-    fn doubao_automatic_icon_uses_agent_lanes_not_team_windows() {
-        let mut snapshot = doubao_snapshot(None, None);
-        snapshot.extra_rate_windows = vec![
-            agent_extra(
-                "doubao-agent-session",
-                agent_window(42.0, 300),
-                Some(IconLane::Primary),
-            ),
-            agent_extra(
-                "doubao-agent-weekly",
-                agent_window(67.0, 10_080),
-                Some(IconLane::Secondary),
-            ),
-            agent_extra("doubao-agent-team-session", agent_window(91.0, 300), None),
-            agent_extra("doubao-agent-team-weekly", agent_window(88.0, 10_080), None),
-        ];
-        let settings = Settings::default();
-
-        let (top, bottom) = selected_usage_icon_windows(&snapshot, &settings);
-        assert_eq!(top.used_percent, 42.0);
-        assert_eq!(bottom.expect("bottom lane").used_percent, 67.0);
-        assert_eq!(
-            selected_usage_window(&snapshot, &settings).used_percent,
-            67.0
-        );
-        assert_eq!(
-            crate::tray_presentation::headline_window(&snapshot).used_percent,
-            42.0
-        );
-    }
-
-    #[test]
-    fn icon_fallback_hints_are_ignored_while_the_core_lane_is_present() {
-        let snapshot = doubao_snapshot(Some(10.0), Some(20.0));
-        let resolved = with_icon_fallbacks(&snapshot);
-
-        assert!(matches!(resolved, Cow::Borrowed(_)));
-        assert_eq!(resolved.primary.used_percent, 10.0);
-        assert_eq!(resolved.secondary.as_ref().unwrap().used_percent, 20.0);
-    }
-}
+mod tests;

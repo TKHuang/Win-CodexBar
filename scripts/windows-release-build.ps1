@@ -13,13 +13,17 @@
     build caches between releases without reusing a dirty source checkout.
 
 .PARAMETER Ref
-    Git ref to build. Use a tag such as v0.27.4 for release artifacts.
+    Git ref to build. Use a tag such as v0.27.4 for release artifacts. When
+    RepoUrl is a local folder, the ref is resolved in that repo, so HEAD and
+    unpushed local branches work.
 
 .PARAMETER RepoUrl
-    Git repository URL used when the managed checkout does not exist.
+    Git repository URL or local repo folder used when the managed checkout does
+    not exist. Defaults to this repo.
 
 .PARAMETER WorkRoot
     Root directory for the managed source checkout, cache, and output assets.
+    Defaults to .release in this repo (ignored by Git).
 
 .PARAMETER RefreshInstallerDependencies
     Re-download WebView2 and VC++ bootstrapper files instead of reusing the
@@ -40,8 +44,8 @@
 
 param(
     [string]$Ref = "HEAD",
-    [string]$RepoUrl = "https://github.com/TKHuang/Win-CodexBar.git",
-    [string]$WorkRoot = "C:\code\Win-CodexBar-release",
+    [string]$RepoUrl = (Split-Path -Parent $PSScriptRoot),
+    [string]$WorkRoot = (Join-Path (Split-Path -Parent $PSScriptRoot) ".release"),
     [switch]$RefreshInstallerDependencies,
     [switch]$WarmCacheOnly,
     [switch]$SmokeInstall
@@ -264,7 +268,15 @@ if (-not (Test-Path (Join-Path $SourceDir ".git"))) {
     if (Test-Path $SourceDir) {
         throw "$SourceDir exists but is not a Git checkout. Move it aside or choose another WorkRoot."
     }
-    Invoke-Native $git.Source @("clone", "--quiet", $RepoUrl, $SourceDir)
+    # Some test fixture paths exceed MAX_PATH once nested under WorkRoot\source.
+    Invoke-Native $git.Source @("clone", "--quiet", "-c", "core.longpaths=true", $RepoUrl, $SourceDir)
+}
+
+if (Test-Path -LiteralPath $RepoUrl -PathType Container) {
+    # The managed checkout's own HEAD is stale; build what the local repo means by Ref.
+    $resolvedRef = & $git.Source -C $RepoUrl rev-parse --verify --quiet "$Ref^{commit}"
+    if ($LASTEXITCODE -ne 0 -or -not $resolvedRef) { throw "Cannot resolve ref '$Ref' in $RepoUrl" }
+    $Ref = "$resolvedRef".Trim()
 }
 
 Push-Location $SourceDir

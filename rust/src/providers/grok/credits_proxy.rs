@@ -113,7 +113,7 @@ fn usd_from_exact_cents(cents: i64) -> Option<f64> {
         .then(|| value / 100.0)
 }
 
-fn parse_timestamp(raw: Option<&str>) -> Option<DateTime<Utc>> {
+pub(super) fn parse_timestamp(raw: Option<&str>) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(raw?)
         .ok()
         .map(|parsed| parsed.with_timezone(&Utc))
@@ -123,7 +123,7 @@ fn parse_timestamp(raw: Option<&str>) -> Option<DateTime<Utc>> {
 /// is not in the future, so a reset timestamp alone never invents a cadence.
 /// Upstream `GrokCreditsProxyFetcher.windowMinutes` keeps the length of a
 /// period that has already ended.
-fn window_minutes(
+pub(super) fn window_minutes(
     start: Option<&str>,
     end: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
@@ -269,6 +269,37 @@ impl GrokProvider {
             Err(_) => {
                 tracing::debug!("Grok grok.com percent retry timed out");
                 Ok(proxy)
+            }
+        }
+    }
+
+    /// Bounded grok.com percent for a wallet-only ACP answer (upstream #4679).
+    /// The ACP period, plan and prepaid balance stay authoritative. Only a
+    /// wire-published percent or a validated implicit zero is adopted. Expired
+    /// credentials and failed or slow enrichment keep the wallet with usage unknown.
+    pub(super) async fn resolve_cli_unknown_usage(
+        &self,
+        answer: BearerBilling,
+        credentials: &GrokCredentials,
+    ) -> BearerBilling {
+        if answer.billing.used_percent.is_some() || credentials.is_expired(Utc::now()) {
+            return answer;
+        }
+        let authorization = format!("Bearer {}", credentials.access_token);
+        match tokio::time::timeout(
+            PERCENT_RETRY_TIMEOUT,
+            self.fetch_billing(Some(authorization), None),
+        )
+        .await
+        {
+            Ok(Ok(grpc)) => adopt_grpc_percent(answer, grpc),
+            Ok(Err(error)) => {
+                tracing::debug!("Grok ACP percent enrichment failed: {error}");
+                answer
+            }
+            Err(_) => {
+                tracing::debug!("Grok ACP percent enrichment timed out");
+                answer
             }
         }
     }

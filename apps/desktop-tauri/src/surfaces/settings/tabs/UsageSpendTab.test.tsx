@@ -4,13 +4,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const tauriMocks = vi.hoisted(() => ({
   getUsageSpendSummary: vi.fn(),
   writeUsageSpendExport: vi.fn(),
+  getCodexSessionToolActivity: vi.fn(),
+  getCodexSessionDetails: vi.fn(),
 }));
 
 vi.mock("../../../lib/tauri", () => tauriMocks);
 vi.mock("@tauri-apps/plugin-dialog", () => ({ save: vi.fn() }));
-vi.mock("@tauri-apps/api/event", () => ({
-  listen: vi.fn().mockResolvedValue(() => {}),
-}));
+vi.mock("@tauri-apps/api/event", () => import("../../../test/mocks/event"));
 
 const EN: Record<string, string> = {
   CostPeriodMonthToDate: "Month to date",
@@ -318,6 +318,31 @@ describe("UsageSpendTab", () => {
     fireEvent.click(within(chats).getByRole("button", { name: /Repair the local service/ }));
     expect(within(chats).getByText("Restart the daemon")).toBeInTheDocument();
     expect(within(chats).queryByText("Elsewhere")).toBeNull();
+  });
+
+  it("reads a conversation's tool activity over the contract's history window", async () => {
+    tauriMocks.getCodexSessionDetails.mockResolvedValue({ sessionId: "s-1", requestCount: 0, turns: [] });
+    tauriMocks.getCodexSessionToolActivity.mockResolvedValue({
+      sessionId: "s-1",
+      operations: [],
+      ignoredRecordCount: 0,
+      isPartial: false,
+      redacted: false,
+    });
+    tauriMocks.getUsageSpendSummary.mockImplementation(async (options?: { period?: string }) =>
+      withContract(summary(options?.period ?? "rolling:30"), {
+        conversations: [chatSession("s-1", "chat-1", "Restart the daemon")],
+      }),
+    );
+    renderTab();
+    await screen.findByText("USD");
+    fireEvent.click(screen.getByRole("tab", { name: "UsageSpendViewSessions" }));
+
+    expect(tauriMocks.getCodexSessionToolActivity).not.toHaveBeenCalled();
+    fireEvent.click(await screen.findByRole("button", { name: /Restart the daemon/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "UsageSpendToolsTitle" }));
+    await waitFor(() => expect(tauriMocks.getCodexSessionToolActivity).toHaveBeenCalledWith("s-1", 30));
+    expect(await screen.findByText("UsageSpendToolsEmpty")).toBeInTheDocument();
   });
 
   it("captions a project with its path only when another project shares its name", async () => {

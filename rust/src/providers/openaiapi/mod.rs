@@ -33,14 +33,15 @@ use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-mod history;
+pub(crate) mod history;
 pub mod live;
 pub mod org_limits;
 
 use crate::core::{
     CostSnapshot, FetchContext, Provider, ProviderError, ProviderFetchResult, ProviderId,
-    ProviderMetadata, RateWindow, SourceMode, UsageSnapshot,
+    RateWindow, SourceMode, UsageSnapshot,
 };
+use crate::providers::json;
 
 const OPENAI_CREDIT_GRANTS_URL: &str = "https://api.openai.com/v1/dashboard/billing/credit_grants";
 const OPENAI_ORG_COSTS_URL: &str = "https://api.openai.com/v1/organization/costs";
@@ -192,7 +193,6 @@ fn allows_legacy_balance_fallback(project_id: Option<&str>, is_admin: bool) -> b
 }
 
 pub struct OpenAIApiProvider {
-    metadata: ProviderMetadata,
     client: Client,
     endpoints: Endpoints,
     retry: RetryPolicy,
@@ -201,19 +201,6 @@ pub struct OpenAIApiProvider {
 impl OpenAIApiProvider {
     pub fn new() -> Self {
         Self {
-            metadata: ProviderMetadata {
-                id: ProviderId::OpenAIApi,
-                display_name: "OpenAI",
-                session_label: "Spend",
-                weekly_label: "Requests",
-                supports_opus: false,
-                supports_credits: false,
-                default_enabled: false,
-                is_primary: false,
-                dashboard_url: Some("https://platform.openai.com/usage"),
-                status_page_url: Some("https://status.openai.com"),
-                tertiary_label_key: None,
-            },
             client: crate::core::credentialed_http_client_builder()
                 .timeout(REQUEST_TIMEOUT)
                 .build()
@@ -492,7 +479,7 @@ fn result_from_admin_usage(
     now: DateTime<Utc>,
     project_id: Option<&str>,
 ) -> Result<ProviderFetchResult, ProviderError> {
-    let daily = history::daily_usage(costs, completions, now, HISTORY_DAYS)?;
+    let mut daily = history::daily_usage(costs, completions, now, HISTORY_DAYS)?;
 
     let cost_total: f64 = daily.iter().map(|day| day.cost_usd).sum();
     let request_total: u128 = daily.iter().map(|day| u128::from(day.requests)).sum();
@@ -563,6 +550,13 @@ fn result_from_admin_usage(
         "USD",
         format!("Last {HISTORY_DAYS} days"),
     ));
+    // Every UTC day of the window gets a slot: a day without a bucket is zero, since
+    // the fetch above returned data for the whole window (upstream keeps calendar days).
+    let today_start = now.timestamp().div_euclid(SECONDS_PER_DAY) * SECONDS_PER_DAY;
+    history::fill_missing_days(
+        &mut daily,
+        (0..i64::from(HISTORY_DAYS)).map(|ago| today_start - ago * SECONDS_PER_DAY),
+    );
     if let Some(history) = history::usage_history(daily, HISTORY_DAYS, project_id) {
         result = result.with_open_ai_api_usage(history);
     }
@@ -578,7 +572,7 @@ fn cost_amount(result: &CostResult) -> Result<f64, ProviderError> {
     match &amount.value {
         serde_json::Value::Null => Ok(0.0),
         serde_json::Value::String(text) if text.trim().is_empty() => Ok(0.0),
-        value => number_value(value).ok_or_else(|| {
+        value => json::lenient_finite_f64(value).ok_or_else(|| {
             ProviderError::Parse("OpenAI API costs amount must be numeric".to_string())
         }),
     }
@@ -702,10 +696,6 @@ impl Default for OpenAIApiProvider {
 impl Provider for OpenAIApiProvider {
     fn id(&self) -> ProviderId {
         ProviderId::OpenAIApi
-    }
-
-    fn metadata(&self) -> &ProviderMetadata {
-        &self.metadata
     }
 
     async fn fetch_usage(&self, ctx: &FetchContext) -> Result<ProviderFetchResult, ProviderError> {

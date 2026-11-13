@@ -528,12 +528,20 @@ fn fixture_then_other_sessions() -> BrowserSessions {
 }
 
 /// The shared App-Bound Encryption message, as the provider reports it.
-const ABE_ERROR: &str = "Failed to read browser cookies: Chromium App-Bound Encryption is blocking automatic browser import. Paste the Cookie header manually, or use Firefox if that browser has the same login.";
+const ABE_ERROR: &str = "Failed to read browser cookies: Chromium App-Bound Encryption blocked automatic import from Google Chrome. Paste the Cookie header manually, or use Firefox if that browser has the same login.";
+
+/// Two blocked browsers (Chrome, then Arc) in one error.
+const ABE_ERROR_CHROME_AND_ARC: &str = "Failed to read browser cookies: Chromium App-Bound Encryption blocked automatic import from Google Chrome and Arc. Paste the Cookie header manually, or sign in with Firefox instead.";
 
 /// Chrome is skipped by App-Bound Encryption; Edge holds a session.
 fn chrome_protected_edge_signed_in() -> BrowserSessions {
     collect_sessions([
-        (BrowserType::Chrome, Err(CookieError::AppBoundEncryption)),
+        (
+            BrowserType::Chrome,
+            Err(CookieError::AppBoundEncryption {
+                browsers: vec![BrowserType::Chrome],
+            }),
+        ),
         (
             BrowserType::Edge,
             Ok(vec![cookie("session", ".workbuddy.cn", "/")]),
@@ -545,7 +553,12 @@ fn chrome_protected_edge_signed_in() -> BrowserSessions {
 /// request to www.workbuddy.cn would not carry.
 fn chrome_protected_edge_without_session() -> BrowserSessions {
     collect_sessions([
-        (BrowserType::Chrome, Err(CookieError::AppBoundEncryption)),
+        (
+            BrowserType::Chrome,
+            Err(CookieError::AppBoundEncryption {
+                browsers: vec![BrowserType::Chrome],
+            }),
+        ),
         (
             BrowserType::Edge,
             Ok(vec![cookie("api", "api.workbuddy.cn", "/")]),
@@ -676,8 +689,8 @@ async fn requests_post_json_with_the_website_session_and_no_bearer() {
 }
 
 #[tokio::test]
-async fn the_earliest_listing_reset_wins_across_paid_and_free() {
-    let (base_url, _) = serve(|seen| match seen.path.as_str() {
+async fn a_future_paid_reset_is_used_without_querying_free_grants() {
+    let (base_url, log) = serve(|seen| match seen.path.as_str() {
         PAID_FIXTURE_PATH => (200, PAID_PACKAGES.to_owned()),
         path => default_route(path),
     });
@@ -687,6 +700,52 @@ async fn the_earliest_listing_reset_wins_across_paid_and_free() {
         .expect("fetch");
     // 2026-10-20 23:59:59 +08:00, plus one second.
     assert_eq!(result.usage.primary.resets_at, at(1_792_512_000));
+    assert_eq!(paths(&log), vec![SUMMARY_FIXTURE_PATH, PAID_FIXTURE_PATH]);
+}
+
+/// Upstream #4767 `the paid cycle outranks an earlier free grant`.
+#[tokio::test]
+async fn the_paid_cycle_outranks_an_earlier_free_grant() {
+    const PAID: &str = r#"{"code":0,"msg":"OK","data":{"Accounts":[
+      {"CapacityUnit":"credits","CycleEndTime":"2026-11-24 12:44:13"}
+    ]}}"#;
+    // The trial grant closes with the calendar month and the reward grants end piecewise.
+    const FREE: &str = r#"{"code":0,"msg":"OK","data":{"Accounts":[
+      {"CapacityUnit":"credits","CycleEndTime":"2026-10-31 23:59:59"},
+      {"CapacityUnit":"credits","CycleEndTime":"2026-11-11 23:09:21"}
+    ]}}"#;
+    let (base_url, _) = serve(|seen| match seen.path.as_str() {
+        PAID_FIXTURE_PATH => (200, PAID.to_owned()),
+        FREE_FIXTURE_PATH => (200, FREE.to_owned()),
+        path => default_route(path),
+    });
+    let result = provider(&base_url, chrome_154, no_browser_sessions)
+        .fetch_usage(&manual(FIXTURE_COOKIE))
+        .await
+        .expect("fetch");
+    // 2026-11-24 12:44:13 +08:00, plus one second.
+    assert_eq!(result.usage.primary.resets_at, at(1_795_495_454));
+}
+
+/// Upstream #4767 `an exhausted paid cycle falls back to the free grants`.
+#[tokio::test]
+async fn an_exhausted_paid_cycle_falls_back_to_the_free_grants() {
+    const PAID: &str = r#"{"code":0,"msg":"OK","data":{"Accounts":[
+      {"CapacityUnit":"credits","CycleEndTime":"2026-09-30 23:59:59"}
+    ]}}"#;
+    let (base_url, log) = serve(|seen| match seen.path.as_str() {
+        PAID_FIXTURE_PATH => (200, PAID.to_owned()),
+        path => default_route(path),
+    });
+    let result = provider(&base_url, chrome_154, no_browser_sessions)
+        .fetch_usage(&manual(FIXTURE_COOKIE))
+        .await
+        .expect("fetch");
+    assert_eq!(result.usage.primary.resets_at, at(OCTOBER_RESET));
+    assert_eq!(
+        paths(&log),
+        vec![SUMMARY_FIXTURE_PATH, PAID_FIXTURE_PATH, FREE_FIXTURE_PATH]
+    );
 }
 
 #[tokio::test]
@@ -921,7 +980,12 @@ async fn no_session_is_a_sign_in_prompt_without_a_request() {
 #[test]
 fn browser_scans_keep_sessions_in_order_and_the_first_failure_of_each_kind() {
     let found = collect_sessions([
-        (BrowserType::Chrome, Err(CookieError::AppBoundEncryption)),
+        (
+            BrowserType::Chrome,
+            Err(CookieError::AppBoundEncryption {
+                browsers: vec![BrowserType::Chrome],
+            }),
+        ),
         (
             BrowserType::Edge,
             Ok(vec![cookie("session", ".workbuddy.cn", "/")]),
@@ -931,7 +995,18 @@ fn browser_scans_keep_sessions_in_order_and_the_first_failure_of_each_kind() {
             BrowserType::Firefox,
             Err(CookieError::Decryption("first".into())),
         ),
-        (BrowserType::Arc, Err(CookieError::AppBoundEncryption)),
+        (
+            BrowserType::Arc,
+            Err(CookieError::AppBoundEncryption {
+                browsers: vec![BrowserType::Arc],
+            }),
+        ),
+        (
+            BrowserType::Chrome,
+            Err(CookieError::AppBoundEncryption {
+                browsers: vec![BrowserType::Chrome],
+            }),
+        ),
         (BrowserType::Chromium, Err(CookieError::NoEncryptionKey)),
         (
             BrowserType::ChromeBeta,
@@ -942,9 +1017,10 @@ fn browser_scans_keep_sessions_in_order_and_the_first_failure_of_each_kind() {
         found.cookies,
         vec!["session=session-value", "locale=locale-value"]
     );
+    // Every blocked browser is named once, in browser order, in one error.
     assert_eq!(
         found.protected.map(|error| error.to_string()).as_deref(),
-        Some(ABE_ERROR)
+        Some(ABE_ERROR_CHROME_AND_ARC)
     );
     assert_eq!(
         found.unreadable.map(|error| error.to_string()).as_deref(),

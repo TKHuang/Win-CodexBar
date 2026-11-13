@@ -6,7 +6,9 @@
 //! API or browser-session quota onto the local estimate (upstream #4445);
 //! Web is cookie scrape only; Cli is local-only.
 
-mod console;
+mod cli_credential;
+pub(crate) mod console;
+pub(crate) mod cost_cli;
 mod legacy;
 pub(crate) mod local;
 mod session_overlay;
@@ -24,12 +26,14 @@ use transport::{HttpWebTransport, WebTransport};
 
 use crate::core::{
     CostSnapshot, FetchContext, Provider, ProviderError, ProviderFetchResult, ProviderId,
-    ProviderMetadata, RateWindow, SourceMode, UsageSnapshot,
+    RateWindow, SourceMode, UsageSnapshot,
 };
 
 const BASE_URL: &str = "https://opencode.ai";
 /// Source label for quota values reconstructed from the device-local SQLite history.
 pub const LOCAL_ESTIMATE_SOURCE_LABEL: &str = "local estimate";
+/// Source label of server quota read with the OpenCode CLI login over local history.
+const LOCAL_CLI_SOURCE_LABEL: &str = "local+cli";
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 // Upstream 0.48.0 #2583 (F15) optional-Zen-balance bounds.
@@ -46,7 +50,6 @@ pub(crate) const PACE_CAPABILITY: crate::core::ProviderPaceCapability =
     crate::core::ProviderPaceCapability::CALENDAR_MONTH_RESET_WINDOW;
 
 pub struct OpenCodeGoProvider {
-    metadata: ProviderMetadata,
     client: Client,
 }
 
@@ -56,8 +59,10 @@ struct CookieCapabilities {
     legacy: bool,
 }
 
+/// Console vs legacy session capabilities of an `opencode.ai` cookie header,
+/// shared by OpenCode and OpenCode Go.
 #[derive(Clone, Debug)]
-struct WebCookieSession {
+pub(crate) struct WebCookieSession {
     header: String,
     capabilities: CookieCapabilities,
 }
@@ -69,7 +74,7 @@ enum OptionalZenBalance {
 }
 
 impl WebCookieSession {
-    fn new(header: &str) -> Self {
+    pub(crate) fn new(header: &str) -> Self {
         let has_cookie = |names: &[&str]| {
             header.split(';').any(|part| {
                 let Some((name, value)) = part.trim().split_once('=') else {
@@ -87,11 +92,15 @@ impl WebCookieSession {
         }
     }
 
-    fn header(&self) -> &str {
+    pub(crate) fn header(&self) -> &str {
         &self.header
     }
 
-    fn can_recover_with_legacy(&self, error: &ProviderError) -> bool {
+    pub(crate) fn has_console_session(&self) -> bool {
+        self.capabilities.console
+    }
+
+    pub(crate) fn can_recover_with_legacy(&self, error: &ProviderError) -> bool {
         self.capabilities.legacy
             && (matches!(
                 error,
@@ -102,7 +111,7 @@ impl WebCookieSession {
             ) || error.is_transport_failure())
     }
 
-    fn select_legacy_result<T>(
+    pub(crate) fn select_legacy_result<T>(
         &self,
         console_error: ProviderError,
         legacy_result: Result<T, ProviderError>,
@@ -123,19 +132,6 @@ impl WebCookieSession {
 impl OpenCodeGoProvider {
     pub fn new() -> Self {
         Self {
-            metadata: ProviderMetadata {
-                id: ProviderId::OpenCodeGo,
-                display_name: "OpenCode Go",
-                session_label: "5-hour",
-                weekly_label: "Weekly",
-                supports_opus: true,
-                supports_credits: false,
-                default_enabled: false,
-                is_primary: false,
-                dashboard_url: Some("https://opencode.ai"),
-                status_page_url: None,
-                tertiary_label_key: Some("ProviderMonthly"),
-            },
             client: crate::core::credentialed_http_client_builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
@@ -349,20 +345,8 @@ impl OpenCodeGoProvider {
             }
             Err(console_error) if cookies.can_recover_with_legacy(&console_error) => {
                 zen_task.abort();
-                let session = match transport.resolve_legacy_session(&cookies).await {
-                    Ok(session) => session,
-                    Err(error) => {
-                        return cookies.select_legacy_result(console_error, Err(error));
-                    }
-                };
-                return Self::fetch_legacy_with_session(
-                    ctx,
-                    &cookies,
-                    console_error,
-                    transport,
-                    session,
-                )
-                .await;
+                return Self::fetch_legacy_with_cookies(ctx, &cookies, console_error, transport)
+                    .await;
             }
             Err(error) => {
                 zen_task.abort();
@@ -466,6 +450,30 @@ impl OpenCodeGoProvider {
     }
 }
 
+/// `(used percent, reset time)` of one OpenCode Go window.
+type GoWindow = (f64, chrono::DateTime<Utc>);
+
+/// Rolling 5h, weekly and calendar-month windows in the shared Go snapshot shape.
+fn go_snapshot(
+    rolling: GoWindow,
+    weekly: Option<GoWindow>,
+    monthly: Option<GoWindow>,
+) -> UsageSnapshot {
+    let window = |(percent, resets_at): GoWindow, minutes| {
+        RateWindow::with_details(percent, minutes, Some(resets_at), None)
+    };
+    let mut snapshot =
+        UsageSnapshot::new(window(rolling, Some(300))).with_login_method("OpenCode Go");
+    if let Some(weekly) = weekly {
+        snapshot = snapshot.with_secondary(window(weekly, Some(10080)));
+    }
+    if let Some(monthly) = monthly {
+        let minutes = RateWindow::monthly_window_minutes(Some(monthly.1)).or(Some(43200));
+        snapshot = snapshot.with_tertiary(window(monthly, minutes));
+    }
+    snapshot
+}
+
 impl Default for OpenCodeGoProvider {
     fn default() -> Self {
         Self::new()
@@ -476,10 +484,6 @@ impl Default for OpenCodeGoProvider {
 impl Provider for OpenCodeGoProvider {
     fn id(&self) -> ProviderId {
         ProviderId::OpenCodeGo
-    }
-
-    fn metadata(&self) -> &ProviderMetadata {
-        &self.metadata
     }
 
     async fn fetch_usage(&self, ctx: &FetchContext) -> Result<ProviderFetchResult, ProviderError> {
@@ -515,30 +519,57 @@ impl Provider for OpenCodeGoProvider {
                         tracing::debug!("OpenCode Go local failed in Auto; trying API/web: {e}");
                     }
                 }
-                if let Some(api_key) = usage_api::resolve_api_key(ctx) {
-                    match usage_api::fetch(&self.client, ctx, &api_key, "api").await {
+                let api_key = usage_api::resolve_api_key(ctx);
+                if let Some(api_key) = &api_key {
+                    match usage_api::fetch(&self.client, ctx, api_key, "api").await {
                         Ok(result) => return Ok(result),
                         Err(e) => {
-                            tracing::debug!("OpenCode Go API failed in Auto; trying web: {e}")
+                            tracing::debug!(
+                                "OpenCode Go API failed in Auto; trying web: {}",
+                                crate::logging::safe_error_message(&e)
+                            )
                         }
                     }
                 }
-                self.fetch_web(ctx).await
+                let web = self.fetch_web(ctx).await;
+                if web.is_ok() || api_key.is_some() {
+                    return web;
+                }
+                // Without a configured key, a usable browser session comes
+                // before the ambient CLI login (upstream #4771).
+                match usage_api::usage_credential(ctx, cli_credential::load_cli_credential) {
+                    Ok(Some((token, source))) if source == usage_api::CLI_SOURCE_LABEL => {
+                        usage_api::fetch(&self.client, ctx, &token, source).await
+                    }
+                    Ok(_) => web,
+                    Err(e) => {
+                        tracing::debug!(
+                            "OpenCode Go CLI login unavailable in Auto: {}",
+                            crate::logging::safe_error_message(&e)
+                        );
+                        web
+                    }
+                }
             }
             SourceMode::Web => self.fetch_web(ctx).await,
             SourceMode::Cli => self.fetch_local_with_balance(ctx, false).await,
             SourceMode::OAuth => {
-                let api_key = if ctx.token_account_isolated {
-                    usage_api::selected_account_api_key(ctx).ok_or(ProviderError::AuthRequired)?
+                let (api_key, source) = if ctx.token_account_isolated {
+                    (
+                        usage_api::selected_account_api_key(ctx)
+                            .ok_or(ProviderError::AuthRequired)?,
+                        "api",
+                    )
                 } else {
-                    usage_api::resolve_api_key(ctx).ok_or_else(|| {
-                        ProviderError::NotInstalled(
-                        "Missing OpenCode Go API key. Add one in Settings or set OPENCODE_API_KEY."
-                            .to_string(),
-                        )
-                    })?
+                    usage_api::usage_credential(ctx, cli_credential::load_cli_credential)?
+                        .ok_or_else(|| {
+                            ProviderError::NotInstalled(
+                                "Missing OpenCode Go API key. Add one in Settings, set OPENCODE_API_KEY, or sign in with the OpenCode CLI."
+                                    .to_string(),
+                            )
+                        })?
                 };
-                usage_api::fetch(&self.client, ctx, &api_key, "api").await
+                usage_api::fetch(&self.client, ctx, &api_key, source).await
             }
         }
     }
@@ -547,11 +578,9 @@ impl Provider for OpenCodeGoProvider {
         vec![SourceMode::Auto, SourceMode::Web, SourceMode::Cli]
     }
 
-    fn supports_web(&self) -> bool {
-        true
-    }
-
-    fn supports_cli(&self) -> bool {
+    /// The configured source wins over a manual cookie (upstream #4616). The
+    /// cookie then scopes only the web session that Web or Auto may use.
+    fn manual_cookie_keeps_usage_source(&self) -> bool {
         true
     }
 
@@ -640,11 +669,46 @@ impl OpenCodeGoProvider {
         }
         if overlay_session {
             let cookie_header = session.resolve(session_overlay::discover_browser_session);
-            return Ok(
-                Self::overlay_local_with_session(ctx, local, cookie_header, transport).await,
-            );
+            let result =
+                Self::overlay_local_with_session(ctx, local, cookie_header, transport).await;
+            return Ok(self.overlay_local_with_cli_login(ctx, result).await);
         }
         Ok(Self::with_optional_session_balance(ctx, local, session, transport).await)
+    }
+
+    /// Last overlay for the local estimate (upstream #4771): a configured key
+    /// or usable browser session already had its turn, so only a plain
+    /// estimate without a browser account's Zen balance borrows the CLI
+    /// login. Any failure keeps the estimate.
+    async fn overlay_local_with_cli_login(
+        &self,
+        ctx: &FetchContext,
+        fallback: ProviderFetchResult,
+    ) -> ProviderFetchResult {
+        if fallback.source_label != LOCAL_ESTIMATE_SOURCE_LABEL || fallback.cost.is_some() {
+            return fallback;
+        }
+        let token = match usage_api::usage_credential(ctx, cli_credential::load_cli_credential) {
+            Ok(Some((token, source))) if source == usage_api::CLI_SOURCE_LABEL => token,
+            Ok(_) => return fallback,
+            Err(e) => {
+                tracing::debug!(
+                    "OpenCode Go CLI login unavailable; keeping estimate: {}",
+                    crate::logging::safe_error_message(&e)
+                );
+                return fallback;
+            }
+        };
+        match usage_api::fetch(&self.client, ctx, &token, LOCAL_CLI_SOURCE_LABEL).await {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::debug!(
+                    "OpenCode Go CLI quota unavailable; keeping estimate: {}",
+                    crate::logging::safe_error_message(&e)
+                );
+                fallback
+            }
+        }
     }
 
     async fn with_optional_session_balance(

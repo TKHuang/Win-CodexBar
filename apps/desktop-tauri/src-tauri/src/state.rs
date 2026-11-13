@@ -124,11 +124,36 @@ pub struct AppState {
     pub flyout_cursor_anchor: Option<(f64, f64)>,
     pub provider_cache: Vec<ProviderUsageSnapshot>,
     pub claude_account_usage: HashMap<String, crate::commands::ClaudeAccountUsageState>,
+    /// Bumped under this lock on every change to `claude_account_usage`, so
+    /// disk writes can be applied in change order.
+    pub claude_account_usage_revision: u64,
+    /// Managed Claude accounts removed this session, mapped to the revision of
+    /// their removal. A refresh that started before that revision must not
+    /// re-add the account's usage. Ids are identity-derived, so a re-added
+    /// account is accepted again by any refresh that starts after its removal.
+    pub removed_claude_accounts: HashMap<String, u64>,
+    /// Last successful usage per saved token account, for Overview account rows.
+    /// Persisted without credentials; see `commands::provider_account_usage`.
+    pub provider_account_usage: crate::commands::ProviderAccountUsageCache,
+    /// Bumped under this lock on every change to `provider_account_usage`, so
+    /// disk writes can be applied in change order.
+    pub provider_account_usage_revision: u64,
+    /// Last usage read from the claude-swap or tcr pool, for Overview account
+    /// rows. Persisted without tokens or organization IDs, but the label may
+    /// include an organization name when two accounts share an email; see
+    /// `commands::claude_swap_usage`.
+    pub claude_swap_usage: crate::commands::ClaudeSwapUsageState,
+    /// Token account ids removed this session. An in-flight refresh that
+    /// finishes after a removal must not re-add that account's usage.
+    pub removed_token_account_usage: std::collections::HashSet<String>,
     pub codex_account_needs_authentication: HashMap<uuid::Uuid, bool>,
     pub transient_provider_failure_counts: HashMap<ProviderId, u8>,
     /// Live session behind each provider's cached good snapshot, for
     /// owner-checked last-good retention. In memory only.
     pub last_good_owners: HashMap<ProviderId, codexbar::core::LastGoodOwner>,
+    /// Default-account rate windows from each provider's last fresh fetch,
+    /// for the opt-in CLI usage cache. In memory only.
+    pub cli_usage_entries: HashMap<ProviderId, codexbar::cli_usage_cache::Entry>,
     pub provider_cache_updated_at: Option<std::time::Instant>,
     /// Per-provider freshness for scoped background refreshes. The aggregate
     /// timestamp cannot tell a dedicated auto-resume watcher whether its own
@@ -151,8 +176,9 @@ pub struct AppState {
     pub installer_path: Option<PathBuf>,
     /// Proof-harness configuration (set when `CODEXBAR_PROOF_MODE` is active).
     pub proof_config: Option<ProofConfig>,
-    /// True only after a validated proof seed was installed at startup.
-    pub provider_cache_seeded: bool,
+    /// Providers whose cache entry came from a validated proof seed. A
+    /// non-forced refresh leaves these providers' snapshots in place.
+    pub seeded_provider_ids: std::collections::HashSet<ProviderId>,
     /// Persistent notification manager — tracks which alerts have fired to prevent spam.
     pub notification_manager: codexbar::notifications::NotificationManager,
     /// Instant when the tray panel was last shown — used to suppress
@@ -161,9 +187,6 @@ pub struct AppState {
     /// Instant when focus loss last dismissed the tray panel. The following
     /// tray click consumes this marker instead of reopening the panel.
     pub last_blur_dismissed_at: Option<std::time::Instant>,
-    /// One-shot grace for a blur event caused while revealing the tray panel
-    /// during explicit startup.
-    pub startup_tray_blur_grace_until: Option<std::time::Instant>,
     /// One-shot permission for frontend layout code to reveal a newly opened
     /// flyout, carrying whether the revealed window may take focus.
     pub flyout_reveal_pending: Option<Activation>,
@@ -207,9 +230,16 @@ impl AppState {
             flyout_cursor_anchor: None,
             provider_cache: Vec::new(),
             claude_account_usage: HashMap::new(),
+            claude_account_usage_revision: 0,
+            removed_claude_accounts: HashMap::new(),
+            provider_account_usage: HashMap::new(),
+            provider_account_usage_revision: 0,
+            claude_swap_usage: Default::default(),
+            removed_token_account_usage: std::collections::HashSet::new(),
             codex_account_needs_authentication: HashMap::new(),
             transient_provider_failure_counts: HashMap::new(),
             last_good_owners: HashMap::new(),
+            cli_usage_entries: HashMap::new(),
             provider_cache_updated_at: None,
             provider_cache_updated_at_by_provider: HashMap::new(),
             provider_refresh_started_at: None,
@@ -221,11 +251,10 @@ impl AppState {
             last_update_check_ms: None,
             installer_path: None,
             proof_config: None,
-            provider_cache_seeded: false,
+            seeded_provider_ids: std::collections::HashSet::new(),
             notification_manager: codexbar::notifications::NotificationManager::new(),
             last_shown_at: None,
             last_blur_dismissed_at: None,
-            startup_tray_blur_grace_until: None,
             flyout_reveal_pending: None,
             gesture_blur_guard: None,
             auto_resume: crate::auto_resume::AutoResumeState::default(),
@@ -258,12 +287,6 @@ impl AppState {
         self.last_blur_dismissed_at
             .take()
             .is_some_and(|dismissed_at| now.duration_since(dismissed_at) <= max_age)
-    }
-
-    pub fn take_startup_tray_blur_grace(&mut self, now: std::time::Instant) -> bool {
-        self.startup_tray_blur_grace_until
-            .take()
-            .is_some_and(|until| now <= until)
     }
 
     pub fn arm_flyout_reveal(&mut self, activation: Activation) {

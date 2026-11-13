@@ -37,12 +37,45 @@ pub(crate) fn normalize_merged_overview_selection(ids: Vec<String>) -> Vec<Strin
     ids
 }
 
+/// Raw `provider_metrics` values, keeping every string so one unknown metric
+/// (a newer build's key, a hand-edited `extra:`) never fails the whole file.
+/// Non-string values are skipped here; unknown strings are dropped with a
+/// warning in [`canonicalize_provider_metrics`].
+fn deserialize_metric_keys<'de, D>(deserializer: D) -> Result<HashMap<String, String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum MetricValue {
+        Key(String),
+        Other(IgnoredAny),
+    }
+
+    let raw = Option::<HashMap<String, MetricValue>>::deserialize(deserializer)?;
+    Ok(raw
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(provider, value)| match value {
+            MetricValue::Key(key) => Some((provider, key)),
+            MetricValue::Other(_) => {
+                tracing::warn!(provider = %provider, "ignoring non-string menu bar metric");
+                None
+            }
+        })
+        .collect())
+}
+
 fn canonicalize_provider_metrics(
-    metrics: HashMap<String, MetricPreference>,
+    metrics: HashMap<String, String>,
 ) -> HashMap<String, MetricPreference> {
     let mut entries = metrics
         .into_iter()
-        .filter_map(|(raw, preference)| {
+        .filter_map(|(raw, key)| {
+            let Some(preference) = MetricPreference::from_key(&key) else {
+                tracing::warn!(provider = %raw, metric = %key, "ignoring unknown menu bar metric");
+                return None;
+            };
             let canonical = canonical_provider_id(&raw)?;
             let canonical_spelling = raw.eq_ignore_ascii_case(&canonical);
             Some((canonical, canonical_spelling, raw, preference))
@@ -155,10 +188,14 @@ pub(super) struct RawSettings {
     menu_bar_icon_style: Option<String>,
     #[serde(default)]
     merged_overview_selected_providers: Vec<String>,
+    #[serde(default)]
+    merged_overview_all_accounts: bool,
     #[serde(default = "default_true")]
     quota_warning_markers_visible: bool,
     #[serde(default = "default_true")]
     highlight_menu_cards_on_hover: bool,
+    #[serde(default)]
+    compact_menu_layout: bool,
     #[serde(default)]
     workday_tick_style: Option<String>,
     #[serde(default)]
@@ -176,6 +213,8 @@ pub(super) struct RawSettings {
     reset_time_relative: bool,
     show_reset_when_exhausted: bool,
     predictive_pace_warning_enabled: bool,
+    #[serde(default)]
+    predictive_pace_warning_lead_hours: u16,
     limit_reset_notifications_enabled: bool,
     credential_expiry_notifications_enabled: bool,
     /// `None` when the file predates the key; it then inherits `show_notifications`.
@@ -253,7 +292,8 @@ pub(super) struct RawSettings {
     disable_keychain_access: bool,
     hide_personal_info: bool,
     update_channel: UpdateChannel,
-    provider_metrics: HashMap<String, MetricPreference>,
+    #[serde(deserialize_with = "deserialize_metric_keys")]
+    provider_metrics: HashMap<String, String>,
     provider_order: Vec<String>,
     #[serde(default = "default_global_shortcut")]
     global_shortcut: String,
@@ -262,6 +302,8 @@ pub(super) struct RawSettings {
     #[serde(default)]
     antigravity_additional_profile_homes: Vec<String>,
     agent_sessions_enabled: bool,
+    #[serde(default)]
+    agent_sessions_local_only: bool,
     #[serde(default)]
     stay_awake_enabled: bool,
     agent_session_ssh_hosts: Vec<String>,
@@ -287,10 +329,18 @@ pub(super) struct RawSettings {
     window_scale_percent: u16,
     #[serde(default = "default_tray_scale_percent")]
     tray_scale_percent: u16,
+    #[serde(default = "default_tray_panel_style")]
+    tray_panel_style: String,
+    #[serde(default = "default_tray_panel_width")]
+    tray_panel_width: u16,
     #[serde(default)]
     tray_panel_always_on_top: bool,
     #[serde(default)]
+    tray_panel_movable: bool,
+    #[serde(default)]
     powertoys_status_pipe_enabled: bool,
+    #[serde(default)]
+    share_usage_with_cli: bool,
 
     #[serde(default)]
     float_bar_enabled: bool,
@@ -312,6 +362,8 @@ pub(super) struct RawSettings {
     float_bar_show_reset_inline: bool,
     #[serde(default)]
     float_bar_show_cost: bool,
+    #[serde(default)]
+    float_bar_show_weekly: bool,
     #[serde(default = "default_true")]
     promote_tray_icon: bool,
     #[serde(default = "default_true")]
@@ -373,8 +425,10 @@ impl Default for RawSettings {
             menu_bar_shows_percent: s.menu_bar_shows_percent,
             menu_bar_icon_style: Some(s.menu_bar_icon_style.as_str().to_string()),
             merged_overview_selected_providers: s.merged_overview_selected_providers,
+            merged_overview_all_accounts: s.merged_overview_all_accounts,
             quota_warning_markers_visible: s.quota_warning_markers_visible,
             highlight_menu_cards_on_hover: s.highlight_menu_cards_on_hover,
+            compact_menu_layout: s.compact_menu_layout,
             workday_tick_style: Some(s.workday_tick_style.as_str().to_string()),
             menu_bar_color_pace: s.menu_bar_color_pace,
             menu_bar_color_by_provider: s.menu_bar_color_by_provider,
@@ -386,6 +440,7 @@ impl Default for RawSettings {
             reset_time_relative: s.reset_time_relative,
             show_reset_when_exhausted: s.show_reset_when_exhausted,
             predictive_pace_warning_enabled: s.predictive_pace_warning_enabled,
+            predictive_pace_warning_lead_hours: s.predictive_pace_warning_lead_hours,
             limit_reset_notifications_enabled: s.limit_reset_notifications_enabled,
             credential_expiry_notifications_enabled: s.credential_expiry_notifications_enabled,
             session_quota_notifications_enabled: Some(s.session_quota_notifications_enabled),
@@ -425,13 +480,18 @@ impl Default for RawSettings {
             disable_keychain_access: s.disable_keychain_access,
             hide_personal_info: s.hide_personal_info,
             update_channel: s.update_channel,
-            provider_metrics: s.provider_metrics,
+            provider_metrics: s
+                .provider_metrics
+                .into_iter()
+                .map(|(provider, metric)| (provider, metric.key().into_owned()))
+                .collect(),
             provider_order: s.provider_order,
             global_shortcut: s.global_shortcut,
             switcher_shortcuts: s.switcher_shortcuts,
             codex_custom_sessions_dirs: s.codex_custom_sessions_dirs,
             antigravity_additional_profile_homes: s.antigravity_additional_profile_homes,
             agent_sessions_enabled: s.agent_sessions_enabled,
+            agent_sessions_local_only: s.agent_sessions_local_only,
             stay_awake_enabled: s.stay_awake_enabled,
             agent_session_ssh_hosts: s.agent_session_ssh_hosts,
             hooks_enabled: s.hooks_enabled,
@@ -446,8 +506,12 @@ impl Default for RawSettings {
             theme: s.theme,
             window_scale_percent: s.window_scale_percent,
             tray_scale_percent: s.tray_scale_percent,
+            tray_panel_style: s.tray_panel_style,
+            tray_panel_width: s.tray_panel_width,
             tray_panel_always_on_top: s.tray_panel_always_on_top,
+            tray_panel_movable: s.tray_panel_movable,
             powertoys_status_pipe_enabled: s.powertoys_status_pipe_enabled,
+            share_usage_with_cli: s.share_usage_with_cli,
             float_bar_enabled: s.float_bar_enabled,
             float_bar_opacity: s.float_bar_opacity,
             float_bar_scale: s.float_bar_scale,
@@ -458,6 +522,7 @@ impl Default for RawSettings {
             float_bar_dark_text: s.float_bar_dark_text,
             float_bar_show_reset_inline: s.float_bar_show_reset_inline,
             float_bar_show_cost: s.float_bar_show_cost,
+            float_bar_show_weekly: s.float_bar_show_weekly,
             promote_tray_icon: s.promote_tray_icon,
             claude_daily_routines_usage_visible: s.claude_daily_routines_usage_visible,
             claude_allow_reading_claude_code_credentials: s
@@ -750,8 +815,10 @@ impl From<RawSettings> for Settings {
             merged_overview_selected_providers: normalize_merged_overview_selection(
                 raw.merged_overview_selected_providers,
             ),
+            merged_overview_all_accounts: raw.merged_overview_all_accounts,
             quota_warning_markers_visible: raw.quota_warning_markers_visible,
             highlight_menu_cards_on_hover: raw.highlight_menu_cards_on_hover,
+            compact_menu_layout: raw.compact_menu_layout,
             workday_tick_style: raw
                 .workday_tick_style
                 .as_deref()
@@ -767,6 +834,9 @@ impl From<RawSettings> for Settings {
             reset_time_relative: raw.reset_time_relative,
             show_reset_when_exhausted: raw.show_reset_when_exhausted,
             predictive_pace_warning_enabled: raw.predictive_pace_warning_enabled,
+            predictive_pace_warning_lead_hours: clamp_predictive_pace_warning_lead_hours(
+                raw.predictive_pace_warning_lead_hours,
+            ),
             limit_reset_notifications_enabled: raw.limit_reset_notifications_enabled,
             credential_expiry_notifications_enabled: raw.credential_expiry_notifications_enabled,
             session_quota_notifications_enabled: raw
@@ -791,6 +861,7 @@ impl From<RawSettings> for Settings {
             codex_custom_sessions_dirs: raw.codex_custom_sessions_dirs,
             antigravity_additional_profile_homes: raw.antigravity_additional_profile_homes,
             agent_sessions_enabled: raw.agent_sessions_enabled,
+            agent_sessions_local_only: raw.agent_sessions_local_only,
             stay_awake_enabled: raw.stay_awake_enabled,
             agent_session_ssh_hosts: raw.agent_session_ssh_hosts,
             hooks_enabled: raw.hooks_enabled,
@@ -805,8 +876,12 @@ impl From<RawSettings> for Settings {
             theme: raw.theme,
             window_scale_percent: clamp_window_scale_percent(raw.window_scale_percent),
             tray_scale_percent: clamp_tray_scale_percent(raw.tray_scale_percent),
+            tray_panel_style: normalize_tray_panel_style(&raw.tray_panel_style),
+            tray_panel_width: clamp_tray_panel_width(raw.tray_panel_width),
             tray_panel_always_on_top: raw.tray_panel_always_on_top,
+            tray_panel_movable: raw.tray_panel_movable,
             powertoys_status_pipe_enabled: raw.powertoys_status_pipe_enabled,
+            share_usage_with_cli: raw.share_usage_with_cli,
             float_bar_enabled: raw.float_bar_enabled,
             float_bar_opacity: clamp_float_bar_opacity(raw.float_bar_opacity),
             float_bar_scale: clamp_float_bar_scale(raw.float_bar_scale),
@@ -817,6 +892,7 @@ impl From<RawSettings> for Settings {
             float_bar_dark_text: raw.float_bar_dark_text,
             float_bar_show_reset_inline: raw.float_bar_show_reset_inline,
             float_bar_show_cost: raw.float_bar_show_cost,
+            float_bar_show_weekly: raw.float_bar_show_weekly,
             promote_tray_icon: raw.promote_tray_icon,
             claude_daily_routines_usage_visible: raw.claude_daily_routines_usage_visible,
             claude_allow_reading_claude_code_credentials: raw
@@ -838,6 +914,7 @@ impl From<RawSettings> for Settings {
                 .hide_native_codex_cost_when_open_codex_present,
             codex_external_oauth_sources_allowed: raw.codex_external_oauth_sources_allowed,
             legacy_usage_thresholds_pending,
+            load_state: super::SettingsLoadState::default(),
             cost_reporting_period: raw.cost_reporting_period,
             cost_usage_bucket_time_zone: super::normalize_cost_usage_bucket_time_zone(
                 &raw.cost_usage_bucket_time_zone,

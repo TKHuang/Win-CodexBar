@@ -1,58 +1,8 @@
 use crate::core::{ClaudePricingResolution, CostUsagePricing, ModelsDevPricingSnapshot};
+use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 
 pub(super) const FALLBACK_CLAUDE_MODEL: &str = "claude-sonnet-4-6";
-
-#[cfg(test)]
-pub(super) struct ClaudePricing;
-
-#[cfg(test)]
-impl ClaudePricing {
-    pub(super) fn cost_usd_with_cache_ttl(
-        model: &str,
-        input: u64,
-        cache_create: u64,
-        cache_create_1h: u64,
-        cache_read: u64,
-        output: u64,
-    ) -> f64 {
-        let cache_create_1h = cache_create_1h.min(cache_create);
-        let cache_create_5m = cache_create.saturating_sub(cache_create_1h);
-
-        // Standard buckets (input, cache-read, 5-minute cache-write, output),
-        // including any long-context tiering, come from the canonical table.
-        // Unknown/retired models fall back to Sonnet pricing.
-        #[allow(
-            clippy::cast_possible_truncation,
-            reason = "clamped to i32::MAX before casting"
-        )]
-        let clamp = |v: u64| v.min(i32::MAX as u64) as i32;
-        let base = CostUsagePricing::claude_cost_usd(
-            model,
-            clamp(input),
-            clamp(cache_read),
-            clamp(cache_create_5m),
-            clamp(output),
-        )
-        .or_else(|| {
-            CostUsagePricing::claude_cost_usd(
-                FALLBACK_CLAUDE_MODEL,
-                clamp(input),
-                clamp(cache_read),
-                clamp(cache_create_5m),
-                clamp(output),
-            )
-        })
-        .unwrap_or(0.0);
-
-        // Scanner-specific: one-hour cache writes bill at 2x the input rate.
-        let input_rate = CostUsagePricing::claude_input_cost_per_token(model)
-            .or_else(|| CostUsagePricing::claude_input_cost_per_token(FALLBACK_CLAUDE_MODEL))
-            .unwrap_or(0.0);
-
-        base + (cache_create_1h as f64) * input_rate * 2.0
-    }
-}
 
 /// Per-scan Claude pricing memo.
 ///
@@ -127,35 +77,34 @@ impl ClaudeScanPricingResolver {
         self.resolve(model).is_some()
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one row's five token counters plus its model and date"
+    )]
     pub(super) fn cost_usd_with_cache_ttl(
         &mut self,
         model: &str,
+        pricing_date: Option<DateTime<Utc>>,
         input: u64,
         cache_create: u64,
         cache_create_1h: u64,
         cache_read: u64,
         output: u64,
     ) -> f64 {
-        let cache_create_1h = cache_create_1h.min(cache_create);
-        let cache_create_5m = cache_create.saturating_sub(cache_create_1h);
-
         let resolved = self.resolve(model);
         let billable = resolved.or_else(|| self.resolve(FALLBACK_CLAUDE_MODEL));
-        let base = billable
+        billable
             .map(|pricing| {
-                CostUsagePricing::claude_cost_usd_u64_from_resolution(
+                CostUsagePricing::claude_cost_usd_u64_from_resolution_with_one_hour_writes(
                     pricing,
+                    pricing_date,
                     input,
                     cache_read,
-                    cache_create_5m,
+                    cache_create,
+                    cache_create_1h,
                     output,
                 )
             })
-            .unwrap_or(0.0);
-        let input_rate = billable
-            .map(CostUsagePricing::claude_input_cost_per_token_from_resolution)
-            .unwrap_or(0.0);
-
-        base + (cache_create_1h as f64) * input_rate * 2.0
+            .unwrap_or(0.0)
     }
 }

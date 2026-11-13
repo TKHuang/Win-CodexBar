@@ -2,13 +2,14 @@
 //!
 //! Projection is where external identity and status become the provider-neutral
 //! snapshot the UI and CLI consume. Identity is the source-issued numeric slot
-//! (`claude-swap:<slot>`), never email or credential-derived values, and
+//! (`<source>:<slot>`), never email or credential-derived values, and
 //! personal information collapses to `Account N` ordinals when hidden.
 
 use serde::Serialize;
 
 use super::{
-    ClaudeSwapAccountList, ClaudeSwapAccountRow, ClaudeSwapHistoricalUsage, ClaudeSwapScopedWindow,
+    ClaudeSwapAccountList, ClaudeSwapAccountRow, ClaudeSwapAccountSource,
+    ClaudeSwapHistoricalUsage, ClaudeSwapScopedWindow, ClaudeSwapSessionForecastDto,
     ClaudeSwapSpendWindow, ClaudeSwapUsageMeasurement, ClaudeSwapUsageStatus,
     ClaudeSwapUsageWindow,
 };
@@ -23,11 +24,14 @@ pub enum ClaudeSwapAccountAction {
 }
 
 /// Bridge-facing external account row. Identity is the source-issued numeric
-/// slot (`claude-swap:<slot>`), never email or credential-derived values.
+/// slot (`claude-swap:<slot>` or `tcr:<slot>`), never email or
+/// credential-derived values.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClaudeSwapAccount {
     pub id: String,
+    /// The tool that reported the row; also the card's source label.
+    pub source: ClaudeSwapAccountSource,
     pub slot: u32,
     pub label: String,
     pub email: Option<String>,
@@ -42,7 +46,13 @@ pub struct ClaudeSwapAccount {
     pub seven_day: Option<ClaudeSwapUsageWindowDto>,
     pub scoped: Vec<ClaudeSwapScopedWindowDto>,
     pub spend: Option<ClaudeSwapSpendWindowDto>,
+    /// When the live measurement above was fetched (claude-swap's per-account
+    /// cache can be minutes old). `None` when the row reported no live usage.
+    pub usage_fetched_at: Option<chrono::DateTime<chrono::Utc>>,
     pub historical_usage: Option<ClaudeSwapHistoricalUsageDto>,
+    /// Filled by [`super::attach_session_forecasts`]; projection alone never
+    /// has the account's history.
+    pub session_equivalent_forecast: Option<ClaudeSwapSessionForecastDto>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -145,7 +155,8 @@ fn candidate_label(
     format!("{} · Account {}", row.email, row.number)
 }
 
-fn error_text_for(row: &ClaudeSwapAccountRow) -> Option<String> {
+fn error_text_for(row: &ClaudeSwapAccountRow, source: ClaudeSwapAccountSource) -> Option<String> {
+    let tool = source.label();
     match row.usage_status {
         ClaudeSwapUsageStatus::Ok => {
             if !row.usage.is_empty() {
@@ -154,29 +165,26 @@ fn error_text_for(row: &ClaudeSwapAccountRow) -> Option<String> {
                 Some("No usage windows reported.".to_string())
             }
         }
-        ClaudeSwapUsageStatus::TokenExpired => {
-            Some("Token expired. Switch to this account in claude-swap to refresh it.".to_string())
-        }
-        ClaudeSwapUsageStatus::ReloginRequired => {
-            Some("Re-login required. Re-authenticate this account in claude-swap.".to_string())
-        }
+        ClaudeSwapUsageStatus::TokenExpired => Some(format!(
+            "Token expired. Switch to this account in {tool} to refresh it."
+        )),
+        ClaudeSwapUsageStatus::ReloginRequired => Some(format!(
+            "Re-login required. Re-authenticate this account in {tool}."
+        )),
         ClaudeSwapUsageStatus::ApiKey => {
             Some("API-key account; subscription usage is unavailable.".to_string())
         }
-        ClaudeSwapUsageStatus::KeychainUnavailable => {
-            Some("claude-swap could not read the active account's Keychain entry.".to_string())
-        }
+        ClaudeSwapUsageStatus::KeychainUnavailable => Some(format!(
+            "{tool} could not read the active account's Keychain entry."
+        )),
         ClaudeSwapUsageStatus::NoCredentials => {
             Some("No stored credentials for this account slot.".to_string())
         }
-        ClaudeSwapUsageStatus::ForeignCredential => Some(
-            "claude-swap reports the live credential belongs to a different account. Re-authenticate this account in claude-swap to restore its saved login."
-                .to_string(),
-        ),
-        ClaudeSwapUsageStatus::Unavailable => {
-            Some("Usage unavailable.".to_string())
-        }
-        ClaudeSwapUsageStatus::Unknown => Some("Unrecognized claude-swap status.".to_string()),
+        ClaudeSwapUsageStatus::ForeignCredential => Some(format!(
+            "{tool} reports the live credential belongs to a different account. Re-authenticate this account in {tool} to restore its saved login."
+        )),
+        ClaudeSwapUsageStatus::Unavailable => Some("Usage unavailable.".to_string()),
+        ClaudeSwapUsageStatus::Unknown => Some(format!("Unrecognized {tool} status.")),
     }
 }
 
@@ -228,13 +236,15 @@ fn to_historical_usage(
 }
 
 /// Action a row offers within `list`. Read-only adapters
-/// (`supports_account_switching == false`) offer none: usage, details and the
-/// active marker still render, but switching and re-authentication do not.
+/// (`supports_account_switching == false`) and sources that never switch (tcr)
+/// offer none: usage, details and the active marker still render, but
+/// switching and re-authentication do not.
 pub fn action_for_account(
     list: &ClaudeSwapAccountList,
     row: &ClaudeSwapAccountRow,
+    source: ClaudeSwapAccountSource,
 ) -> Option<ClaudeSwapAccountAction> {
-    if !list.supports_account_switching {
+    if !list.supports_account_switching || !source.supports_switching() {
         None
     } else if row.is_active {
         (row.usage_status == ClaudeSwapUsageStatus::ForeignCredential)
@@ -251,6 +261,7 @@ pub fn action_for_account(
 /// stable `Account N` ordinals and identity is omitted from the bridge payload.
 pub fn project_accounts(
     list: &ClaudeSwapAccountList,
+    source: ClaudeSwapAccountSource,
     hide_personal_info: bool,
 ) -> Vec<ClaudeSwapAccount> {
     let mut ordered = list.accounts.iter().collect::<Vec<_>>();
@@ -271,9 +282,10 @@ pub fn project_accounts(
             } else {
                 label
             };
-            let action = action_for_account(list, row);
+            let action = action_for_account(list, row, source);
             ClaudeSwapAccount {
-                id: format!("claude-swap:{}", row.number),
+                id: format!("{}:{}", source.label(), row.number),
+                source,
                 slot: row.number,
                 label: display_label,
                 email: if hide_personal_info || row.email.is_empty() {
@@ -295,12 +307,14 @@ pub fn project_accounts(
                 action,
                 is_disabled: row.is_disabled,
                 status: row.usage_status.as_label().to_string(),
-                error: error_text_for(row),
+                error: error_text_for(row, source),
                 five_hour: to_window(&row.usage.five_hour),
                 seven_day: to_window(&row.usage.seven_day),
                 scoped: row.usage.scoped.iter().map(to_scoped_window).collect(),
                 spend: to_spend(&row.usage.spend),
+                usage_fetched_at: row.usage_fetched_at,
                 historical_usage: to_historical_usage(&row.historical_usage),
+                session_equivalent_forecast: None,
             }
         })
         .collect()
@@ -346,9 +360,21 @@ mod tests {
         parse_account_list(&raw.to_string()).unwrap()
     }
 
+    /// Parse and project a list holding only `account`.
+    fn project_one(account: serde_json::Value, active: Option<u32>) -> ClaudeSwapAccount {
+        let raw = json!({
+            "schemaVersion": 1,
+            "activeAccountNumber": active,
+            "accounts": [account]
+        });
+        let parsed = parse_account_list(&raw.to_string()).unwrap();
+        project_accounts(&parsed, ClaudeSwapAccountSource::ClaudeSwap, false).remove(0)
+    }
+
     #[test]
     fn same_email_accounts_get_distinct_stable_ids_and_labels() {
-        let projected = project_accounts(&list_fixture(), false);
+        let projected =
+            project_accounts(&list_fixture(), ClaudeSwapAccountSource::ClaudeSwap, false);
         // Active row sorts first.
         assert_eq!(projected[0].id, "claude-swap:2");
         let work = projected.iter().find(|a| a.slot == 1).unwrap();
@@ -378,7 +404,7 @@ mod tests {
         list.supports_account_switching = false;
         list.accounts[1].usage_status = ClaudeSwapUsageStatus::ForeignCredential;
 
-        let projected = project_accounts(&list, false);
+        let projected = project_accounts(&list, ClaudeSwapAccountSource::ClaudeSwap, false);
         assert_eq!(projected.len(), 3);
         assert!(projected.iter().all(|account| account.action.is_none()));
         // Active marker, identity and usage remain.
@@ -392,14 +418,16 @@ mod tests {
 
     #[test]
     fn supporting_adapter_keeps_row_actions() {
-        let projected = project_accounts(&list_fixture(), false);
+        let projected =
+            project_accounts(&list_fixture(), ClaudeSwapAccountSource::ClaudeSwap, false);
         let actionable = projected.iter().find(|a| a.slot == 1).unwrap();
         assert_eq!(actionable.action, Some(ClaudeSwapAccountAction::Switch));
     }
 
     #[test]
     fn hiding_personal_info_collapses_to_ordinals() {
-        let projected = project_accounts(&list_fixture(), true);
+        let projected =
+            project_accounts(&list_fixture(), ClaudeSwapAccountSource::ClaudeSwap, true);
         let ids = projected
             .iter()
             .map(|account| account.id.as_str())
@@ -415,20 +443,16 @@ mod tests {
 
     #[test]
     fn unknown_status_is_neither_echoed_nor_actionable() {
-        let raw = json!({
-            "schemaVersion": 1,
-            "activeAccountNumber": null,
-            "accounts": [{
+        let account = project_one(
+            json!({
                 "number": 1,
                 "email": "x@example.com",
                 "active": false,
                 "usageStatus": "super_secret_token\u{1b}]0;leak\u{07}",
                 "usage": { "fiveHour": { "pct": 1.0 } }
-            }]
-        });
-        let parsed = parse_account_list(&raw.to_string()).unwrap();
-        let projected = project_accounts(&parsed, false);
-        let account = &projected[0];
+            }),
+            None,
+        );
         assert_eq!(account.status, "unknown");
         assert!(account.action.is_none());
         let error = account.error.as_deref().unwrap();
@@ -438,18 +462,15 @@ mod tests {
 
     #[test]
     fn foreign_credentials_expose_explicit_reauthentication_action() {
-        let raw = json!({
-            "schemaVersion": 1,
-            "activeAccountNumber": 1,
-            "accounts": [{
+        let account = project_one(
+            json!({
                 "number": 1,
                 "email": "x@example.com",
                 "active": true,
                 "usageStatus": "foreign_credential"
-            }]
-        });
-        let parsed = parse_account_list(&raw.to_string()).unwrap();
-        let account = &project_accounts(&parsed, false)[0];
+            }),
+            Some(1),
+        );
         assert_eq!(
             account.action,
             Some(ClaudeSwapAccountAction::Reauthenticate)
@@ -465,10 +486,8 @@ mod tests {
 
     #[test]
     fn historical_usage_is_typed_and_marked_as_source_reported() {
-        let raw = json!({
-            "schemaVersion": 1,
-            "activeAccountNumber": null,
-            "accounts": [{
+        let account = project_one(
+            json!({
                 "number": 1,
                 "email": "x@example.com",
                 "active": false,
@@ -479,10 +498,9 @@ mod tests {
                     "spend": { "used": 2.0, "limit": 20.0, "pct": 10.0, "currency": "USD" }
                 },
                 "lastGoodFetchedAt": "2026-09-12T00:45:00Z"
-            }]
-        });
-        let parsed = parse_account_list(&raw.to_string()).unwrap();
-        let account = &project_accounts(&parsed, false)[0];
+            }),
+            None,
+        );
         assert!(account.is_disabled);
         assert_eq!(
             account.historical_usage.as_ref().unwrap().provenance,
@@ -503,10 +521,8 @@ mod tests {
 
     #[test]
     fn spend_only_ok_usage_is_not_reported_as_empty() {
-        let raw = json!({
-            "schemaVersion": 1,
-            "activeAccountNumber": null,
-            "accounts": [{
+        let account = project_one(
+            json!({
                 "number": 1,
                 "email": "spend@example.com",
                 "active": false,
@@ -514,11 +530,84 @@ mod tests {
                 "usage": {
                     "spend": { "used": 2.0, "limit": 20.0, "pct": 10.0 }
                 }
-            }]
-        });
-        let parsed = parse_account_list(&raw.to_string()).unwrap();
-        let account = &project_accounts(&parsed, false)[0];
+            }),
+            None,
+        );
         assert!(account.spend.is_some());
         assert!(account.error.is_none());
+    }
+
+    /// tcr (teamclaude-rs) prints claude-swap's list schema v1 from
+    /// `tcr list --json`; upstream's synthetic contract fixture.
+    const TCR_FIXTURE: &str = include_str!("../../fixtures/claude/tcr-list-v1.json");
+
+    #[test]
+    fn tcr_fixture_parses_unchanged_as_a_pool_with_no_active_account_and_no_switching() {
+        let list = parse_account_list(TCR_FIXTURE).unwrap();
+        assert_eq!(list.active_account_number, None);
+        assert!(!list.supports_account_switching);
+        assert_eq!(
+            list.accounts
+                .iter()
+                .map(|row| row.number)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 6]
+        );
+        assert!(list.accounts.iter().all(|row| !row.is_active));
+        assert_eq!(
+            list.accounts
+                .iter()
+                .filter(|row| row.is_disabled)
+                .map(|row| row.number)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+    }
+
+    #[test]
+    fn tcr_rows_project_with_their_own_identity_and_label_and_are_read_only() {
+        let list = parse_account_list(TCR_FIXTURE).unwrap();
+        let accounts = project_accounts(&list, ClaudeSwapAccountSource::Tcr, false);
+
+        assert_eq!(
+            accounts.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            vec!["tcr:1", "tcr:2", "tcr:3", "tcr:4", "tcr:5", "tcr:6"]
+        );
+        assert!(accounts.iter().all(|a| {
+            a.source == ClaudeSwapAccountSource::Tcr && !a.is_active && a.action.is_none()
+        }));
+        let alice = &accounts[0];
+        assert_eq!(alice.label, "alice@example.com");
+        assert_eq!(alice.five_hour.as_ref().unwrap().used_percent, 40.0);
+        assert_eq!(alice.seven_day.as_ref().unwrap().used_percent, 60.0);
+        assert_eq!(alice.scoped[0].used_percent, 10.0);
+        assert!(accounts[2].is_disabled);
+        assert_eq!(
+            accounts[4].error.as_deref(),
+            Some("Re-login required. Re-authenticate this account in tcr.")
+        );
+        assert_eq!(serde_json::to_value(alice).unwrap()["source"], json!("tcr"));
+    }
+
+    #[test]
+    fn tcr_source_stays_read_only_even_if_the_adapter_claims_switching() {
+        let mut list = parse_account_list(TCR_FIXTURE).unwrap();
+        list.supports_account_switching = true;
+        let accounts = project_accounts(&list, ClaudeSwapAccountSource::Tcr, false);
+        assert!(accounts.iter().all(|a| a.action.is_none()));
+        let claude_swap = project_accounts(&list, ClaudeSwapAccountSource::ClaudeSwap, false);
+        assert!(claude_swap.iter().any(|a| a.action.is_some()));
+    }
+
+    #[test]
+    fn claude_swap_source_keeps_its_identity_and_tool_name_in_errors() {
+        let list = parse_account_list(TCR_FIXTURE).unwrap();
+        let accounts = project_accounts(&list, ClaudeSwapAccountSource::ClaudeSwap, false);
+        assert_eq!(accounts[0].id, "claude-swap:1");
+        assert_eq!(accounts[0].source, ClaudeSwapAccountSource::ClaudeSwap);
+        assert_eq!(
+            accounts[4].error.as_deref(),
+            Some("Re-login required. Re-authenticate this account in claude-swap.")
+        );
     }
 }

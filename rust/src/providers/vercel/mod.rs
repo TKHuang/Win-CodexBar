@@ -1,33 +1,50 @@
-//! Vercel AI Gateway credit balance provider.
+//! Vercel AI Gateway provider.
 //!
-//! `GET https://ai-gateway.vercel.sh/v1/credits` with a bearer API key returns
-//! the team's remaining balance and lifetime spend as decimal strings
-//! (upstream CodexBar 0.66.0, `Resources/Plugins/vercel.js`). The endpoint
-//! reports no quota or billing period, so the primary window is informational
-//! and no percentage is invented.
+//! Default (team credits): `GET https://ai-gateway.vercel.sh/v1/credits` with a
+//! bearer AI Gateway key returns the team's remaining balance and lifetime
+//! spend as decimal strings (upstream CodexBar 0.66.0,
+//! `Resources/Plugins/vercel.js`). The endpoint reports no quota or billing
+//! period, so the primary window is informational and no percentage is invented.
+//!
+//! Opt-in (personal budget, upstream 0.79 #4623/#4650): when a Vercel access
+//! token is configured, the card shows the token user's AI Gateway budget
+//! instead. The access token is sent only to `api.vercel.com`; see `budget.rs`.
+
+mod budget;
+
+pub(crate) use budget::is_team_id;
 
 use async_trait::async_trait;
+use chrono::Utc;
 use reqwest::{Client, StatusCode, redirect::Policy};
 use serde::Deserialize;
 use std::time::Duration;
 
 use crate::core::{
     CostSnapshot, FetchContext, Provider, ProviderDisplayDetail, ProviderError,
-    ProviderFetchResult, ProviderId, ProviderMetadata, RateWindow, SourceMode, UsageSnapshot,
+    ProviderFetchResult, ProviderId, RateWindow, SourceMode, UsageSnapshot,
 };
-use crate::providers::{BoundedBodyError, read_bounded_response};
+use crate::providers::{BoundedBodyError, format, read_bounded_response};
 
 const CREDITS_URL: &str = "https://ai-gateway.vercel.sh/v1/credits";
+const API_BASE_URL: &str = "https://api.vercel.com";
 const CREDENTIAL_TARGET: &str = "codexbar-vercel";
 const ENV_KEYS: &[&str] = &["AI_GATEWAY_API_KEY"];
+const ACCESS_TOKEN_ENV: &str = "VERCEL_ACCESS_TOKEN";
+const TEAM_ENV: &str = "VERCEL_TEAM_ID";
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const SECTION_LABEL: &str = "Team credits";
 
+/// Source of the optional personal-budget access token. A plain function
+/// pointer so tests can pin it without reading the user's settings.
+type AccessTokenLookup = fn() -> Option<String>;
+
 pub struct VercelProvider {
-    metadata: ProviderMetadata,
     client: Client,
     credits_url: String,
+    api_base_url: String,
+    access_token_lookup: AccessTokenLookup,
 }
 
 impl VercelProvider {
@@ -37,27 +54,30 @@ impl VercelProvider {
             .timeout(REQUEST_TIMEOUT)
             .build()
             .unwrap_or_else(|_| Client::new());
-        Self::with_client(CREDITS_URL, client)
+        let mut provider = Self::with_client(CREDITS_URL, client);
+        provider.access_token_lookup = configured_access_token;
+        provider
     }
 
     fn with_client(credits_url: impl Into<String>, client: Client) -> Self {
         Self {
-            metadata: ProviderMetadata {
-                id: ProviderId::Vercel,
-                display_name: "Vercel AI Gateway",
-                session_label: "Balance",
-                weekly_label: "Balance",
-                supports_opus: false,
-                supports_credits: false,
-                default_enabled: false,
-                is_primary: false,
-                dashboard_url: Some("https://vercel.com/d?to=%2F%5Bteam%5D%2F%7E%2Fai-gateway"),
-                status_page_url: None,
-                tertiary_label_key: None,
-            },
             client,
             credits_url: credits_url.into(),
+            api_base_url: API_BASE_URL.to_owned(),
+            access_token_lookup: || None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_api_base_url(mut self, api_base_url: impl Into<String>) -> Self {
+        self.api_base_url = api_base_url.into().trim_end_matches('/').to_owned();
+        self
+    }
+
+    #[cfg(test)]
+    fn with_access_token_lookup(mut self, lookup: AccessTokenLookup) -> Self {
+        self.access_token_lookup = lookup;
+        self
     }
 
     async fn fetch_credits(
@@ -99,13 +119,12 @@ impl Provider for VercelProvider {
         ProviderId::Vercel
     }
 
-    fn metadata(&self) -> &ProviderMetadata {
-        &self.metadata
-    }
-
     async fn fetch_usage(&self, ctx: &FetchContext) -> Result<ProviderFetchResult, ProviderError> {
         match ctx.source_mode {
-            SourceMode::Auto | SourceMode::OAuth => self.fetch_credits(ctx).await,
+            SourceMode::Auto | SourceMode::OAuth => match (self.access_token_lookup)() {
+                Some(token) => self.fetch_personal_budget(ctx, &token, Utc::now()).await,
+                None => self.fetch_credits(ctx).await,
+            },
             SourceMode::Web | SourceMode::Cli => {
                 Err(ProviderError::UnsupportedSource(ctx.source_mode))
             }
@@ -115,6 +134,16 @@ impl Provider for VercelProvider {
     fn available_sources(&self) -> Vec<SourceMode> {
         vec![SourceMode::Auto, SourceMode::OAuth]
     }
+}
+
+/// The personal-budget token: the provider's stored secret (DPAPI-protected
+/// settings, same slot as OpenRouter's management key), else the environment.
+fn configured_access_token() -> Option<String> {
+    let stored = crate::settings::Settings::load()
+        .management_api_token(ProviderId::Vercel)
+        .map(str::to_owned);
+    let env = std::env::var(ACCESS_TOKEN_ENV).ok();
+    budget::pick_access_token(stored.as_deref(), env.as_deref())
 }
 
 /// Wire shape at upstream v0.66.0: both amounts are decimal strings.
@@ -184,16 +213,6 @@ fn parse_amount(value: &str) -> Option<f64> {
         .filter(|amount| amount.is_finite())
 }
 
-/// `$95.50`, `-$1.25`, `$0.00`; a negative that rounds to zero carries no sign.
-fn format_usd(value: f64) -> String {
-    let cents = format!("{:.2}", value.abs());
-    if value < 0.0 && cents != "0.00" {
-        format!("-${cents}")
-    } else {
-        format!("${cents}")
-    }
-}
-
 fn build_result(credits: Credits) -> ProviderFetchResult {
     let usage =
         UsageSnapshot::new(RateWindow::informational(SECTION_LABEL)).with_login_method("API");
@@ -208,12 +227,12 @@ fn build_result(credits: Credits) -> ProviderFetchResult {
         .with_display_detail(ProviderDisplayDetail::new(
             "vercel-balance",
             "Available balance",
-            format_usd(credits.balance),
+            format::usd_signed(credits.balance),
         ))
         .with_display_detail(ProviderDisplayDetail::new(
             "vercel-lifetime-spend",
             "Lifetime spend",
-            format_usd(credits.total_used),
+            format::usd_signed(credits.total_used),
         ))
 }
 

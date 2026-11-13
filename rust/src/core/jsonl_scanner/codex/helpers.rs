@@ -4,6 +4,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::io::BufRead;
 
+/// Maximum retained Codex JSONL line size (upstream session-metadata bound).
 pub(super) const CODEX_JSONL_MAX_LINE_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Deserialize)]
@@ -337,11 +338,9 @@ pub(super) fn parse_codex_fast_event(line: &str) -> Option<CodexFastEvent<'_>> {
 }
 
 pub(super) fn is_candidate_codex_line(line: &str) -> bool {
-    if !line.contains("\"type\":\"event_msg\"")
-        && !line.contains("\"type\":\"turn_context\"")
-        && !line.contains("\"turn_context\"")
-        && !line.contains("\"event_msg\"")
-    {
+    // `"type":"event_msg"` and `"type":"turn_context"` contain `"event_msg"` and
+    // `"turn_context"`, so those two checks cannot succeed where the bare values fail.
+    if !line.contains("\"turn_context\"") && !line.contains("\"event_msg\"") {
         return false;
     }
 
@@ -368,10 +367,6 @@ pub(super) fn event_payload_type(obj: &Value) -> Option<&str> {
         .or_else(|| obj.get("event_msg"))
         .and_then(|payload| payload.get("type"))
         .and_then(Value::as_str)
-}
-
-pub(super) fn codex_timestamp_day_key(timestamp: &str) -> Option<String> {
-    parse_codex_timestamp(timestamp).map(|parsed| parsed.day_key())
 }
 
 #[derive(Debug, Clone)]
@@ -668,24 +663,4 @@ fn optional_token_i64(value: &Value, key: &str) -> Option<i64> {
 
 pub(super) fn clamp_reasoning(reasoning: Option<i64>, output: i64) -> Option<i64> {
     reasoning.map(|tokens| tokens.max(0).min(output.max(0)))
-}
-
-pub(super) fn last_usage_delta(last: &Value) -> (i64, i64, i64, Option<i64>) {
-    let totals = read_token_totals(last);
-    (
-        totals.input.max(0),
-        totals.cached.max(0),
-        totals.output.max(0),
-        totals.reasoning,
-    )
-}
-
-pub(super) fn fast_last_usage_delta(last: CodexFastTotals) -> (i64, i64, i64, Option<i64>) {
-    let totals = codex_totals_from_fast(last);
-    (
-        totals.input.max(0),
-        totals.cached.max(0),
-        totals.output.max(0),
-        totals.reasoning,
-    )
 }

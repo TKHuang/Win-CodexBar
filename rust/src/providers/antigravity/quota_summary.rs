@@ -2,11 +2,14 @@ use chrono::{DateTime, TimeZone, Utc};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 
+use super::legacy_status::slug;
 use crate::core::{NamedRateWindow, ProviderError, RateWindow, UsageSnapshot};
 
 const WINDOW_ID_PREFIX: &str = "antigravity-quota-summary-";
 const SESSION_MINUTES: u32 = 300;
 const WEEKLY_MINUTES: u32 = 7 * 24 * 60;
+/// Normalized cadence names that mean a five-hour session bucket.
+const SESSION_ALIASES: [&str; 5] = ["session", "5h", "5-hour", "five hour", "five-hour"];
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -98,8 +101,12 @@ enum BucketKind {
 }
 
 pub(super) fn parse_usage_snapshot(data: &[u8]) -> Result<UsageSnapshot, ProviderError> {
-    let envelope: QuotaSummaryEnvelope = serde_json::from_slice(data)
-        .map_err(|error| ProviderError::Parse(format!("Antigravity quota summary: {error}")))?;
+    // serde error text quotes string values from the response, so a decode
+    // failure reduces to a fixed category: response content must not reach
+    // user-facing errors or logs.
+    let envelope: QuotaSummaryEnvelope = serde_json::from_slice(data).map_err(|_| {
+        ProviderError::Parse("Antigravity quota summary: unexpected response shape".into())
+    })?;
     let payload = envelope
         .response
         .or(envelope.summary)
@@ -126,7 +133,8 @@ pub(super) fn parse_cli_usage_report(data: &[u8]) -> Result<UsageSnapshot, Provi
 }
 
 fn build_usage_snapshot(groups: Vec<QuotaSummaryGroup>) -> Result<UsageSnapshot, ProviderError> {
-    let (primary_windows, extra_windows, has_gemini_group) = split_quota_windows(groups);
+    let (primary_windows, extra_windows, has_gemini_group, ordinary_gemini_ids) =
+        split_quota_windows(groups);
     let all_windows: Vec<NamedRateWindow> = primary_windows
         .iter()
         .chain(extra_windows.iter())
@@ -144,8 +152,10 @@ fn build_usage_snapshot(groups: Vec<QuotaSummaryGroup>) -> Result<UsageSnapshot,
     } else {
         &all_windows
     };
-    let primary_selected = most_constrained_named(cadence_windows, SESSION_MINUTES);
-    let secondary_selected = most_constrained_named(cadence_windows, WEEKLY_MINUTES);
+    let primary_selected =
+        most_constrained_named(cadence_windows, SESSION_MINUTES, &ordinary_gemini_ids);
+    let secondary_selected =
+        most_constrained_named(cadence_windows, WEEKLY_MINUTES, &ordinary_gemini_ids);
 
     let mut selected_ids = Vec::new();
     let mut snapshot = if let Some(primary) = primary_selected {
@@ -180,9 +190,16 @@ fn build_usage_snapshot(groups: Vec<QuotaSummaryGroup>) -> Result<UsageSnapshot,
     Ok(snapshot)
 }
 
+/// Returns the primary windows, the extra windows, whether a Gemini group
+/// exists, and the IDs of ordinary Gemini buckets among the primary windows.
 fn split_quota_windows(
     groups: Vec<QuotaSummaryGroup>,
-) -> (Vec<NamedRateWindow>, Vec<NamedRateWindow>, bool) {
+) -> (
+    Vec<NamedRateWindow>,
+    Vec<NamedRateWindow>,
+    bool,
+    HashSet<String>,
+) {
     let mut indexed_groups = groups.into_iter().enumerate().collect::<Vec<_>>();
     let has_gemini_group = indexed_groups
         .iter()
@@ -192,6 +209,7 @@ fn split_quota_windows(
     let mut primary_windows = Vec::new();
     let mut extra_windows = Vec::new();
     let mut used_window_ids = HashSet::new();
+    let mut ordinary_gemini_ids = HashSet::new();
     let mut group_scope_counts = HashMap::<String, usize>::new();
 
     for (pos, (_, group)) in indexed_groups.into_iter().enumerate() {
@@ -203,7 +221,12 @@ fn split_quota_windows(
             format!("{base_scope}-{}", *occurrence)
         };
         *occurrence += 1;
-        let windows = group_quota_windows(&group, &scoped_group, &mut used_window_ids);
+        let windows = group_quota_windows(
+            &group,
+            &scoped_group,
+            &mut used_window_ids,
+            &mut ordinary_gemini_ids,
+        );
         if pos == 0 {
             primary_windows = windows;
         } else {
@@ -211,13 +234,19 @@ fn split_quota_windows(
         }
     }
 
-    (primary_windows, extra_windows, has_gemini_group)
+    (
+        primary_windows,
+        extra_windows,
+        has_gemini_group,
+        ordinary_gemini_ids,
+    )
 }
 
 fn group_quota_windows(
     group: &QuotaSummaryGroup,
     group_scope: &str,
     used_window_ids: &mut HashSet<String>,
+    ordinary_gemini_ids: &mut HashSet<String>,
 ) -> Vec<NamedRateWindow> {
     let group_title = group_title(group);
     let mut buckets = group.buckets.iter().enumerate().collect::<Vec<_>>();
@@ -250,6 +279,9 @@ fn group_quota_windows(
         );
         let base_id = format!("{WINDOW_ID_PREFIX}{group_scope}-{bucket_id}");
         let id = unique_window_id(base_id, group_scope, used_window_ids);
+        if group_rank(group) == 0 && is_ordinary_gemini_bucket(bucket_id) {
+            ordinary_gemini_ids.insert(id.clone());
+        }
         windows.push(NamedRateWindow::new(id, title, window).with_usage_known(usage_known));
     }
     windows
@@ -274,62 +306,88 @@ fn unique_window_id(
     }
 }
 
-fn most_constrained_named(windows: &[NamedRateWindow], minutes: u32) -> Option<&NamedRateWindow> {
-    windows
-        .iter()
-        .filter(|row| row.usage_known && row.window.window_minutes == Some(minutes))
-        .max_by(|left, right| {
-            left.window
-                .used_percent
-                .partial_cmp(&right.window.used_percent)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| right.id.cmp(&left.id))
-        })
+/// The most constrained known window of one cadence. Ordinary Gemini buckets
+/// represent Gemini; a model-specific bucket of that cadence is used only when
+/// no ordinary bucket of that cadence is known (absent, unknown or disabled).
+fn most_constrained_named<'a>(
+    windows: &'a [NamedRateWindow],
+    minutes: u32,
+    ordinary_ids: &HashSet<String>,
+) -> Option<&'a NamedRateWindow> {
+    let most_constrained = |ordinary_only: bool| {
+        windows
+            .iter()
+            .filter(|row| row.usage_known && row.window.window_minutes == Some(minutes))
+            .filter(|row| !ordinary_only || ordinary_ids.contains(&row.id))
+            .max_by(|left, right| {
+                left.window
+                    .used_percent
+                    .partial_cmp(&right.window.used_percent)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| right.id.cmp(&left.id))
+            })
+    };
+    most_constrained(true).or_else(|| most_constrained(false))
 }
 
-fn group_rank(group: &QuotaSummaryGroup) -> u8 {
-    let title = group
-        .display_name
-        .as_deref()
-        .or(group.name.as_deref())
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
-    if title.contains("gemini") {
+/// Stable ordinary Gemini bucket IDs: `gemini-weekly` and `gemini-` plus a
+/// session alias. IDs are compared lowercased with `_` as `-`, so display
+/// labels never decide which bucket represents Gemini.
+fn is_ordinary_gemini_bucket(bucket_id: &str) -> bool {
+    let lowered = bucket_id.trim().to_ascii_lowercase().replace('_', "-");
+    let id = lowered.strip_suffix(" limit").unwrap_or(&lowered);
+    id == "gemini-weekly"
+        || SESSION_ALIASES
+            .iter()
+            .any(|alias| id == format!("gemini-{alias}"))
+}
+
+/// The group's trimmed name and its rank: 0 for Gemini, 1 for Claude/GPT,
+/// 2 for everything else.
+fn group_family(group: &QuotaSummaryGroup) -> (Option<&str>, u8) {
+    let title = non_empty(group.display_name.as_deref().or(group.name.as_deref()));
+    let lower = title.unwrap_or_default().to_ascii_lowercase();
+    let rank = if lower.contains("gemini") {
         0
-    } else if title.contains("claude") || title.contains("gpt") {
+    } else if lower.contains("claude") || lower.contains("gpt") {
         1
     } else {
         2
-    }
+    };
+    (title, rank)
 }
 
+fn group_rank(group: &QuotaSummaryGroup) -> u8 {
+    group_family(group).1
+}
+
+/// Upstream `displayTitle(forQuotaGroup:)`. A Gemini group reads "Gemini" only
+/// when its title has no digit, so a versioned group such as "Gemini 4 Argon"
+/// keeps its own name. Claude and GPT groups read "Claude/GPT"; any other group
+/// keeps its trimmed name, or "Quota" when the name is blank.
+///
+/// Unlike upstream, every Gemini-ranked group is titled in the Gemini branch,
+/// so a versioned "Gemini 4 + GPT" keeps its name instead of "Claude/GPT".
 fn group_title(group: &QuotaSummaryGroup) -> String {
-    let title =
-        non_empty(group.display_name.as_deref().or(group.name.as_deref())).unwrap_or("Quota");
-    let lower = title.to_ascii_lowercase();
-    if lower.contains("gemini") {
-        "Gemini".into()
-    } else if lower.contains("claude") || lower.contains("gpt") {
+    let (title, rank) = group_family(group);
+    let title = title.unwrap_or_default();
+    if rank == 0 {
+        if title.chars().any(char::is_numeric) {
+            title.into()
+        } else {
+            "Gemini".into()
+        }
+    } else if rank == 1 {
         "Claude/GPT".into()
+    } else if title.is_empty() {
+        "Quota".into()
     } else {
-        title.to_string()
+        title.into()
     }
 }
 
 fn group_scope(group: &QuotaSummaryGroup) -> String {
-    group_title(group)
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string()
+    slug(&group_title(group))
 }
 
 fn bucket_kind(bucket: &QuotaSummaryBucket) -> BucketKind {
@@ -352,7 +410,6 @@ fn bucket_kind(bucket: &QuotaSummaryBucket) -> BucketKind {
             candidates.push(stripped.to_string());
         }
     }
-    const SESSION_ALIASES: [&str; 5] = ["session", "5h", "5-hour", "five hour", "five-hour"];
     if candidates.iter().any(|candidate| {
         SESSION_ALIASES
             .iter()
@@ -550,12 +607,71 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_gemini_buckets_represent_gemini_over_exhausted_model_allowances() {
+        let data = br#"{"groups":[{"displayName":"Gemini Models","buckets":[
+            {"bucketId":"gemini-2.5-pro-5h","displayName":"5h","remainingFraction":0.0},
+            {"bucketId":"gemini-2.5-pro-weekly","displayName":"Weekly","remainingFraction":0.0},
+            {"bucketId":"gemini-5h","displayName":"5h","remainingFraction":0.96},
+            {"bucketId":"gemini-weekly","displayName":"Weekly","remainingFraction":0.9}
+          ]}]}"#;
+        let snapshot = parse_usage_snapshot(data).unwrap();
+        assert!((snapshot.primary.used_percent - 4.0).abs() < 0.001);
+        assert_eq!(snapshot.primary_label.as_deref(), Some("Gemini 5h"));
+        let weekly = snapshot.secondary.unwrap();
+        assert!((weekly.used_percent - 10.0).abs() < 0.001);
+        assert_eq!(snapshot.secondary_label.as_deref(), Some("Gemini Weekly"));
+        // Model-specific rows stay visible with their own usage and reset data.
+        assert_eq!(snapshot.extra_rate_windows.len(), 2);
+        assert!(
+            snapshot
+                .extra_rate_windows
+                .iter()
+                .any(|row| (row.window.used_percent - 100.0).abs() < 0.001)
+        );
+    }
+
+    #[test]
+    fn model_specific_gemini_represents_when_ordinary_bucket_is_disabled_or_unknown() {
+        let disabled = br#"{"groups":[{"displayName":"Gemini Models","buckets":[
+            {"bucketId":"gemini-5h","displayName":"5h","disabled":true,"remainingFraction":0.96},
+            {"bucketId":"gemini-2.5-pro-5h","displayName":"5h","remainingFraction":0.4}
+          ]}]}"#;
+        let snapshot = parse_usage_snapshot(disabled).unwrap();
+        assert!((snapshot.primary.used_percent - 60.0).abs() < 0.001);
+
+        let unknown = br#"{"groups":[{"displayName":"Gemini Models","buckets":[
+            {"bucketId":"gemini-5h","displayName":"5h"},
+            {"bucketId":"gemini-2.5-pro-5h","displayName":"5h","remainingFraction":0.4}
+          ]}]}"#;
+        let snapshot = parse_usage_snapshot(unknown).unwrap();
+        assert!((snapshot.primary.used_percent - 60.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn ordinary_gemini_ids_match_after_normalizing_case_underscores_and_limit_suffix() {
+        assert!(is_ordinary_gemini_bucket("gemini-5h"));
+        assert!(is_ordinary_gemini_bucket("Gemini_Session"));
+        assert!(is_ordinary_gemini_bucket("GEMINI-WEEKLY limit"));
+        assert!(!is_ordinary_gemini_bucket("gemini-2.5-pro-5h"));
+        assert!(!is_ordinary_gemini_bucket("3p-weekly"));
+        assert!(!is_ordinary_gemini_bucket("gemini-weekly-extra"));
+    }
+
+    #[test]
     fn rejects_empty_or_unusable_quota_summary() {
         assert!(parse_usage_snapshot(br#"{}"#).is_err());
         assert!(parse_usage_snapshot(
             br#"{"groups":[{"displayName":"Gemini","buckets":[{"bucketId":"weekly","displayName":"Weekly"}]}]}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn parse_failure_is_a_fixed_category_without_response_text() {
+        let error = parse_usage_snapshot(br#"{"groups": "proj-secret-leak"}"#).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("unexpected response shape"), "{message}");
+        assert!(!message.contains("proj-secret-leak"), "{message}");
     }
 
     #[test]
@@ -601,6 +717,81 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn cli_report_keeps_a_versioned_gemini_group_name_distinct() {
+        // Upstream #4585: "Gemini 4 Argon" is its own quota, not a second "Gemini".
+        let data = br#"{
+          "status": "SUCCESS",
+          "command": {"name": "usage", "data": {"groups": [
+            {"name": "Gemini Models", "buckets": [
+              {"id": "gemini-weekly", "name": "Weekly Limit Remaining", "window": "weekly", "remaining_fraction": 0.99}
+            ]},
+            {"name": "Gemini 4 Argon", "description": "For paid Pro plans, Argon quota is separate.", "buckets": [
+              {"id": "gemini-argon-wtu-weekly", "name": "Gemini 4 Argon Weekly Limit", "window": "weekly", "remaining_fraction": 0.53, "reset_time": "2026-10-23T10:24:14Z"}
+            ]}
+          ]}}
+        }"#;
+
+        let snapshot = parse_cli_usage_report(data).expect("CLI report");
+
+        assert_eq!(snapshot.secondary_label.as_deref(), Some("Gemini Weekly"));
+        let extra_titles: Vec<&str> = snapshot
+            .extra_rate_windows
+            .iter()
+            .map(|window| window.title.as_str())
+            .collect();
+        assert_eq!(extra_titles, ["Gemini 4 Argon weekly"]);
+    }
+
+    #[test]
+    fn group_rank_title_and_scope_follow_the_group_family() {
+        // (displayName, name, rank, title, scope)
+        let cases = [
+            (Some("Gemini Pro"), None, 0, "Gemini", "gemini"),
+            (
+                Some("Gemini 4 Argon"),
+                None,
+                0,
+                "Gemini 4 Argon",
+                "gemini-4-argon",
+            ),
+            (
+                Some("Gemini 4 + GPT"),
+                None,
+                0,
+                "Gemini 4 + GPT",
+                "gemini-4---gpt",
+            ),
+            (None, Some("claude & GPT"), 1, "Claude/GPT", "claude-gpt"),
+            (
+                Some("OpenAI gpt-oss"),
+                Some("Gemini"),
+                1,
+                "Claude/GPT",
+                "claude-gpt",
+            ),
+            (Some("  "), Some("Gemini"), 2, "Quota", "quota"),
+            (
+                Some(" Third Party! "),
+                None,
+                2,
+                "Third Party!",
+                "third-party",
+            ),
+            (None, None, 2, "Quota", "quota"),
+        ];
+        for (display_name, name, rank, title, scope) in cases {
+            let group: QuotaSummaryGroup = serde_json::from_value(serde_json::json!({
+                "displayName": display_name,
+                "name": name,
+            }))
+            .unwrap();
+            assert_eq!(group_rank(&group), rank, "{display_name:?} {name:?}");
+            assert_eq!(group_title(&group), title, "{display_name:?} {name:?}");
+            assert_eq!(group_scope(&group), scope, "{display_name:?} {name:?}");
+        }
     }
 
     fn single_bucket_snapshot(bucket_id: &str, display_name: &str, window: &str) -> UsageSnapshot {

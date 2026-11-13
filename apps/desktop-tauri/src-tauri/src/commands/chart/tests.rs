@@ -1,6 +1,6 @@
 use super::{
     CostFetchFailure, ProviderLocalUsageSummary, cost_fetch_failure_allows_early_retry,
-    local_usage_summary_from_cost_summary, local_usage_summary_period_identity,
+    estimate_note_for, local_usage_summary_from_cost_summary, local_usage_summary_period_identity,
     localized_estimate_note, muse_local_usage_summary, token_cost_cache_is_fresh,
 };
 use crate::commands::is_provider_cache_fresh;
@@ -195,6 +195,23 @@ fn english_estimate_note_is_localized() {
 }
 
 #[test]
+fn recorded_opencode_spend_replaces_the_estimate_note() {
+    let native = CostSummary::default();
+    let recorded = CostSummary {
+        recorded_cost_rows: 2,
+        ..CostSummary::default()
+    };
+    assert_eq!(
+        estimate_note_for("codex", &native, Language::English),
+        "Estimated from local logs; may differ from your bill"
+    );
+    assert_eq!(
+        estimate_note_for("codex", &recorded, Language::English),
+        "Estimated from local logs, plus recorded OpenCode spend; may differ from your bill"
+    );
+}
+
+#[test]
 fn local_usage_today_hides_known_zero_and_unknown_cost_but_keeps_tokens() {
     let thirty = CostSummary {
         total_cost_usd: 30.0,
@@ -230,7 +247,9 @@ fn local_usage_today_hides_known_zero_and_unknown_cost_but_keeps_tokens() {
 
 #[test]
 fn a_scan_that_finishes_after_track_costs_went_off_is_not_cached() {
-    use super::{cached_provider_local_usage_summary, store_scanned_local_usage_summary};
+    use super::local_usage_cache::{
+        cached_provider_local_usage_summary, store_scanned_local_usage_summary,
+    };
     let summary = || ProviderLocalUsageSummary {
         today_cost: Some(1.25),
         thirty_day_cost: Some(12.5),

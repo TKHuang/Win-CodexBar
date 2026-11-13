@@ -10,10 +10,10 @@ use std::time::Duration;
 use super::{BoundedBodyError, read_bounded_response};
 use crate::core::{
     CostSnapshot, FetchContext, Provider, ProviderDisplayDetail, ProviderError,
-    ProviderFetchResult, ProviderId, ProviderMetadata, RateWindow, SourceMode, UsageSnapshot,
+    ProviderFetchResult, ProviderId, RateWindow, SourceMode, UsageSnapshot,
 };
 
-const BILLING_URL: &str = "https://console.typesafe.ai/settings/billing";
+pub(crate) const BILLING_URL: &str = "https://console.typesafe.ai/settings/billing";
 const ORIGIN: &str = "https://console.typesafe.ai";
 const COOKIE_DOMAINS: [&str; 2] = ["console.typesafe.ai", "typesafe.ai"];
 const MAX_CHUNKS: usize = 60;
@@ -38,26 +38,12 @@ struct Billing {
 }
 
 pub struct TypeSafeProvider {
-    metadata: ProviderMetadata,
     client: Client,
 }
 
 impl TypeSafeProvider {
     pub fn new() -> Self {
         Self {
-            metadata: ProviderMetadata {
-                id: ProviderId::TypeSafe,
-                display_name: "TypeSafe",
-                session_label: "Balance",
-                weekly_label: "Spend",
-                supports_opus: false,
-                supports_credits: true,
-                default_enabled: false,
-                is_primary: false,
-                dashboard_url: Some(BILLING_URL),
-                status_page_url: None,
-                tertiary_label_key: None,
-            },
             client: crate::core::credentialed_http_client_builder()
                 .redirect(Policy::none())
                 .timeout(REQUEST_TIMEOUT)
@@ -184,9 +170,6 @@ impl Default for TypeSafeProvider {
 impl Provider for TypeSafeProvider {
     fn id(&self) -> ProviderId {
         ProviderId::TypeSafe
-    }
-    fn metadata(&self) -> &ProviderMetadata {
-        &self.metadata
     }
     async fn fetch_usage(&self, ctx: &FetchContext) -> Result<ProviderFetchResult, ProviderError> {
         match ctx.source_mode {
@@ -367,20 +350,14 @@ fn build_result(billing: Billing) -> ProviderFetchResult {
             .unwrap_or_else(|| "Billing cycle".into()),
     )
     .with_balance(billing.balance)
-    .always_visible();
+    .always_visible()
+    .pay_as_you_go();
     cost.updated_at = usage.updated_at;
-    let spent_title = billing
-        .cycle_label
-        .as_deref()
-        .map_or_else(|| "Spent".into(), |cycle| format!("Spent ({cycle})"));
+    // The pay-as-you-go card already shows the cycle spend, so there is no
+    // separate "Spent" detail row (upstream `replacedDetailRows`).
     let mut result = ProviderFetchResult::new(usage, "web")
         .with_non_authoritative_pace()
-        .with_cost(cost)
-        .with_display_detail(ProviderDisplayDetail::new(
-            "spent",
-            spent_title,
-            format!("${:.2}", billing.spent),
-        ));
+        .with_cost(cost);
     if let Some(plan) = billing.plan.as_deref() {
         let label = if plan == "free_plan" {
             "Free".into()
@@ -487,6 +464,24 @@ mod tests {
         assert_eq!(parsed.spent, 4.5);
         assert_eq!(parsed.balance, 10.0);
         assert_eq!(parsed.credits.len(), 1);
+    }
+
+    #[test]
+    fn billing_is_a_pay_as_you_go_card_with_spend_and_balance() {
+        let result = build_result(Billing {
+            spent: 4.5,
+            balance: 10.0,
+            cycle_label: Some("September".into()),
+            plan: Some("free_plan".into()),
+            credits: Vec::new(),
+        });
+        let cost = result.cost.as_ref().expect("cost");
+        assert!(cost.pay_as_you_go, "upstream payAsYouGoSpend card style");
+        assert_eq!(cost.used, 4.5);
+        assert_eq!(cost.period, "September");
+        assert_eq!(cost.balance, Some(10.0));
+        let ids: Vec<&str> = result.display_details().iter().map(|d| d.id()).collect();
+        assert_eq!(ids, vec!["plan"], "the card shows spend, so no Spent row");
     }
 
     #[test]

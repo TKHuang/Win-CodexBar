@@ -84,6 +84,10 @@ const ALLOWED_PREFERENCES: &[(&str, Validator)] = &[
     ("high_usage_threshold", percent),
     ("critical_usage_threshold", percent),
     ("predictive_pace_warning_enabled", typed::<bool>),
+    (
+        "predictive_pace_warning_lead_hours",
+        predictive_pace_warning_lead_hours,
+    ),
     ("limit_reset_notifications_enabled", typed::<bool>),
     ("show_pace", typed::<bool>),
     ("show_as_used", typed::<bool>),
@@ -100,6 +104,7 @@ const ALLOWED_PREFERENCES: &[(&str, Validator)] = &[
         "merged_overview_selected_providers",
         merged_overview_selection,
     ),
+    ("merged_overview_all_accounts", typed::<bool>),
     ("quota_warning_markers_visible", typed::<bool>),
     ("workday_tick_style", |v| {
         one_of(v, &["hidden", "subtle", "high_contrast"])
@@ -122,6 +127,11 @@ const ALLOWED_PREFERENCES: &[(&str, Validator)] = &[
         "tray_scale_percent",
         uint_in::<{ super::TRAY_SCALE_PERCENT_MIN as u64 }, { super::TRAY_SCALE_PERCENT_MAX as u64 }>,
     ),
+    ("tray_panel_style", |v| one_of(v, &["classic", "modern"])),
+    (
+        "tray_panel_width",
+        uint_in::<{ super::TRAY_PANEL_WIDTH_MIN as u64 }, { super::TRAY_PANEL_WIDTH_MAX as u64 }>,
+    ),
     ("float_bar_opacity", uint_in::<30, 100>),
     ("float_bar_scale", uint_in::<75, 200>),
     ("float_bar_orientation", |v| {
@@ -131,6 +141,7 @@ const ALLOWED_PREFERENCES: &[(&str, Validator)] = &[
     ("float_bar_dark_text", typed::<bool>),
     ("float_bar_show_reset_inline", typed::<bool>),
     ("float_bar_show_cost", typed::<bool>),
+    ("float_bar_show_weekly", typed::<bool>),
     ("cost_reporting_period", cost_reporting_period),
     ("cost_usage_enabled", typed::<bool>),
     ("spend_dashboard_period", cost_reporting_period),
@@ -165,15 +176,18 @@ pub const EXCLUDED_KEYS: &[&str] = &[
     "hooks_enabled",
     "global_shortcut",
     "agent_sessions_enabled",
+    "agent_sessions_local_only",
     "disable_keychain_access",
     "claude_allow_reading_claude_code_credentials",
     "codex_external_oauth_sources_allowed",
     "open_codex_usage_logs_enabled",
     "hide_native_codex_cost_when_open_codex_present",
     "powertoys_status_pipe_enabled",
+    "share_usage_with_cli",
     "float_bar_enabled",
     "float_bar_click_through",
     "tray_panel_always_on_top",
+    "tray_panel_movable",
     "promote_tray_icon",
     "stay_awake_enabled",
     // Update settings.
@@ -198,6 +212,7 @@ pub const EXCLUDED_KEYS: &[&str] = &[
     "stacked_tray_bottom_provider",
     "credential_expiry_notifications_enabled",
     "highlight_menu_cards_on_hover",
+    "compact_menu_layout",
     // No reader anywhere in the app.
     "merge_tray_icons",
 ];
@@ -218,6 +233,12 @@ fn uint_in<const MIN: u64, const MAX: u64>(value: &Value) -> bool {
 
 /// `0` is manual refresh; otherwise the interval must be at least a minute
 /// (the shortest option offered in Settings) and at most a day.
+fn predictive_pace_warning_lead_hours(value: &Value) -> bool {
+    value
+        .as_u64()
+        .is_some_and(|hours| hours <= u64::from(super::MAX_PREDICTIVE_PACE_WARNING_LEAD_HOURS))
+}
+
 fn refresh_interval_secs(value: &Value) -> bool {
     value
         .as_u64()
@@ -282,12 +303,23 @@ fn merged_overview_selection(value: &Value) -> bool {
 }
 
 fn provider_metrics(value: &Value) -> bool {
-    let known = known_provider_ids();
     value.as_object().is_some_and(|map| {
-        map.iter().all(|(provider, metric)| {
-            known.contains(provider.as_str()) && typed::<MetricPreference>(metric)
-        })
+        map.iter()
+            .all(|(provider, metric)| portable_metric(provider, metric))
     })
+}
+
+/// A known provider with a metric it can take; a named extra must be one
+/// that provider declares.
+fn portable_metric(provider: &str, metric: &Value) -> bool {
+    let Some(id) = ProviderId::from_cli_name(provider).filter(|id| id.cli_name() == provider)
+    else {
+        return false;
+    };
+    metric
+        .as_str()
+        .and_then(MetricPreference::from_key)
+        .is_some_and(|metric| metric.is_declared_for(id))
 }
 
 /// Keys are `<provider>` or `<provider>:session|weekly`; values carry optional
@@ -453,7 +485,7 @@ impl PreferencesDocument {
             ids.retain(|id| id.as_str().is_some_and(|id| known.contains(id)));
         }
         if let Some(Value::Object(metrics)) = preferences.get_mut("provider_metrics") {
-            metrics.retain(|provider, _| known.contains(provider.as_str()));
+            metrics.retain(|provider, metric| portable_metric(provider, metric));
         }
         if let Some(Value::Array(ids)) = preferences.get_mut("enabled_providers") {
             // `enabled_providers` is a set; keep exports deterministic.
@@ -538,6 +570,9 @@ impl PreferencesDocument {
         if let Some(value) = self.preferences.get(PROVIDER_QUOTA_WARNINGS) {
             apply_provider_quota_warnings(&mut next, value)?;
         }
+        // Not serialized, so the round trip above dropped it: an import onto
+        // stand-in defaults must not unlock saving over an unreadable file.
+        next.load_state = settings.load_state;
         *settings = next;
         Ok(self.preferences.len())
     }

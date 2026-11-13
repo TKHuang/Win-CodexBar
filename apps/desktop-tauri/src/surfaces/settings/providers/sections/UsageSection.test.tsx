@@ -1,9 +1,11 @@
+import { makeRateWindow as rateWindow } from "../../../../test/fixtures";
 import { render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { LocaleProvider } from "../../../../i18n/LocaleProvider";
 import { buildBundle } from "../../../../test/localeHarness";
 import type { ProviderDetail } from "../../../../types/bridge";
 import { UsageSection } from "./UsageSection";
+import { makeRateWindow } from "../../../../test/fixtures";
 
 const tauriMocks = vi.hoisted(() => ({
   getLocaleStrings: vi.fn(),
@@ -20,19 +22,6 @@ vi.mock("../../../../lib/tauri", async (importOriginal) => ({
 }));
 vi.mock("@tauri-apps/api/event", () => eventMocks);
 
-function rateWindow(usedPercent: number) {
-  return {
-    usedPercent,
-    remainingPercent: 100 - usedPercent,
-    windowMinutes: null,
-    resetsAt: null,
-    resetDescription: null,
-    isExhausted: false,
-    reservePercent: null,
-    reserveDescription: null,
-  };
-}
-
 function provider(): ProviderDetail {
   return {
     id: "copilot",
@@ -48,12 +37,12 @@ function provider(): ProviderDetail {
     sourceLabel: null,
     organization: null,
     lastUpdated: null,
-    session: rateWindow(20),
+    session: makeRateWindow(20),
     weekly: null,
     modelSpecific: null,
     tertiary: null,
     extraRateWindows: [
-      { id: "additional_budget", title: "Additional Budget", window: rateWindow(42) },
+      { id: "additional_budget", title: "Additional Budget", window: makeRateWindow(42) },
     ],
     cost: null,
     pace: null,
@@ -79,6 +68,7 @@ describe("UsageSection", () => {
         UsageBarQuotaWarnings: "Quota warnings",
         ProviderLabelLimitResetCredits: "Limit reset credits",
         ProviderTextTokens: "{} tokens",
+        UsageSpendSpend: "Spend",
       }),
     );
     eventMocks.listen.mockResolvedValue(() => {});
@@ -120,7 +110,7 @@ describe("UsageSection", () => {
         ? new Date(Date.now() + 3 * 60 * 60 * 1000 + 30_000).toISOString()
         : null;
       detail.session = {
-        ...rateWindow(75),
+        ...makeRateWindow(75),
         resetsAt,
         resetDescription: "19.17 EUR / 25.50 EUR · 6.33 EUR remaining",
         descriptionIsDetail: true,
@@ -130,7 +120,7 @@ describe("UsageSection", () => {
           id: "mistral-monthly-plan",
           title: "Monthly Plan",
           window: {
-            ...rateWindow(13),
+            ...makeRateWindow(13),
             resetsAt,
             resetDescription: "34.07 EUR / 255.00 EUR · 220.93 EUR remaining",
             descriptionIsDetail: true,
@@ -159,7 +149,7 @@ describe("UsageSection", () => {
 
   it("filters only hidden metric and extra rows", async () => {
     const detail = provider();
-    detail.weekly = rateWindow(30);
+    detail.weekly = makeRateWindow(30);
     detail.hiddenUsageItemIds = [
       "metric:primary",
       "metric:extra-additional_budget",
@@ -179,7 +169,7 @@ describe("UsageSection", () => {
   it("marks an unavailable session without rendering a quota bar", async () => {
     const detail = provider();
     detail.session = {
-      ...rateWindow(0),
+      ...makeRateWindow(0),
       isInformational: true,
       resetDescription: "No active 5h session",
     };
@@ -201,7 +191,7 @@ describe("UsageSection", () => {
     detail.id = "kimi";
     detail.displayName = "Kimi";
     detail.session = {
-      ...rateWindow(0),
+      ...makeRateWindow(0),
       resetsAt: new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString(),
       monthlyLimitBlock: { resetsAt: blockResetsAt },
     };
@@ -209,7 +199,7 @@ describe("UsageSection", () => {
       {
         id: "kimi-monthly",
         title: "Total usage",
-        window: { ...rateWindow(100), isExhausted: true, resetsAt: blockResetsAt },
+        window: { ...makeRateWindow(100), isExhausted: true, resetsAt: blockResetsAt },
       },
     ];
     return detail;
@@ -285,7 +275,7 @@ describe("UsageSection", () => {
 
   it("shows provider-declared lane labels in settings bars", async () => {
     const detail = provider();
-    detail.weekly = rateWindow(30);
+    detail.weekly = makeRateWindow(30);
     detail.primaryLabel = "Fuel Pack";
     detail.secondaryLabel = "Gemini Pro";
 
@@ -303,7 +293,7 @@ describe("UsageSection", () => {
 
   it("keeps the generic labels when the provider declares none", async () => {
     const detail = provider();
-    detail.weekly = rateWindow(30);
+    detail.weekly = makeRateWindow(30);
 
     render(
       <LocaleProvider>
@@ -352,9 +342,70 @@ describe("UsageSection", () => {
       </LocaleProvider>,
     );
 
-    expect(await screen.findByText(/fixture-alpha: 60 tokens/)).toBeInTheDocument();
+    const alpha = await screen.findByText("fixture-alpha");
+    expect(alpha.tagName).toBe("DT");
+    expect(alpha.closest("dl")).toHaveClass("provider-detail-grid");
+    expect(screen.getByText("60 tokens").tagName).toBe("DD");
     expect(screen.getAllByRole("heading", { name: "Model activity" })).toHaveLength(1);
-    expect(screen.getByText(/Plain: 1/)).toBeInTheDocument();
+    expect(screen.getByText("Plain").tagName).toBe("DT");
+    expect(screen.getByText("1").tagName).toBe("DD");
+  });
+
+  it("lays out spend budget details in the styled detail grid", async () => {
+    const detail = provider();
+    detail.id = "vercel";
+    detail.session = null;
+    detail.extraRateWindows = [];
+    detail.displayDetails = [
+      {
+        id: "spend",
+        sectionTitle: null,
+        title: "Spend",
+        value: "$42.00",
+        secondaryValue: null,
+        progress: { used: 42, total: 100 },
+      },
+      {
+        id: "limit",
+        sectionTitle: null,
+        title: "Limit",
+        value: "$100.00",
+        secondaryValue: null,
+        progress: null,
+      },
+      {
+        id: "remaining",
+        sectionTitle: null,
+        title: "Remaining",
+        value: "$58.00",
+        secondaryValue: null,
+        progress: null,
+      },
+    ];
+
+    const { container } = render(
+      <LocaleProvider>
+        <UsageSection provider={detail} resetTimeRelative={true} t={(key) => key} />
+      </LocaleProvider>,
+    );
+
+    await screen.findByText("Spend");
+    const grid = container.querySelector("dl.provider-detail-grid");
+    expect(grid).not.toBeNull();
+    expect(Array.from(grid?.querySelectorAll("dt") ?? []).map((dt) => dt.textContent)).toEqual([
+      "Spend",
+      "Limit",
+      "Remaining",
+    ]);
+    expect(Array.from(grid?.querySelectorAll("dd") ?? []).map((dd) => dd.textContent)).toEqual([
+      "$42.00",
+      "$100.00",
+      "$58.00",
+    ]);
+    const bar = screen.getByRole("progressbar", { name: "Spend" });
+    expect(bar.closest("dd")).not.toBeNull();
+    expect(bar).toHaveAttribute("aria-valuenow", "42");
+    expect(container.querySelector(".provider-usage-inventory")).toBeNull();
   });
 
   it("draws Custom quota-warning markers at % left and follows show-as-used", async () => {

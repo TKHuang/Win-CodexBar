@@ -1,5 +1,6 @@
 import type { CSSProperties, ReactNode } from "react";
 import { useLocale } from "../hooks/useLocale";
+import type { TrayPanelStyle } from "../types/bridge";
 
 export type MenuRowId =
   | "switchAccount"
@@ -61,6 +62,13 @@ const ROW_ICONS: Record<MenuRowId, ReactNode> = {
   ),
 };
 
+/** The modern look keeps icons on the provider action rows only. */
+const MODERN_ICON_ROWS: ReadonlySet<MenuRowId> = new Set([
+  "switchAccount",
+  "dashboard",
+  "statusPage",
+]);
+
 interface MenuSurfaceProps {
   summary?: ReactNode;
   banner?: ReactNode;
@@ -74,6 +82,10 @@ interface MenuSurfaceProps {
   /** Settings "Highlight menu cards on hover"; off keeps the Refresh row
    *  unhighlighted under the pointer while keyboard focus still shows. */
   hoverHighlight?: boolean;
+  /** Settings > Menu > Compact layout. */
+  compact?: boolean;
+  /** Settings > Menu > Panel look. */
+  variant?: TrayPanelStyle;
   children: ReactNode;
 }
 
@@ -88,13 +100,15 @@ export default function MenuSurface({
   statusLine = null,
   style,
   hoverHighlight = true,
+  compact = false,
+  variant = "modern",
   children,
 }: MenuSurfaceProps) {
   const { t } = useLocale();
   const groups = footerGroups.filter((group) => group.length > 0);
   return (
     <div
-      className={`menu-surface menu-surface--tray${hoverHighlight ? "" : " menu-surface--hover-highlight-off"}`}
+      className={`menu-surface menu-surface--tray menu-surface--${variant}${hoverHighlight ? "" : " menu-surface--hover-highlight-off"}${compact ? " menu-surface--compact" : ""}`}
       style={style}
     >
       {banner}
@@ -113,7 +127,8 @@ export default function MenuSurface({
               : []),
             <div key={`sep-${group[0].id}`} className="menu-surface__footer-sep" />,
             ...group.map((row) => {
-              const icon = ROW_ICONS[row.id];
+              const icon =
+                variant === "modern" && !MODERN_ICON_ROWS.has(row.id) ? null : ROW_ICONS[row.id];
               return (
                 <button
                   key={row.id}

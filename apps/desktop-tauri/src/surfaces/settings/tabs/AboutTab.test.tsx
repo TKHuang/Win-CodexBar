@@ -15,6 +15,29 @@ const updateMocks = vi.hoisted(() => ({
 }));
 
 vi.mock("../../../lib/tauri", () => tauriMocks);
+vi.mock("./acknowledgements", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./acknowledgements")>()),
+  loadAcknowledgements: vi.fn(async () => [
+    {
+      name: "alpha-crate",
+      ecosystem: "cargo",
+      versions: ["1.2.3"],
+      authors: ["Ann Author", "Ben Builder", "Cy Coder", "Di Dev"],
+      url: "https://example.com/alpha",
+      license: "MIT OR Apache-2.0",
+      notices: [{ file: "LICENSE-MIT", text: "Permission is hereby granted, free of charge" }],
+    },
+    {
+      name: "beta-pkg",
+      ecosystem: "npm",
+      versions: ["4.5.6"],
+      authors: ["Solo Maintainer"],
+      url: "https://example.com/beta",
+      license: "ISC",
+      notices: [],
+    },
+  ]),
+}));
 vi.mock("../../../hooks/useLocale", () => ({
   // AboutBuilt keeps its Fluent `{}` placeholder so the rendered date is asserted.
   useLocale: () => ({ t: (key: string) => (key === "AboutBuilt" ? "Built {}" : key) }),
@@ -37,87 +60,20 @@ vi.mock("../../../hooks/useUpdateState", () => ({
 
 import AboutTab from "./AboutTab";
 import type { SettingsSnapshot } from "../../../types/bridge";
+import { makeSettings } from "../../../test/fixtures";
 
-const settings: SettingsSnapshot = {
+const settings: SettingsSnapshot = makeSettings({
   enabledProviders: [],
-  refreshIntervalSecs: 300,
-    adaptiveRefresh: false,
-  refreshAllProvidersOnMenuOpen: false,
-  statusChecksEnabled: true,
-  lowPowerMode: false,
-  startAtLogin: false,
-  startMinimized: false,
-  showNotifications: true,
-  soundEnabled: true,
-  notificationSoundTheme: "windows",
-  notificationSoundPaths: {
-    predictiveWarning: null,
-    highUsage: null,
-    criticalUsage: null,
-    exhausted: null,
-    statusIssue: null,
-    sessionDepleted: null,
-    sessionRestored: null,
-  },
-  highUsageThreshold: 70,
-  criticalUsageThreshold: 90,
-  predictivePaceWarningEnabled: false,
-  credentialExpiryNotificationsEnabled: false,
-  trayIconMode: "single",
-  switcherShowsIcons: true,
   menuBarShowsHighestUsage: true,
   menuBarShowsPercent: true,
   menuBarIconStyle: "percent",
-  mergedOverviewSelectedProviders: [],
-  quotaWarningMarkersVisible: true,
-  workdayTickStyle: "subtle",
-  menuBarColorPace: false,
-  menuBarColorByProvider: false,
-  menuBarPaceReservePositive: false,
-  providersSortedAlphabetically: false,
   showAsUsed: false,
   showAllTokenAccountsInMenu: true,
-  enableAnimations: true,
-  resetTimeRelative: true,
-  showResetWhenExhausted: false,
   menuBarDisplayMode: "compact",
-  overviewLayout: "detailed",
-  hidePersonalInfo: false,
-  autoDownloadUpdates: false,
-  installUpdatesOnQuit: false,
   globalShortcut: "",
-  switcherShortcuts: {},
-  codexCustomSessionsDirs: [],
-  antigravityAdditionalProfileHomes: [],
-  updateChannel: "stable",
-  uiLanguage: "english",
-  uiLanguageFollowsSystem: false,
-  theme: "dark",
-  windowScalePercent: 125,
-  trayScalePercent: 100,
-  trayPanelAlwaysOnTop: false,
-  powertoysStatusPipeEnabled: false,
   claudeAvoidKeychainPrompts: true,
-  codexSparkUsageVisible: true,
-  disableKeychainAccess: false,
-  providerMetrics: {},
-  floatBarEnabled: false,
   floatBarOpacity: 0.9,
-  floatBarScale: 100,
-  floatBarOrientation: "horizontal",
-  floatBarStyle: "floating",
-  floatBarClickThrough: false,
-  floatBarProviderIds: [],
-  floatBarDarkText: false,
-  floatBarShowResetInline: false,
-  floatBarShowCost: false,
-  claudeDailyRoutinesUsageVisible: true,
-  claudeAllowReadingClaudeCodeCredentials: false,
-  alibabaTokenPlanRegion: "cn",
-  weeklyProgressWorkDays: null,
-    costSummaryDisplayStyle: "compact",
-    providerAccentColors: {},
-};
+});
 
 describe("AboutTab", () => {
   beforeEach(() => {
@@ -168,6 +124,59 @@ describe("AboutTab", () => {
     await waitFor(() => {
       expect(screen.getByText("ErrorPrefix no browser")).toBeInTheDocument();
     });
+  });
+});
+
+describe("AboutTab acknowledgements", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    tauriMocks.getAppInfo.mockResolvedValue({
+      name: "CodexBar",
+      version: "0.70.0",
+      buildNumber: "dev",
+      updateChannel: "stable",
+      tagline: "Keep agent limits in view.",
+    });
+    tauriMocks.openExternalUrl.mockResolvedValue(undefined);
+  });
+
+  it("opens the list, expands a component's notices and returns to About", async () => {
+    const { container } = render(<AboutTab settings={settings} set={vi.fn()} saving={false} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "AboutLinkAcknowledgements" }));
+
+    const summary = (await screen.findByText("alpha-crate")).closest("summary");
+    expect(summary).toHaveTextContent("alpha-crate");
+    expect(summary).toHaveTextContent("Ann Author, Ben Builder, AcknowledgementsOthers");
+    expect(summary).toHaveTextContent("MIT OR Apache-2.0");
+    expect(screen.getByText("AcknowledgementsFooter")).toBeInTheDocument();
+    expect(screen.queryByText(/Permission is hereby granted/)).toBeNull();
+
+    const details = summary!.parentElement as HTMLDetailsElement;
+    details.open = true;
+    fireEvent(details, new Event("toggle"));
+
+    expect(await screen.findByText(/Permission is hereby granted/)).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "AcknowledgementsAuthors" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "https://example.com/alpha" }));
+    expect(tauriMocks.openExternalUrl).toHaveBeenCalledWith("https://example.com/alpha");
+
+    fireEvent.click(screen.getByRole("button", { name: /TabAbout/ }));
+    expect(await screen.findByText("Keep agent limits in view.")).toBeInTheDocument();
+    expect(container.querySelector(".acknowledgement")).toBeNull();
+  });
+
+  it("links the SPDX page when a component publishes no license file", async () => {
+    render(<AboutTab settings={settings} set={vi.fn()} saving={false} />);
+    fireEvent.click(await screen.findByRole("button", { name: "AboutLinkAcknowledgements" }));
+
+    const details = (await screen.findByText("beta-pkg")).closest("details") as HTMLDetailsElement;
+    details.open = true;
+    fireEvent(details, new Event("toggle"));
+
+    expect(await screen.findByRole("heading", { name: "AcknowledgementsAuthor" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "https://spdx.org/licenses/ISC.html" }));
+    expect(tauriMocks.openExternalUrl).toHaveBeenCalledWith("https://spdx.org/licenses/ISC.html");
   });
 });
 
@@ -233,6 +242,7 @@ describe("AboutTab Mac grouped layout", () => {
       "AboutLinkWebsite↗",
       "AboutLinkOriginalProject↗",
       "SubmitIssue↗",
+      "AboutLinkAcknowledgements›",
     ]);
     expect(screen.getByRole("checkbox", { name: "AutoDownloadUpdates" })).toHaveClass(
       "toggle--switch",

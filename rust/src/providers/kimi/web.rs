@@ -13,16 +13,17 @@
 
 use reqwest::Client;
 
+use super::code_api::MISSING_WEEKLY_DESCRIPTION;
 use super::credential::KimiWebCredential;
 use super::desktop_session::desktop_credential;
 use super::local_storage::local_storage_tokens;
 use super::{
     KIMI_SUBSCRIPTION_SERVICE, KIMI_SUBSCRIPTION_STATS_SERVICE, KIMI_WEB_USAGE_SERVICE,
     KimiProvider, KimiRegion, KimiSubscriptionResponse, KimiSubscriptionStatsResponse,
-    KimiWebUsageResponse, apply_subscription_windows, kimi_web_post,
+    KimiWebUsageResponse, apply_subscription_windows, gift_display_details, kimi_web_post,
 };
 use crate::browser::cookies::get_cookie_header;
-use crate::core::{ProviderError, ProviderId, UsageSnapshot};
+use crate::core::{ProviderError, ProviderFetchResult, ProviderId, RateWindow, UsageSnapshot};
 
 /// Persisted Kimi cookie-source value ("manual" default; matches the
 /// `claude`/settings convention of a fresh read at fetch time).
@@ -57,11 +58,28 @@ pub(super) struct WebFetchFailure {
 }
 
 impl WebFetchFailure {
+    fn before_token(error: ProviderError) -> Self {
+        Self {
+            error,
+            had_token: false,
+        }
+    }
+
     fn after_token(error: ProviderError) -> Self {
         Self {
             error,
             had_token: true,
         }
+    }
+}
+
+/// One automatic token attempt. `None` means the server rejected the token
+/// and the chain moves on; anything else ends it.
+fn settle_attempt<T>(result: Result<T, ProviderError>) -> Option<Result<T, WebFetchFailure>> {
+    match result {
+        Ok(usage) => Some(Ok(usage)),
+        Err(ProviderError::AuthRequired) => None,
+        Err(error) => Some(Err(WebFetchFailure::after_token(error))),
     }
 }
 
@@ -172,7 +190,7 @@ pub(crate) async fn fetch_via_web(
     cookie_header: Option<&str>,
     region: KimiRegion,
     account_isolated: bool,
-) -> Result<UsageSnapshot, ProviderError> {
+) -> Result<ProviderFetchResult, ProviderError> {
     fetch_web_session_isolated(cookie_header, region, account_isolated)
         .await
         .map_err(|failure| failure.error)
@@ -186,29 +204,14 @@ pub(super) async fn fetch_web_session_isolated(
     cookie_header: Option<&str>,
     region: KimiRegion,
     account_isolated: bool,
-) -> Result<UsageSnapshot, WebFetchFailure> {
+) -> Result<ProviderFetchResult, WebFetchFailure> {
     // An explicitly selected token account is an identity boundary: fetch only
     // its own session cookie and never fall back to another ambient credential
     // or browser account (upstream per-provider token account routing).
     if account_isolated {
-        let token = match selected_account_auth_token(cookie_header) {
-            Ok(token) => token,
-            Err(error) => {
-                return Err(WebFetchFailure {
-                    error,
-                    had_token: false,
-                });
-            }
-        };
-        let http = match client() {
-            Ok(http) => http,
-            Err(error) => {
-                return Err(WebFetchFailure {
-                    error,
-                    had_token: false,
-                });
-            }
-        };
+        let token =
+            selected_account_auth_token(cookie_header).map_err(WebFetchFailure::before_token)?;
+        let http = client().map_err(WebFetchFailure::before_token)?;
         return fetch_via_web_token(&http, &KimiWebCredential::plain(token), region)
             .await
             .map_err(WebFetchFailure::after_token);
@@ -220,7 +223,7 @@ pub(super) async fn fetch_web_session_isolated(
 pub(super) async fn fetch_web_session(
     cookie_header: Option<&str>,
     region: KimiRegion,
-) -> Result<UsageSnapshot, WebFetchFailure> {
+) -> Result<ProviderFetchResult, WebFetchFailure> {
     let source = cookie_source();
     let input = WebTokenInput {
         manual_header: cookie_header,
@@ -247,13 +250,13 @@ pub(super) async fn fetch_web_session(
 /// is tried, then browser import. Only a server rejection moves on to the
 /// next automatic token; a Desktop session that changed before dispatch is a
 /// non-auth error and stops the chain.
-async fn fetch_with_web_tokens<F, Fut>(
+async fn fetch_with_web_tokens<T, F, Fut>(
     input: &WebTokenInput<'_>,
     mut fetch: F,
-) -> Result<UsageSnapshot, WebFetchFailure>
+) -> Result<T, WebFetchFailure>
 where
     F: FnMut(KimiWebCredential) -> Fut,
-    Fut: Future<Output = Result<UsageSnapshot, ProviderError>>,
+    Fut: Future<Output = Result<T, ProviderError>>,
 {
     if let Some(token) = input
         .manual_header
@@ -267,33 +270,28 @@ where
     }
 
     if !browser_import_allowed(input.cookie_source) {
-        return Err(WebFetchFailure {
-            error: browser_import_error(input.cookie_source),
-            had_token: false,
-        });
+        return Err(WebFetchFailure::before_token(browser_import_error(
+            input.cookie_source,
+        )));
     }
 
     // Read and try the desktop session first. Browser cookies are intentionally
     // read only after the server rejects this automatic session, so a healthy
     // desktop account never causes another credential store to be touched.
     let desktop_token = (input.desktop_token)(input.region);
-    if let Some(credential) = desktop_token.clone() {
-        match fetch(credential).await {
-            Ok(usage) => return Ok(usage),
-            Err(ProviderError::AuthRequired) => {}
-            Err(error) => return Err(WebFetchFailure::after_token(error)),
-        }
+    if let Some(credential) = desktop_token.clone()
+        && let Some(outcome) = settle_attempt(fetch(credential).await)
+    {
+        return outcome;
     }
 
     let browser_token = (input.browser_token)(input.region).filter(|token| {
         desktop_token.as_ref().map(KimiWebCredential::token) != Some(token.as_str())
     });
-    if let Some(token) = browser_token.clone() {
-        match fetch(KimiWebCredential::plain(token)).await {
-            Ok(usage) => return Ok(usage),
-            Err(ProviderError::AuthRequired) => {}
-            Err(error) => return Err(WebFetchFailure::after_token(error)),
-        }
+    if let Some(token) = browser_token.clone()
+        && let Some(outcome) = settle_attempt(fetch(KimiWebCredential::plain(token)).await)
+    {
+        return outcome;
     }
 
     // Local-storage tokens are read last, only after every cookie source
@@ -309,10 +307,8 @@ where
         candidate.source == WebTokenSource::LocalStorage
             && seen.insert(candidate.credential.token().to_string())
     }) {
-        match fetch(candidate.credential).await {
-            Ok(usage) => return Ok(usage),
-            Err(ProviderError::AuthRequired) => {}
-            Err(error) => return Err(WebFetchFailure::after_token(error)),
+        if let Some(outcome) = settle_attempt(fetch(candidate.credential).await) {
+            return outcome;
         }
     }
 
@@ -332,7 +328,7 @@ fn selected_account_auth_token(cookie_header: Option<&str>) -> Result<String, Pr
         .ok_or(ProviderError::AuthRequired)
 }
 
-fn client() -> Result<reqwest::Client, ProviderError> {
+pub(super) fn client() -> Result<reqwest::Client, ProviderError> {
     crate::core::credentialed_http_client_builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -343,7 +339,7 @@ async fn fetch_via_web_token(
     client: &reqwest::Client,
     credential: &KimiWebCredential,
     region: KimiRegion,
-) -> Result<UsageSnapshot, ProviderError> {
+) -> Result<ProviderFetchResult, ProviderError> {
     let usage_url = region.web_api_url(KIMI_WEB_USAGE_SERVICE);
     let resp = kimi_web_post(
         client,
@@ -383,14 +379,17 @@ async fn fetch_subscription_details(
     // completed statistics response when the plan endpoint is slow or absent.
     let stats = tokio::time::timeout(
         SUBSCRIPTION_ENRICHMENT_TIMEOUT,
-        fetch_subscription_for_enrichment(client, credential, region),
+        fetch_subscription_for_enrichment_result(client, credential, region),
     );
     let plan = tokio::time::timeout(
         SUBSCRIPTION_ENRICHMENT_TIMEOUT,
         fetch_subscription_plan(client, credential, region),
     );
     let (stats, plan) = tokio::join!(stats, plan);
-    (stats.ok().flatten(), plan.ok().flatten())
+    (
+        stats.ok().and_then(Result::ok).flatten(),
+        plan.ok().flatten(),
+    )
 }
 
 pub(super) fn snapshot_from_web_usage_response(
@@ -398,36 +397,59 @@ pub(super) fn snapshot_from_web_usage_response(
     subscription: Option<KimiSubscriptionStatsResponse>,
 ) -> Result<UsageSnapshot, ProviderError> {
     snapshot_from_web_usage_response_with_plan(response, subscription, None)
+        .map(|fetched| fetched.usage)
 }
 
 fn snapshot_from_web_usage_response_with_plan(
     response: KimiWebUsageResponse,
     subscription: Option<KimiSubscriptionStatsResponse>,
     plan_name: Option<String>,
-) -> Result<UsageSnapshot, ProviderError> {
+) -> Result<ProviderFetchResult, ProviderError> {
     let coding = response
         .usages
+        .unwrap_or_default()
         .into_iter()
-        .find(|usage| usage.scope == "FEATURE_CODING")
-        .ok_or_else(|| ProviderError::Parse("Kimi FEATURE_CODING usage missing".into()))?;
-    let primary = KimiProvider::rate_window_from_usage_detail(&coding.detail, Some(10080))?;
-    let mut usage = UsageSnapshot::new(primary).with_login_method("Kimi");
+        .find(|usage| usage.scope == "FEATURE_CODING");
+    let has_coding = coding.is_some();
+    let mut usage = match coding {
+        Some(coding) => {
+            let primary = KimiProvider::rate_window_from_usage_detail(&coding.detail, Some(10080))?;
+            let mut usage = UsageSnapshot::new(primary).with_login_method("Kimi");
 
-    if let Some(limit) = coding.limits.unwrap_or_default().into_iter().next() {
-        let window_minutes = limit.window.as_ref().and_then(super::kimi_window_minutes);
-        let rate_limit =
-            KimiProvider::rate_window_from_usage_detail(&limit.detail, window_minutes)?;
-        usage = usage.with_secondary(rate_limit);
-    }
+            if let Some(limit) = coding.limits.unwrap_or_default().into_iter().next() {
+                let window_minutes = limit.window.as_ref().and_then(super::kimi_window_minutes);
+                let rate_limit =
+                    KimiProvider::rate_window_from_usage_detail(&limit.detail, window_minutes)?;
+                usage = usage.with_secondary(rate_limit);
+            }
+            usage
+        }
+        // Upstream #4700: a lapsed plan can omit its Code pools while the
+        // membership pools below still show usage.
+        None => UsageSnapshot::new(RateWindow::informational(MISSING_WEEKLY_DESCRIPTION))
+            .with_login_method("Kimi"),
+    };
 
+    let mut details = Vec::new();
     if let Some(subscription) = subscription.as_ref() {
+        details = super::monthly_breakdown::monthly_breakdown_details(
+            super::monthly_breakdown::subscription_monthly_shares(subscription),
+        );
+        details.extend(gift_display_details(subscription, usage.updated_at));
         usage = apply_subscription_windows(usage, subscription);
     }
     if let Some(plan_name) = plan_name {
         usage = usage.with_login_method(plan_name);
     }
 
-    Ok(usage)
+    // Without Code pools, the membership pools must supply at least one lane.
+    if !has_coding && usage.extra_rate_windows.is_empty() {
+        return Err(ProviderError::Parse(
+            "FEATURE_CODING scope not found in response".into(),
+        ));
+    }
+
+    Ok(ProviderFetchResult::new(usage, "web").with_display_details(details))
 }
 
 pub(super) async fn fetch_subscription_plan(
@@ -444,19 +466,6 @@ pub(super) async fn fetch_subscription_plan(
             .and_then(|response| response.plan_name()),
         _ => None,
     }
-}
-
-// Kept for `code_api`: resolve the subscription stats snapshot with a web
-// token; any failure means "no enrichment", never an error.
-pub(super) async fn fetch_subscription_for_enrichment(
-    client: &Client,
-    credential: &KimiWebCredential,
-    region: KimiRegion,
-) -> Option<KimiSubscriptionStatsResponse> {
-    fetch_subscription_for_enrichment_result(client, credential, region)
-        .await
-        .ok()
-        .flatten()
 }
 
 pub(super) async fn fetch_subscription_for_enrichment_result(
@@ -694,6 +703,120 @@ mod tests {
         Vec::new()
     }
 
+    thread_local! {
+        static READS: std::cell::Cell<[u32; 3]> = const { std::cell::Cell::new([0; 3]) };
+    }
+
+    fn count_read(source: usize) {
+        READS.with(|reads| {
+            let mut counts = reads.get();
+            counts[source] += 1;
+            reads.set(counts);
+        });
+    }
+
+    /// Desktop, browser and local-storage reads since the last call.
+    fn take_reads() -> [u32; 3] {
+        READS.with(|reads| reads.replace([0; 3]))
+    }
+
+    fn counted_desktop(_: KimiRegion) -> Option<KimiWebCredential> {
+        count_read(0);
+        Some(KimiWebCredential::plain("desktop-token"))
+    }
+
+    fn counted_browser(_: KimiRegion) -> Option<String> {
+        count_read(1);
+        Some("browser-token".to_string())
+    }
+
+    fn counted_no_desktop(_: KimiRegion) -> Option<KimiWebCredential> {
+        count_read(0);
+        None
+    }
+
+    fn counted_no_browser(_: KimiRegion) -> Option<String> {
+        count_read(1);
+        None
+    }
+
+    fn counted_local_storage(_: KimiRegion) -> Vec<String> {
+        count_read(2);
+        vec!["browser-token".to_string(), "storage-token".to_string()]
+    }
+
+    fn accept_storage_only(token: &str) -> Result<UsageSnapshot, ProviderError> {
+        if token == "storage-token" {
+            Ok(usage(40.0))
+        } else {
+            Err(ProviderError::AuthRequired)
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_local_storage_only_token_reports_none_tried() {
+        take_reads();
+        let (result, sent) = run_chain(
+            WebTokenInput {
+                local_storage_tokens: counted_local_storage,
+                ..input(None, "auto", counted_no_desktop, counted_no_browser)
+            },
+            reject_all,
+        )
+        .await;
+        let failure = result.expect_err("local-storage token rejected");
+        // Kept quirk: a rejected local-storage-only token reads as "no token".
+        assert!(!failure.had_token);
+        assert!(matches!(failure.error, ProviderError::AuthRequired));
+        assert_eq!(sent, ["browser-token", "storage-token"]);
+        assert_eq!(take_reads(), [2, 2, 2]);
+    }
+
+    #[tokio::test]
+    async fn local_storage_tokens_follow_rejected_cookie_tokens() {
+        take_reads();
+        let (result, sent) = run_chain(
+            WebTokenInput {
+                local_storage_tokens: counted_local_storage,
+                ..input(None, "auto", counted_desktop, counted_browser)
+            },
+            accept_storage_only,
+        )
+        .await;
+        assert_eq!(
+            result.expect("storage token accepted").primary.used_percent,
+            40.0
+        );
+        assert_eq!(sent, ["desktop-token", "browser-token", "storage-token"]);
+        assert_eq!(take_reads(), [2, 2, 1]);
+
+        let (result, sent) = run_chain(
+            WebTokenInput {
+                local_storage_tokens: counted_local_storage,
+                ..input(None, "auto", counted_desktop, counted_browser)
+            },
+            reject_all,
+        )
+        .await;
+        assert!(result.expect_err("every token rejected").had_token);
+        assert_eq!(sent, ["desktop-token", "browser-token", "storage-token"]);
+        assert_eq!(take_reads(), [2, 2, 1]);
+
+        let (result, sent) = run_chain(
+            WebTokenInput {
+                local_storage_tokens: counted_local_storage,
+                ..input(None, "auto", counted_no_desktop, counted_no_browser)
+            },
+            server_error,
+        )
+        .await;
+        let failure = result.expect_err("server error");
+        assert!(failure.had_token);
+        assert!(matches!(failure.error, ProviderError::Other(message) if message.contains("500")));
+        assert_eq!(sent, ["browser-token"]);
+        assert_eq!(take_reads(), [2, 2, 1]);
+    }
+
     fn static_local_storage(_: KimiRegion) -> Vec<String> {
         vec!["browser-token".to_string(), "storage-token".to_string()]
     }
@@ -929,5 +1052,92 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(inactive.plan_name(), None);
+    }
+
+    #[test]
+    fn lapsed_web_result_carries_gift_rows_and_membership_pool() {
+        // Upstream #4700 + #4691: a lapsed plan keeps the membership pool and
+        // the live gift rows in the web result, with the web source label.
+        let usage: KimiWebUsageResponse = serde_json::from_value(serde_json::json!({
+            "totalQuota": { "limit": "100", "used": "36" }
+        }))
+        .unwrap();
+        let subscription: KimiSubscriptionStatsResponse =
+            serde_json::from_value(serde_json::json!({
+                "subscriptionBalance": {
+                    "feature": "FEATURE_OMNI",
+                    "type": "SUBSCRIPTION",
+                    "amountUsedRatio": 0.36,
+                    "expireTime": "2026-11-22T00:00:00Z"
+                },
+                "giftBalances": [{
+                    "feature": "FEATURE_OMNI",
+                    "type": "GIFT",
+                    "amountUsedRatio": 0.6,
+                    "expireTime": "2099-12-31T15:59:59Z",
+                    "displayName": "Welcome Credit"
+                }]
+            }))
+            .unwrap();
+
+        let fetched =
+            snapshot_from_web_usage_response_with_plan(usage, Some(subscription), None).unwrap();
+
+        assert_eq!(fetched.source_label, "web");
+        assert!(fetched.usage.primary.is_informational);
+        assert!(
+            fetched
+                .usage
+                .extra_rate_windows
+                .iter()
+                .any(|window| window.id == "kimi-monthly")
+        );
+        assert_eq!(fetched.display_details.len(), 1);
+        assert_eq!(fetched.display_details[0].title(), "Welcome Credit");
+        assert_eq!(fetched.display_details[0].value(), "40% left");
+    }
+
+    #[test]
+    fn web_result_lists_the_total_usage_breakdown_before_gifts() {
+        // Upstream #4759: the membership pool's Code share splits Total usage.
+        let usage: KimiWebUsageResponse = serde_json::from_value(serde_json::json!({
+            "totalQuota": { "limit": "100", "used": "36" }
+        }))
+        .unwrap();
+        let subscription: KimiSubscriptionStatsResponse =
+            serde_json::from_value(serde_json::json!({
+                "subscriptionBalance": {
+                    "feature": "FEATURE_OMNI",
+                    "type": "SUBSCRIPTION",
+                    "amountUsedRatio": 0.36,
+                    "kimiCodeUsedRatio": 0.1,
+                    "expireTime": "2026-11-22T00:00:00Z"
+                },
+                "giftBalances": [{
+                    "feature": "FEATURE_OMNI",
+                    "type": "GIFT",
+                    "amountUsedRatio": 0.6,
+                    "expireTime": "2099-12-31T15:59:59Z",
+                    "displayName": "Welcome Credit"
+                }]
+            }))
+            .unwrap();
+
+        let fetched =
+            snapshot_from_web_usage_response_with_plan(usage, Some(subscription), None).unwrap();
+
+        let rows: Vec<(&str, &str)> = fetched
+            .display_details
+            .iter()
+            .map(|row| (row.title(), row.value()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("Kimi Code", "10% used"),
+                ("Other features", "26% used"),
+                ("Welcome Credit", "40% left"),
+            ]
+        );
     }
 }

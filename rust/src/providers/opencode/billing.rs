@@ -6,11 +6,19 @@
 //! parsing, the HTTP fallback, and the presentation mapping.
 
 use serde_json::Value;
-use uuid::Uuid;
 
-use crate::core::{ProviderError, RateWindow, UsageSnapshot};
+use crate::core::{CostSnapshot, ProviderError, ProviderFetchResult, RateWindow, UsageSnapshot};
 
-use super::{BASE_URL, OpenCodeProvider, SERVER_URL};
+use super::OpenCodeProvider;
+
+/// Window the pay-as-you-go spend covers. The legacy billing payload reports
+/// the current calendar month; migrated Console workspaces report a rolling
+/// 30-day total, which cannot be compared with a monthly limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenCodeBillingPeriod {
+    Monthly,
+    Last30Days,
+}
 
 /// Customer/billing server function carrying the monthly spend fields
 /// pay-as-you-go workspaces bill against (upstream 0.49.5 #2504/#2697).
@@ -31,6 +39,21 @@ pub struct OpenCodeZenBilling {
     /// Whether the workspace still carries a subscription object (legacy
     /// quota accounts).
     pub has_subscription: bool,
+    /// Window `monthly_usage_usd` covers.
+    pub period: OpenCodeBillingPeriod,
+}
+
+impl OpenCodeZenBilling {
+    /// Percent of the configured monthly limit consumed. Rolling 30-day spend
+    /// has no percentage even if a limit is present.
+    pub fn used_percent(&self) -> Option<f64> {
+        if self.period != OpenCodeBillingPeriod::Monthly {
+            return None;
+        }
+        self.monthly_limit_usd
+            .filter(|limit| *limit > 0.0 && limit.is_finite())
+            .map(|limit| ((self.monthly_usage_usd / limit) * 100.0).clamp(0.0, 100.0))
+    }
 }
 
 const ZEN_USD_SCALE: f64 = 100_000_000.0;
@@ -53,6 +76,7 @@ pub(super) fn parse_zen_billing(text: &str) -> Option<OpenCodeZenBilling> {
                 .and_then(json_number)
                 .map(|v| v / ZEN_USD_SCALE),
             has_subscription: customer.get("subscription").is_some_and(|s| !s.is_null()),
+            period: OpenCodeBillingPeriod::Monthly,
         });
     }
     parse_zen_billing_payload(text)
@@ -97,6 +121,7 @@ fn parse_zen_billing_payload(text: &str) -> Option<OpenCodeZenBilling> {
         monthly_limit_usd: payload_number("monthlyLimit", text),
         balance_usd: payload_number("balance", text).map(|v| v / ZEN_USD_SCALE),
         has_subscription: payload_has_subscription(text),
+        period: OpenCodeBillingPeriod::Monthly,
     })
 }
 
@@ -139,28 +164,12 @@ impl OpenCodeProvider {
         cookie_header: &str,
     ) -> Result<Option<UsageSnapshot>, ProviderError> {
         let referer = format!("https://opencode.ai/workspace/{workspace_id}");
-        let args = serde_json::json!([workspace_id]);
-        let encoded_args = Self::url_encode(&args.to_string());
-        let url = format!(
-            "{}?id={}&args={}",
-            SERVER_URL, BILLING_SERVER_ID, encoded_args
-        );
-
         let response = self
-            .client
-            .get(&url)
-            .header("Cookie", cookie_header)
-            .header("X-Server-Id", BILLING_SERVER_ID)
-            .header("X-Server-Instance", format!("server-fn:{}", Uuid::new_v4()))
-            .header(
-                "User-Agent",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            )
-            .header("Origin", BASE_URL)
-            .header("Referer", referer)
-            .header(
-                "Accept",
-                "text/javascript, application/json;q=0.9, */*;q=0.8",
+            .server_fn_get(
+                BILLING_SERVER_ID,
+                Some(workspace_id),
+                cookie_header,
+                &referer,
             )
             .send()
             .await;
@@ -213,25 +222,33 @@ impl OpenCodeProvider {
 
     /// Pay-as-you-go presentation: monthly spend against the configured
     /// monthly limit (when set) with the prepaid balance in the login label.
+    /// Rolling 30-day spend is informational only, with no percentage.
     pub(super) fn snapshot_from_pay_as_you_go(
         &self,
         billing: &OpenCodeZenBilling,
     ) -> UsageSnapshot {
-        let used_percent = billing
-            .monthly_limit_usd
-            .filter(|limit| *limit > 0.0 && limit.is_finite())
-            .map(|limit| ((billing.monthly_usage_usd / limit) * 100.0).clamp(0.0, 100.0))
-            .unwrap_or(0.0);
-        let mut primary = RateWindow::with_details(
-            used_percent,
-            Some(30 * 24 * 60),
-            None,
-            Some(format!(
-                "${:.2} spent this month",
-                billing.monthly_usage_usd
-            )),
-        );
-        primary.is_informational = billing.monthly_limit_usd.is_none();
+        let used_percent = billing.used_percent();
+        let mut primary = match billing.period {
+            OpenCodeBillingPeriod::Monthly => RateWindow::with_details(
+                used_percent.unwrap_or(0.0),
+                Some(30 * 24 * 60),
+                None,
+                Some(format!(
+                    "${:.2} spent this month",
+                    billing.monthly_usage_usd
+                )),
+            ),
+            OpenCodeBillingPeriod::Last30Days => RateWindow::with_details(
+                0.0,
+                None,
+                None,
+                Some(format!(
+                    "${:.2} over last 30 days",
+                    billing.monthly_usage_usd
+                )),
+            ),
+        };
+        primary.is_informational = used_percent.is_none();
         let mut usage = UsageSnapshot::new(primary);
         let label = match billing.balance_usd {
             Some(balance) => format!("Pay-as-you-go · ${balance:.2} prepaid"),
@@ -239,6 +256,19 @@ impl OpenCodeProvider {
         };
         usage = usage.with_login_method(label);
         usage
+    }
+
+    /// Fetch result for pay-as-you-go spend. Rolling 30-day spend also rides
+    /// the cost row so the card shows it as "Last 30 days" with no limit.
+    pub(super) fn pay_as_you_go_result(&self, billing: &OpenCodeZenBilling) -> ProviderFetchResult {
+        let result = ProviderFetchResult::new(self.snapshot_from_pay_as_you_go(billing), "web");
+        match billing.period {
+            OpenCodeBillingPeriod::Monthly => result,
+            OpenCodeBillingPeriod::Last30Days => result.with_cost(
+                CostSnapshot::new(billing.monthly_usage_usd, "USD", "Last 30 days")
+                    .always_visible(),
+            ),
+        }
     }
 }
 
@@ -279,6 +309,55 @@ mod tests {
             snapshot.login_method.as_deref(),
             Some("Pay-as-you-go · $2.00 prepaid")
         );
+    }
+
+    #[test]
+    fn rolling_spend_has_no_limit_percentage() {
+        let mut billing = OpenCodeZenBilling {
+            monthly_usage_usd: 10.0,
+            monthly_limit_usd: Some(40.0),
+            balance_usd: None,
+            has_subscription: false,
+            period: OpenCodeBillingPeriod::Monthly,
+        };
+        assert_eq!(billing.used_percent(), Some(25.0));
+        let provider = OpenCodeProvider::new();
+        let monthly = provider.pay_as_you_go_result(&billing);
+        assert!(monthly.cost.is_none());
+        assert!(!monthly.usage.primary.is_informational);
+
+        billing.period = OpenCodeBillingPeriod::Last30Days;
+        assert_eq!(billing.used_percent(), None);
+        let rolling = provider.pay_as_you_go_result(&billing);
+        assert!(rolling.usage.primary.is_informational);
+        assert_eq!(rolling.usage.primary.used_percent, 0.0);
+        assert_eq!(
+            rolling.usage.primary.reset_description.as_deref(),
+            Some("$10.00 over last 30 days")
+        );
+        let cost = rolling.cost.expect("rolling spend cost row");
+        assert_eq!(cost.limit, None);
+        assert_eq!(cost.period, "Last 30 days");
+    }
+
+    #[test]
+    fn zero_monthly_limit_is_informational() {
+        let billing = OpenCodeZenBilling {
+            monthly_usage_usd: 7.5,
+            monthly_limit_usd: Some(0.0),
+            balance_usd: None,
+            has_subscription: false,
+            period: OpenCodeBillingPeriod::Monthly,
+        };
+        assert_eq!(billing.used_percent(), None);
+        let result = OpenCodeProvider::new().pay_as_you_go_result(&billing);
+        assert!(result.usage.primary.is_informational);
+        assert_eq!(result.usage.primary.used_percent, 0.0);
+        assert_eq!(
+            result.usage.primary.reset_description.as_deref(),
+            Some("$7.50 spent this month")
+        );
+        assert!(result.cost.is_none());
     }
 
     #[test]

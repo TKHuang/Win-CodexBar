@@ -1,0 +1,37 @@
+[
+  {
+    "providerId": "codex",
+    "displayName": "Codex",
+    "errorState": "ready",
+    "primary": {
+      "usedPercent": 61,
+      "windowMinutes": 300,
+      "resetsAt": "2099-01-02T03:04:05Z",
+      "resetDescription": "seeded 5h"
+    },
+    "primaryLabel": "Session",
+    "secondary": {
+      "usedPercent": 74,
+      "windowMinutes": 10080,
+      "resetsAt": "2099-01-08T00:00:00Z"
+    },
+    "secondaryLabel": "Weekly"
+  },
+  {
+    "providerId": "claude",
+    "displayName": "Claude",
+    "errorState": "ready",
+    "primary": {
+      "usedPercent": 12,
+      "windowMinutes": 300,
+      "resetsAt": "2099-01-02T05:00:00Z"
+    },
+    "primaryLabel": "Session",
+    "secondary": {
+      "usedPercent": 37,
+      "windowMinutes": 10080,
+      "resetsAt": "2099-01-08T00:00:00Z"
+    },
+    "secondaryLabel": "Weekly"
+  }
+]

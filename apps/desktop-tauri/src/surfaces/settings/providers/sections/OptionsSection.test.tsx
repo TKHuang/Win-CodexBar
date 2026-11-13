@@ -9,8 +9,9 @@ vi.mock("../../../../lib/tauri", () => ({
 
 const t = (key: string) => key;
 
-const detail = (id: string) => ({
+const detail = (id: string, cookieSource: string | null = null) => ({
   id,
+  cookieSource,
   autoResumeAfterQuotaReset: false,
   autoResumeSupported: false,
   optionalDetailsEnabled: false,
@@ -24,6 +25,7 @@ function settings(extra: Partial<OptionSettings> = {}): OptionSettings {
     codexHistoricalTracking: false,
     codexExternalOauthSourcesAllowed: false,
     codexLocalSessionCostLedgerEnabled: false,
+    codexOpencodeLocalHistoryEnabled: false,
     codexOpenaiWebBatterySaverEnabled: false,
     claudeAvoidKeychainPrompts: false,
     claudeAllowReadingClaudeCodeCredentials: false,
@@ -83,6 +85,7 @@ describe("OptionsSection", () => {
     );
     expect(labels).toEqual([
       "ProviderCodexLocalCostEstimates",
+      "ProviderCodexOpenCodeLocalHistory",
       "ProviderCodexHistoricalTracking",
       "ProviderCodexOpenAiWebExtras",
       "ProviderCodexExternalOauth",
@@ -91,6 +94,8 @@ describe("OptionsSection", () => {
     expect(toggle("ProviderCodexOpenAiWebExtras")).toBeChecked();
     expect(screen.getByText(/ProviderCodexHistoryHelp ProviderOptionNotUsedOnWindows/)).toBeTruthy();
     expect(screen.queryByText(/ProviderCodexExternalOauthHelp ProviderOptionNotUsedOnWindows/)).toBeNull();
+    expect(toggle("ProviderCodexOpenCodeLocalHistory")).not.toBeChecked();
+    expect(screen.getByText("ProviderCodexOpenCodeLocalHistoryHelp")).toBeTruthy();
   });
 
   it("hides the battery saver while OpenAI web extras are off", () => {
@@ -123,6 +128,8 @@ describe("OptionsSection", () => {
     expect(onSettingsChange).toHaveBeenCalledWith({ codexExternalOauthSourcesAllowed: true });
     await act(async () => fireEvent.click(toggle("ProviderCodexOpenAiWebExtras")));
     expect(onSettingsChange).toHaveBeenLastCalledWith({ codexOpenaiWebExtras: false });
+    await act(async () => fireEvent.click(toggle("ProviderCodexOpenCodeLocalHistory")));
+    expect(onSettingsChange).toHaveBeenLastCalledWith({ codexOpencodeLocalHistoryEnabled: true });
   });
 
   it("lists the Claude options and locks Avoid keychain prompts under the Advanced switch", async () => {
@@ -190,6 +197,98 @@ describe("OptionsSection", () => {
       fireEvent.keyDown(input, { key: "Enter" });
     });
     expect(onSettingsChange).toHaveBeenLastCalledWith({ claudeSwapExecutablePath: "D:/bin/cswap.exe" });
+  });
+
+  it("shows the Source picker only while claude-swap is on and writes the chosen source", async () => {
+    const onSettingsChange = vi.fn();
+    const { rerender } = render(
+      <OptionsSection
+        detail={detail("claude")}
+        settings={settings()}
+        disabled={false}
+        t={t}
+        onSettingsChange={onSettingsChange}
+        onReload={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("combobox", { name: "ClaudeSwapSource" })).toBeNull();
+
+    rerender(
+      <OptionsSection
+        detail={detail("claude")}
+        settings={settings({ claudeSwapEnabled: true })}
+        disabled={false}
+        t={t}
+        onSettingsChange={onSettingsChange}
+        onReload={vi.fn()}
+      />,
+    );
+    const picker = screen.getByRole("combobox", { name: "ClaudeSwapSource" });
+    expect(picker).toHaveValue("claude-swap");
+    expect(Array.from((picker as HTMLSelectElement).options).map((o) => o.textContent)).toEqual([
+      "claude-swap",
+      "tcr",
+    ]);
+    expect(screen.getByText("ClaudeSwapHint")).toBeTruthy();
+    await act(async () => fireEvent.change(picker, { target: { value: "tcr" } }));
+    expect(onSettingsChange).toHaveBeenLastCalledWith({ claudeSwapSource: "tcr" });
+
+    rerender(
+      <OptionsSection
+        detail={detail("claude")}
+        settings={settings({ claudeSwapEnabled: true, claudeSwapSource: "tcr" })}
+        disabled={false}
+        t={t}
+        onSettingsChange={onSettingsChange}
+        onReload={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("combobox", { name: "ClaudeSwapSource" })).toHaveValue("tcr");
+    expect(screen.getByRole("textbox", { name: "ClaudeTcrExecutablePath" })).toBeTruthy();
+    expect(screen.getByText("ClaudeTcrHint")).toBeTruthy();
+    expect(screen.queryByText("ClaudeSwapHint")).toBeNull();
+  });
+
+  it("offers Claude desktop app cookies only while the cookie source is Automatic", async () => {
+    const onSettingsChange = vi.fn();
+    const { rerender } = render(
+      <OptionsSection
+        detail={detail("claude", "manual")}
+        settings={settings()}
+        disabled={false}
+        t={t}
+        onSettingsChange={onSettingsChange}
+        onReload={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("checkbox", { name: "ProviderClaudeDesktopCookies" })).toBeNull();
+
+    rerender(
+      <OptionsSection
+        detail={detail("claude", "auto")}
+        settings={settings()}
+        disabled={false}
+        t={t}
+        onSettingsChange={onSettingsChange}
+        onReload={vi.fn()}
+      />,
+    );
+    expect(toggle("ProviderClaudeDesktopCookies")).not.toBeChecked();
+    expect(screen.getByText("ProviderClaudeDesktopCookiesHelp")).toBeTruthy();
+    await act(async () => fireEvent.click(toggle("ProviderClaudeDesktopCookies")));
+    expect(onSettingsChange).toHaveBeenLastCalledWith({ claudeDesktopCookiesEnabled: true });
+
+    rerender(
+      <OptionsSection
+        detail={detail("claude", "auto")}
+        settings={settings({ claudeDesktopCookiesEnabled: true })}
+        disabled={false}
+        t={t}
+        onSettingsChange={onSettingsChange}
+        onReload={vi.fn()}
+      />,
+    );
+    expect(toggle("ProviderClaudeDesktopCookies")).toBeChecked();
   });
 
   it("renders an empty group for a provider without options", () => {

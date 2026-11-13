@@ -11,7 +11,7 @@
 
 param(
     [string]$Version = "",
-    [string]$AssetsDir = "C:\code\Win-CodexBar-release\assets",
+    [string]$AssetsDir = (Join-Path (Split-Path -Parent $PSScriptRoot) ".release\assets"),
     [switch]$SkipGitHub
 )
 
