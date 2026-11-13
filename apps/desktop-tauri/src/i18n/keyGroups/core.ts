@@ -932,6 +932,8 @@ export const CORE_LOCALE_KEYS = [
   "ShowAsUsedLabel",
   "ShowAsUsedHelper",
   "HighlightMenuCardsOnHoverLabel",
+  "CompactMenuLayoutLabel",
+  "CompactMenuLayoutHelper",
   "OverviewLayoutLabel",
   "OverviewLayoutHelper",
   "OverviewLayoutDetailed",

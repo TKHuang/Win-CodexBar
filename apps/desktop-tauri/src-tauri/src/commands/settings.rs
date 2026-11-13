@@ -44,6 +44,7 @@ pub struct SettingsUpdate {
     pub merged_overview_all_accounts: Option<bool>,
     pub quota_warning_markers_visible: Option<bool>,
     pub highlight_menu_cards_on_hover: Option<bool>,
+    pub compact_menu_layout: Option<bool>,
     pub workday_tick_style: Option<codexbar::settings::WorkdayTickStyle>,
     pub menu_bar_color_pace: Option<bool>,
     pub menu_bar_color_by_provider: Option<bool>,
@@ -441,6 +442,9 @@ impl SettingsUpdate {
         }
         if let Some(v) = self.highlight_menu_cards_on_hover {
             settings.highlight_menu_cards_on_hover = v;
+        }
+        if let Some(v) = self.compact_menu_layout {
+            settings.compact_menu_layout = v;
         }
         if let Some(v) = self.workday_tick_style {
             settings.workday_tick_style = v;

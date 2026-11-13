@@ -212,6 +212,7 @@ pub const EXCLUDED_KEYS: &[&str] = &[
     "stacked_tray_bottom_provider",
     "credential_expiry_notifications_enabled",
     "highlight_menu_cards_on_hover",
+    "compact_menu_layout",
     // No reader anywhere in the app.
     "merge_tray_icons",
 ];

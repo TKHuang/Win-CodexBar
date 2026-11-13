@@ -263,6 +263,8 @@ export interface SettingsSnapshot {
   quotaWarningMarkersVisible: boolean;
   /** Pointer hover highlights the tray panel Refresh row. Absent on older shells: on. */
   highlightMenuCardsOnHover?: boolean;
+  /** Settings > Menu > Compact layout: denser tray panel, nothing hidden. */
+  compactMenuLayout?: boolean;
   workdayTickStyle: WorkdayTickStyle;
   menuBarColorPace: boolean;
   /** Tint the tray usage meter with each shown provider's accent color (`menu_bar_color_by_provider`). */
@@ -452,6 +454,7 @@ export interface SettingsUpdate {
   mergedOverviewAllAccounts?: boolean;
   quotaWarningMarkersVisible?: boolean;
   highlightMenuCardsOnHover?: boolean;
+  compactMenuLayout?: boolean;
   workdayTickStyle?: WorkdayTickStyle;
   menuBarColorPace?: boolean;
   menuBarColorByProvider?: boolean;

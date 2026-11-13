@@ -678,3 +678,64 @@
   font: var(--mac-text-caption);
   color: var(--mac-text-2);
 }
+
+
+/* ── Compact layout (Settings > Menu > Compact layout) ──────────────
+   Density only: every row still renders. Tokens set here outrank both looks
+   (same specificity as the modern block, loaded after it); the descendant rules
+   restate the few sizes tray-card-modern.css hardcodes. */
+.menu-surface--tray.menu-surface--compact {
+  --mac-text-headline: 600 13px/16px var(--mac-font);
+  --mac-text-body-medium: 600 12px/15px var(--mac-font);
+  --mac-text-subheadline: 400 11px/13px var(--mac-font);
+  --mac-text-footnote: 400 10px/12px var(--mac-font);
+  --mac-text-caption: 400 10px/12px var(--mac-font);
+  --mac-text-caption2: 400 10px/12px var(--mac-font);
+  --mac-text-section: 600 10px/12px var(--mac-font);
+  --mac-text-menu: 400 12px/15px var(--mac-font);
+  --mac-text-shortcut: 400 12px/15px var(--mac-font);
+
+  --mac-pad-x: 12px;
+  --mac-row-pl: 12px;
+  --mac-pad-header-y: 4px;
+  --mac-gap-header: 4px;
+  --mac-section-pt: 4px;
+  --mac-section-pb: 4px;
+  --mac-usage-pt: 6px;
+  --mac-header-line-gap: 2px;
+  --mac-after-divider: 8px;
+  --mac-metric-gap: 7px;
+  --mac-metric-inner: 3px;
+  --mac-kv-gap: 8px;
+  --mac-kv-section: 4px;
+  --mac-dash-gap: 6px;
+  --mac-kpi-gap: 4px;
+  --mac-chart-h: 44px;
+  --mac-bar-h: 4px;
+  --mac-row-h: 20px;
+  --mac-menu-row-h: 20px;
+}
+.menu-surface--tray.menu-surface--compact.menu-surface--modern {
+  padding: 4px 0;
+}
+.menu-surface--tray.menu-surface--compact .menu-card__content {
+  gap: 8px;
+}
+.menu-surface--tray.menu-surface--compact .menu-metric__progress {
+  height: 5px;
+}
+.menu-surface--tray.menu-surface--compact .provider-grid--tabs .provider-grid__item {
+  min-height: 28px;
+  padding: 3px 1px 5px;
+}
+.menu-surface--tray.menu-surface--compact .provider-grid--tabs {
+  padding: 2px 6px 4px;
+}
+.menu-surface--tray.menu-surface--compact .menu-surface__footer-sep,
+.menu-surface--tray.menu-surface--compact .provider-grid__divider,
+.menu-surface--tray.menu-surface--compact .menu-stack__sep {
+  margin: 3px 12px;
+}
+.menu-surface--tray.menu-surface--compact .overview-spend {
+  padding: 6px 12px;
+}

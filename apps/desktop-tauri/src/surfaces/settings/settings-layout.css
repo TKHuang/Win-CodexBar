@@ -194,19 +194,20 @@
   border-color: var(--accent, #007aff);
 }
 
-/* ── Menu-style select: borderless "Value ⌄" ──────────────────────── */
+/* ── Menu-style select ─────────────────────────────────────────────
+   Always boxed and left-aligned, like a Windows combo box. The borderless,
+   right-aligned macOS look left the value floating apart from its box and
+   right-aligned the opened option list. */
 .select.select--menu {
-  border-color: transparent;
-  background-color: transparent;
-  text-align: right;
-  text-align-last: right;
+  border-color: var(--panel-border);
+  background-color: var(--surface-elevated);
+  text-align: left;
+  text-align-last: left;
   font-size: 13px;
 }
 
-.select.select--menu:hover:not(:disabled),
-.select.select--menu:focus-visible {
-  border-color: var(--panel-border);
-  background-color: var(--surface-elevated);
+.select.select--menu option {
+  text-align: left;
 }
 
 /* ── About hero ───────────────────────────────────────────────────── */

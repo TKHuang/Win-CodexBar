@@ -207,6 +207,7 @@ describe("MenuTab Content section", () => {
     const labels = Array.from(content.querySelectorAll(".settings-field__label"), (n) => n.textContent);
     expect(labels).toEqual([
       "HighlightMenuCardsOnHoverLabel",
+      "CompactMenuLayoutLabel",
       "OverviewLayoutLabel",
       "ShowAllTokenAccountsLabel",
     ]);
@@ -220,6 +221,14 @@ describe("MenuTab Content section", () => {
     expect(
       screen.getByRole("checkbox", { name: "HighlightMenuCardsOnHoverLabel" }),
     ).not.toBeChecked();
+  });
+
+  it("toggles the compact layout, off unless saved on", () => {
+    const { set } = renderTab();
+    const toggle = screen.getByRole("checkbox", { name: "CompactMenuLayoutLabel" });
+    expect(toggle).not.toBeChecked();
+    fireEvent.click(toggle);
+    expect(set).toHaveBeenCalledWith({ compactMenuLayout: true });
   });
 });
 

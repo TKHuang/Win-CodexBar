@@ -1698,6 +1698,17 @@ fn highlight_menu_cards_on_hover_defaults_on_and_round_trips() {
 }
 
 #[test]
+fn compact_menu_layout_defaults_off_and_round_trips() {
+    assert!(!Settings::default().compact_menu_layout);
+    let on: Settings =
+        serde_json::from_str(r#"{ "enabled_providers": [], "compact_menu_layout": true }"#)
+            .expect("settings with compact layout");
+    assert!(on.compact_menu_layout);
+    let json = serde_json::to_string(&on).expect("serialize compact layout");
+    assert!(json.contains(r#""compact_menu_layout":true"#));
+}
+
+#[test]
 fn merged_overview_all_accounts_defaults_off_and_round_trips() {
     assert!(!Settings::default().merged_overview_all_accounts);
     let legacy: Settings =

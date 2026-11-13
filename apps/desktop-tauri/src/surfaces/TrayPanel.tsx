@@ -83,6 +83,7 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
     ...accentSelectionStyle(accentColor),
   } as CSSProperties;
   const hoverHighlight = settings.highlightMenuCardsOnHover ?? true;
+  const compact = settings.compactMenuLayout ?? false;
   const movable = settings.trayPanelMovable ?? false;
   const containerClassName = movable
     ? `${revealClassName} tray-panel-reveal--movable`
@@ -188,7 +189,7 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
         {moveHandle}
         <MenuSurface banner={banner} footerGroups={footerGroups}
           statusLine={statusLine} style={surfaceStyle} hoverHighlight={hoverHighlight}
-          variant={panelStyle}>
+          compact={compact} variant={panelStyle}>
           {stayAwakeStatus}
           {settings.agentSessionsEnabled && <AgentSessions key={settings.agentSessionsLocalOnly ? "local-only" : "all-hosts"} />}
           <MenuEmpty
@@ -206,7 +207,7 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
       {moveHandle}
       <MenuSurface banner={banner} footerGroups={footerGroups}
         statusLine={statusLine} style={surfaceStyle} hoverHighlight={hoverHighlight}
-        variant={panelStyle}>
+        compact={compact} variant={panelStyle}>
         {stayAwakeStatus}
         {settings.agentSessionsEnabled && <AgentSessions key={settings.agentSessionsLocalOnly ? "local-only" : "all-hosts"} />}
         <ProviderGrid

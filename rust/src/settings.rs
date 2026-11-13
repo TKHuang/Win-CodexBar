@@ -217,6 +217,11 @@ pub struct Settings {
     #[serde(default = "default_true")]
     pub highlight_menu_cards_on_hover: bool,
 
+    /// Tighten tray panel padding, spacing, type and bars so it takes less
+    /// room. Density only: no rows are hidden.
+    #[serde(default)]
+    pub compact_menu_layout: bool,
+
     /// How workday boundaries appear on weekly usage bars.
     #[serde(default)]
     pub workday_tick_style: WorkdayTickStyle,
@@ -859,6 +864,7 @@ impl Default for Settings {
             merged_overview_all_accounts: false,
             quota_warning_markers_visible: true,
             highlight_menu_cards_on_hover: true,
+            compact_menu_layout: false,
             workday_tick_style: WorkdayTickStyle::Subtle,
             menu_bar_color_pace: false,
             menu_bar_color_by_provider: false,

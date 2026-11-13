@@ -1207,6 +1207,8 @@ locale_keys! {
     ShowAsUsedLabel,
     ShowAsUsedHelper,
     HighlightMenuCardsOnHoverLabel,
+    CompactMenuLayoutLabel,
+    CompactMenuLayoutHelper,
     OverviewLayoutLabel,
     OverviewLayoutHelper,
     OverviewLayoutDetailed,

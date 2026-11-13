@@ -82,6 +82,8 @@ interface MenuSurfaceProps {
   /** Settings "Highlight menu cards on hover"; off keeps the Refresh row
    *  unhighlighted under the pointer while keyboard focus still shows. */
   hoverHighlight?: boolean;
+  /** Settings > Menu > Compact layout. */
+  compact?: boolean;
   /** Settings > Menu > Panel look. */
   variant?: TrayPanelStyle;
   children: ReactNode;
@@ -98,6 +100,7 @@ export default function MenuSurface({
   statusLine = null,
   style,
   hoverHighlight = true,
+  compact = false,
   variant = "modern",
   children,
 }: MenuSurfaceProps) {
@@ -105,7 +108,7 @@ export default function MenuSurface({
   const groups = footerGroups.filter((group) => group.length > 0);
   return (
     <div
-      className={`menu-surface menu-surface--tray menu-surface--${variant}${hoverHighlight ? "" : " menu-surface--hover-highlight-off"}`}
+      className={`menu-surface menu-surface--tray menu-surface--${variant}${hoverHighlight ? "" : " menu-surface--hover-highlight-off"}${compact ? " menu-surface--compact" : ""}`}
       style={style}
     >
       {banner}

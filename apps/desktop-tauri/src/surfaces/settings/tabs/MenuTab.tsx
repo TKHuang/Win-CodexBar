@@ -206,6 +206,14 @@ export default function MenuTab({ settings, set, saving }: TabProps) {
             onChange={(v) => set({ highlightMenuCardsOnHover: v })}
           />
         </Field>
+        <Field label={t("CompactMenuLayoutLabel")} description={t("CompactMenuLayoutHelper")}>
+          <Toggle
+            variant="switch"
+            checked={settings.compactMenuLayout ?? false}
+            disabled={saving}
+            onChange={(v) => set({ compactMenuLayout: v })}
+          />
+        </Field>
         <Field label={t("OverviewLayoutLabel")} description={t("OverviewLayoutHelper")}>
           <Select
             variant="menu"
