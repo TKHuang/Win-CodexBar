@@ -315,6 +315,10 @@ pub fn revoke_provider_credentials(
         settings.save().map_err(|e| e.to_string())?;
     }
 
+    if id == ProviderId::Antigravity {
+        codexbar::providers::antigravity::oauth_login::sign_out()?;
+    }
+
     Ok(())
 }
 

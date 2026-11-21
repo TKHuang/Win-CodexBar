@@ -1914,3 +1914,23 @@ AcknowledgementsAuthor = 作者
 AcknowledgementsAuthors = 作者
 AcknowledgementsLicense = 授權條款
 AcknowledgementsStandardText = 標準授權條款文字。此套件未附授權檔案。
+
+# Direct account sign-in (Cursor, Antigravity)
+CursorSignInTitle = Cursor 帳號
+CursorSignInButton = 登入 Cursor
+CursorSwitchAccountButton = 切換 Cursor 帳號
+CursorSignOutButton = 登出
+CursorSignInCancelButton = 取消
+CursorSignInWaiting = 請在開啟的 Cursor 視窗中完成登入（支援企業 SSO）。
+CursorSignInHelp = 直接在 CodexBar 內登入 Cursor 帳號以抓取個人或企業方案用量，無須讀取瀏覽器 Cookie。
+CursorSignInSuccess = 已登入 Cursor，正在重新整理用量…
+AntigravitySignInTitle = Antigravity Google 登入
+AntigravitySignInButton = 使用 Google 登入
+AntigravitySignOutButton = 登出
+AntigravitySignInCancelButton = 取消
+AntigravitySignInWaiting = 請在瀏覽器中完成 Google 登入…
+AntigravitySignInHelp = 透過 Google OAuth 直接取得 Antigravity 額度，無須安裝 Antigravity 桌面端或 agy CLI。
+AntigravitySignInClientMissingHelp = 未偵測到本機 Antigravity OAuth 用戶端。若不安裝 Antigravity，請輸入 Google OAuth 桌面端 Client ID 與 Client Secret 後再登入。
+AntigravityClientIdLabel = OAuth Client ID
+AntigravityClientSecretLabel = OAuth Client Secret
+AntigravitySignInSuccess = 已登入 Antigravity，正在重新整理用量…

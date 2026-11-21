@@ -1914,3 +1914,23 @@ AcknowledgementsAuthor = Yazar
 AcknowledgementsAuthors = Yazarlar
 AcknowledgementsLicense = Lisans
 AcknowledgementsStandardText = Standart lisans metni. Paket bir lisans dosyası içermiyor.
+
+# Direct account sign-in (Cursor, Antigravity)
+CursorSignInTitle = Cursor hesabı
+CursorSignInButton = Cursor ile giriş yap
+CursorSwitchAccountButton = Cursor hesabını değiştir
+CursorSignOutButton = Çıkış yap
+CursorSignInCancelButton = İptal
+CursorSignInWaiting = Açılan Cursor penceresinde girişi tamamlayın. Kurumsal SSO desteklenir.
+CursorSignInHelp = Tarayıcı çerezlerini okumadan kişisel veya kurumsal kullanımı almak için doğrudan CodexBar içinde giriş yapın.
+CursorSignInSuccess = Cursor'a giriş yapıldı. Kullanım yenileniyor…
+AntigravitySignInTitle = Antigravity Google girişi
+AntigravitySignInButton = Google ile giriş yap
+AntigravitySignOutButton = Çıkış yap
+AntigravitySignInCancelButton = İptal
+AntigravitySignInWaiting = Tarayıcınızda Google girişini tamamlayın…
+AntigravitySignInHelp = Antigravity uygulamasını veya agy CLI'yı kurmadan Antigravity kotasını doğrudan almak için Google OAuth ile giriş yapın.
+AntigravitySignInClientMissingHelp = Yerel bir Antigravity OAuth istemcisi bulunamadı. Antigravity'yi kurmadan giriş yapmak için bir Google OAuth masaüstü Client ID ve Client Secret girin.
+AntigravityClientIdLabel = OAuth Client ID
+AntigravityClientSecretLabel = OAuth Client Secret
+AntigravitySignInSuccess = Antigravity'ye giriş yapıldı. Kullanım yenileniyor…

@@ -694,3 +694,115 @@ async fn unified_personal_usage_reads_monthly_spend_and_failure_keeps_summary_sp
         assert_eq!(cost.limit, Some(10.0));
     }
 }
+
+#[tokio::test]
+async fn enterprise_member_budget_surfaces_used_limit_and_balance_over_http() {
+    let mut server = mockito::Server::new_async().await;
+    let _summary = server
+        .mock("GET", "/api/usage-summary")
+        .with_status(200)
+        .with_body(
+            r#"{"billingCycleStart":"2026-09-01T00:00:00Z","billingCycleEnd":"2026-10-01T00:00:00Z",
+                "membershipType":"enterprise","limitType":"team",
+                "individualUsage":{"plan":{"used":0,"limit":2000,"totalPercentUsed":0}}}"#,
+        )
+        .create_async()
+        .await;
+    let _me = server
+        .mock("GET", "/api/auth/me")
+        .with_status(200)
+        .with_body(r#"{"email":"member@example.com","emailVerified":true}"#)
+        .create_async()
+        .await;
+    let _teams = server
+        .mock("POST", "/api/dashboard/teams")
+        .with_status(200)
+        .with_body(r#"{"teams":[{"id":7}]}"#)
+        .create_async()
+        .await;
+    let spend = server
+        .mock("POST", "/api/dashboard/get-team-spend")
+        .with_status(200)
+        .with_body(
+            r#"{"totalPages":1,"teamMemberSpend":[
+                {"email":"other@example.com","overallSpendCents":100,"effectivePerUserLimitDollars":50},
+                {"email":"Member@Example.com","overallSpendCents":4250,"effectivePerUserLimitDollars":200}]}"#,
+        )
+        .expect(1)
+        .create_async()
+        .await;
+
+    let result = CursorApi::with_base_url(&server.url())
+        .fetch_usage_with_cookie_header("auth=fixture")
+        .await
+        .expect("enterprise usage should resolve");
+    spend.assert_async().await;
+
+    assert!((result.primary.used_percent - 21.25).abs() < 1e-9);
+    let cost = result.cost.expect("member budget cost");
+    assert!((cost.used - 42.5).abs() < 1e-9);
+    assert_eq!(cost.limit, Some(200.0));
+    assert_eq!(cost.balance, Some(157.5));
+}
+
+#[test]
+fn enterprise_member_falls_back_to_team_on_demand_when_plan_is_disabled() {
+    let summary = parse_summary(
+        r#"{"membershipType":"enterprise","billingCycleEnd":"2026-10-01T00:00:00Z",
+            "individualUsage":{"plan":{"enabled":false,"used":0,"limit":0}},
+            "teamUsage":{"onDemand":{"enabled":true,"used":4250,"limit":20000,"remaining":15750}}}"#,
+    );
+    let result = api().build_result_with_team_budget(summary, None, None);
+    assert!((result.primary.used_percent - 21.25).abs() < 1e-9);
+    let cost = result.cost.expect("team on-demand cost");
+    assert!((cost.used - 42.5).abs() < 1e-9);
+    assert_eq!(cost.limit, Some(200.0));
+    assert_eq!(cost.balance, Some(157.5));
+    assert_eq!(cost.period, "Enterprise pool (billing cycle)");
+}
+
+#[test]
+fn enterprise_member_pooled_usage_reports_remaining_balance() {
+    let summary = parse_summary(
+        r#"{"membershipType":"enterprise",
+            "individualUsage":{"plan":{"enabled":false}},
+            "teamUsage":{"pooled":{"enabled":true,"used":1000,"limit":10000,"remaining":9000}}}"#,
+    );
+    let result = api().build_result_with_team_budget(summary, None, None);
+    assert!((result.primary.used_percent - 10.0).abs() < 1e-9);
+    let cost = result.cost.expect("pooled cost");
+    assert_eq!(cost.balance, Some(90.0));
+    assert_eq!(cost.period, "Enterprise pool (billing cycle)");
+}
+
+#[test]
+fn non_enterprise_team_pool_uses_the_team_label_and_derived_balance() {
+    let summary = parse_summary(r#"{"teamUsage":{"pooled":{"used":5000,"limit":10000}}}"#);
+    let cost = api()
+        .build_result_with_team_budget(summary, None, None)
+        .cost
+        .expect("pooled cost");
+    assert_eq!(cost.period, "Team pool (billing cycle)");
+    assert_eq!(cost.balance, Some(50.0));
+}
+
+#[test]
+fn plan_usability_and_remaining_cents_follow_the_documented_rules() {
+    let disabled: PlanUsage =
+        serde_json::from_str(r#"{"enabled":false,"used":5,"limit":10}"#).expect("plan fixture");
+    assert!(!disabled.has_usable_usage());
+    let empty: PlanUsage = serde_json::from_str(r#"{"used":0,"limit":0}"#).expect("plan fixture");
+    assert!(!empty.has_usable_usage());
+    let percent_only: PlanUsage =
+        serde_json::from_str(r#"{"totalPercentUsed":0}"#).expect("plan fixture");
+    assert!(percent_only.has_usable_usage());
+
+    let explicit: OnDemandUsage =
+        serde_json::from_str(r#"{"used":100,"limit":500,"remaining":123}"#).expect("fixture");
+    assert_eq!(explicit.remaining_cents(), Some(123.0));
+    let derived: OnDemandUsage =
+        serde_json::from_str(r#"{"used":700,"limit":500}"#).expect("fixture");
+    assert_eq!(derived.remaining_cents(), Some(0.0));
+    let unlimited: OnDemandUsage = serde_json::from_str(r#"{"used":700}"#).expect("fixture");
+    assert_eq!(unlimited.remaining_cents(), None);
+}

@@ -17,10 +17,7 @@ import PanelResizeHandle from "../components/PanelResizeHandle";
 import AgentSessions from "../components/AgentSessions";
 import { accentSelectionStyle } from "../lib/menuSelection";
 import { filterUsageSpendSummaryForOverview } from "../lib/usageSpendSharing";
-import { expandOverviewAccountRows, type OverviewEntry } from "../lib/overviewAccountRows";
-import { useCodexAccountsState } from "../hooks/useCodexAccountsState";
-import { useClaudeTokenOverviewAccounts } from "../hooks/useClaudeTokenOverviewAccounts";
-import { useClaudeSwapOverviewAccounts } from "../hooks/useClaudeSwapOverviewAccounts";
+import type { OverviewEntry } from "../lib/overviewAccountRows";
 
 /**
  * Tray popover surface — two modes like macOS CodexBar:
@@ -48,7 +45,8 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
     selectedProviderId,
     gridExpanded,
     setGridExpanded,
-    visibleProviders,
+    cardEntries,
+    overviewColumns,
     requestLayout,
     footerGroups,
     statusLine,
@@ -65,18 +63,6 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
     handleGestureEnd,
     revealClassName,
   } = useTrayPanelController(state);
-  // Read the cached Codex account store only while "Show all accounts in Overview" is on.
-  const codexAccounts = useCodexAccountsState({
-    enabled: settings.mergedOverviewAllAccounts === true,
-  });
-  // Saved Claude token accounts and their cached usage, under the same setting.
-  const claudeTokenAccounts = useClaudeTokenOverviewAccounts({
-    enabled: settings.mergedOverviewAllAccounts === true,
-  });
-  // claude-swap/tcr pool accounts and their cached usage, under the same setting.
-  const claudeSwapAccounts = useClaudeSwapOverviewAccounts({
-    enabled: settings.mergedOverviewAllAccounts === true,
-  });
 
   const surfaceStyle = {
     zoom: trayScale,
@@ -95,7 +81,7 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
       key={side}
       side={side}
       width={panelWidth}
-      zoom={trayScale}
+      zoom={trayScale * overviewColumns}
       onResizeStart={handleResizeStart}
       onResize={handleResize}
       onResizeEnd={handleResizeEnd}
@@ -155,28 +141,6 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
     );
   };
 
-  // Overview: each selected provider, expanded to one row per cached account
-  // (Codex managed accounts, claude-swap/tcr pool accounts, Claude token accounts)
-  // when the setting is on. Rows never take a provider slot; the cap applies first.
-  const cardEntries: OverviewEntry[] =
-    selectedProviderId === null && settings.mergedOverviewAllAccounts === true
-      ? expandOverviewAccountRows(
-          visibleProviders,
-          codexAccounts.loaded ? codexAccounts : null,
-          {
-            hidePersonalInfo: settings.hidePersonalInfo,
-            accountWord: t("Account"),
-            unavailableText: t("CodexAccountsUsageUnavailable"),
-          },
-          claudeTokenAccounts.loaded ? claudeTokenAccounts : null,
-          claudeSwapAccounts.loaded ? claudeSwapAccounts : null,
-        )
-      : visibleProviders.map((provider) => ({
-          key: provider.providerId,
-          provider,
-          accountId: null,
-        }));
-
   const stayAwakeStatus = stayAwakeHeld ? (
     <p className="menu-surface__hint" role="status">
       {t("TrayStayAwakeActive")}
@@ -232,10 +196,22 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
             t={t}
           />
         )}
-        <div className="menu-stack">
+        <div
+          className={
+            overviewColumns > 1
+              ? `menu-stack menu-stack--columns menu-stack--cols-${overviewColumns}`
+              : "menu-stack"
+          }
+          data-columns={overviewColumns}
+          style={
+            overviewColumns > 1
+              ? ({ "--overview-columns": overviewColumns } as CSSProperties)
+              : undefined
+          }
+        >
           {cardEntries.map((entry, idx) => (
             <Fragment key={entry.key}>
-              {idx > 0 && <div className="menu-stack__sep" />}
+              {overviewColumns === 1 && idx > 0 && <div className="menu-stack__sep" />}
               {renderProviderCard(entry.provider, entry)}
             </Fragment>
           ))}

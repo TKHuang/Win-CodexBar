@@ -1913,3 +1913,23 @@ AcknowledgementsAuthor = Autor
 AcknowledgementsAuthors = Autores
 AcknowledgementsLicense = Licencia
 AcknowledgementsStandardText = Texto de licencia estándar. El paquete no incluye un archivo de licencia.
+
+# Direct account sign-in (Cursor, Antigravity)
+CursorSignInTitle = Cuenta de Cursor
+CursorSignInButton = Iniciar sesión en Cursor
+CursorSwitchAccountButton = Cambiar cuenta de Cursor
+CursorSignOutButton = Cerrar sesión
+CursorSignInCancelButton = Cancelar
+CursorSignInWaiting = Completa el inicio de sesión en la ventana de Cursor que se abrió. Se admite SSO empresarial.
+CursorSignInHelp = Inicia sesión directamente en CodexBar para obtener el uso personal o empresarial sin leer las cookies del navegador.
+CursorSignInSuccess = Sesión iniciada en Cursor. Actualizando el uso…
+AntigravitySignInTitle = Inicio de sesión de Antigravity con Google
+AntigravitySignInButton = Iniciar sesión con Google
+AntigravitySignOutButton = Cerrar sesión
+AntigravitySignInCancelButton = Cancelar
+AntigravitySignInWaiting = Completa el inicio de sesión de Google en tu navegador…
+AntigravitySignInHelp = Inicia sesión con Google OAuth para obtener la cuota de Antigravity directamente, sin instalar la app de Antigravity ni la CLI agy.
+AntigravitySignInClientMissingHelp = No se encontró un cliente OAuth local de Antigravity. Ingresa un Client ID y un Client Secret de escritorio de Google OAuth para iniciar sesión sin instalar Antigravity.
+AntigravityClientIdLabel = Client ID de OAuth
+AntigravityClientSecretLabel = Client Secret de OAuth
+AntigravitySignInSuccess = Sesión iniciada en Antigravity. Actualizando el uso…

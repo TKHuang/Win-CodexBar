@@ -27,4 +27,28 @@ describe("CostSection", () => {
     expect(screen.queryByText("DetailCostUsed")).toBeNull();
     expect(screen.queryByText("$0.00")).toBeNull();
   });
+
+  it("renders balance alongside used and limit for capped enterprise pools", () => {
+    const cost: CostSnapshotBridge = {
+      used: 42.5,
+      limit: 200,
+      remaining: 157.5,
+      currencyCode: "USD",
+      period: "Enterprise pool (billing cycle)",
+      resetsAt: "2026-12-01T00:00:00Z",
+      formattedUsed: "$42.50",
+      formattedLimit: "$200.00",
+      balance: 157.5,
+      formattedBalance: "$157.50",
+    };
+
+    render(<CostSection cost={cost} t={(key: LocaleKey) => key} />);
+
+    expect(screen.getByText("DetailCostUsed")).toBeTruthy();
+    expect(screen.getByText("$42.50")).toBeTruthy();
+    expect(screen.getByText("DetailCostLimit")).toBeTruthy();
+    expect(screen.getByText("$200.00")).toBeTruthy();
+    expect(screen.getByText("DetailCostBalance")).toBeTruthy();
+    expect(screen.getByText("$157.50")).toBeTruthy();
+  });
 });

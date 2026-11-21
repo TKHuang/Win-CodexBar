@@ -8,6 +8,7 @@ import {
   getAppInfo,
   getProviderDetail,
   getSystemAccentColor,
+  getWorkAreaRect,
   openProviderDashboard,
   openProviderStatusPage,
   openSettingsWindow,
@@ -23,10 +24,19 @@ import { useNow } from "./useNow";
 import { useProviderSwitcherKeys } from "./useProviderSwitcherKeys";
 import { useSurfaceTarget } from "./useSurfaceMode";
 import { useTrayPanelLayout } from "./useTrayPanelLayout";
+import { useCodexAccountsState } from "./useCodexAccountsState";
+import { useClaudeTokenOverviewAccounts } from "./useClaudeTokenOverviewAccounts";
+import { useClaudeSwapOverviewAccounts } from "./useClaudeSwapOverviewAccounts";
 import type { MenuFooterRow } from "../components/MenuSurface";
 import { accountMenuAction } from "../lib/accountMenuRow";
+import { expandOverviewAccountRows, type OverviewEntry } from "../lib/overviewAccountRows";
 import { orderProviderSnapshots } from "../lib/providerOrder";
-import { clampTrayPanelWidth, clampTrayScalePercent } from "../lib/trayScale";
+import {
+  clampTrayPanelWidth,
+  clampTrayScalePercent,
+  computeOverviewColumns,
+  fitTrayWidthToWorkArea,
+} from "../lib/trayScale";
 import { selectOverviewProviders } from "../lib/overviewProviders";
 import { serviceStatusLine } from "../lib/serviceStatus";
 import {
@@ -185,6 +195,89 @@ export function useTrayPanelController(state: BootstrapState) {
     settings.mergedOverviewSelectedProviders,
   ]);
 
+  // Read the cached Codex / Claude account stores only while "Show all accounts in Overview" is on.
+  const codexAccounts = useCodexAccountsState({
+    enabled: settings.mergedOverviewAllAccounts === true,
+  });
+  const claudeTokenAccounts = useClaudeTokenOverviewAccounts({
+    enabled: settings.mergedOverviewAllAccounts === true,
+  });
+  const claudeSwapAccounts = useClaudeSwapOverviewAccounts({
+    enabled: settings.mergedOverviewAllAccounts === true,
+  });
+
+  // Overview: each selected provider, expanded to one row per cached account
+  // when the setting is on. Rows never take a provider slot; the cap applies first.
+  const cardEntries: OverviewEntry[] = useMemo(
+    () =>
+      selectedProviderId === null && settings.mergedOverviewAllAccounts === true
+        ? expandOverviewAccountRows(
+            visibleProviders,
+            codexAccounts.loaded ? codexAccounts : null,
+            {
+              hidePersonalInfo: settings.hidePersonalInfo,
+              accountWord: t("Account"),
+              unavailableText: t("CodexAccountsUsageUnavailable"),
+            },
+            claudeTokenAccounts.loaded ? claudeTokenAccounts : null,
+            claudeSwapAccounts.loaded ? claudeSwapAccounts : null,
+          )
+        : visibleProviders.map((provider) => ({
+            key: provider.providerId,
+            provider,
+            accountId: null,
+          })),
+    [
+      selectedProviderId,
+      settings.mergedOverviewAllAccounts,
+      settings.hidePersonalInfo,
+      visibleProviders,
+      codexAccounts,
+      claudeTokenAccounts,
+      claudeSwapAccounts,
+      t,
+    ],
+  );
+
+  const [workAreaPhysicalWidth, setWorkAreaPhysicalWidth] = useState<number | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    const readWorkArea = () => {
+      void getWorkAreaRect().then(
+        (rect) => {
+          if (!cancelled && rect && Number.isFinite(rect.width)) {
+            setWorkAreaPhysicalWidth(rect.width);
+          }
+        },
+        () => {},
+      );
+    };
+    readWorkArea();
+    window.addEventListener("focus", readWorkArea);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("focus", readWorkArea);
+    };
+  }, []);
+
+  const availableCssWidth = useMemo(() => {
+    if (workAreaPhysicalWidth == null) return null;
+    const availableLogical = fitTrayWidthToWorkArea(
+      Number.MAX_SAFE_INTEGER,
+      workAreaPhysicalWidth,
+      window.devicePixelRatio,
+    );
+    if (!Number.isFinite(availableLogical) || availableLogical >= Number.MAX_SAFE_INTEGER) {
+      return null;
+    }
+    return availableLogical / trayScale;
+  }, [workAreaPhysicalWidth, trayScale]);
+
+  const overviewColumns = useMemo(() => {
+    if (selectedProviderId !== null || expectsDenseOverview) return 1;
+    return computeOverviewColumns(cardEntries.length, { availableCssWidth });
+  }, [availableCssWidth, cardEntries.length, expectsDenseOverview, selectedProviderId]);
+
   const actionProvider =
     selectedProviderId !== null
       ? (providersById.get(selectedProviderId) ?? null)
@@ -298,6 +391,8 @@ export function useTrayPanelController(state: BootstrapState) {
         expectsDenseOverview ? "dense" : "normal",
         hasLoadedCache ? "cache-ready" : "cache-pending",
         visibleProviders.map((provider) => provider.providerId).join(","),
+        `cards:${cardEntries.length}`,
+        `cols:${overviewColumns}`,
         actionRowIds,
         statusLine ?? "",
         trayScale,
@@ -312,6 +407,8 @@ export function useTrayPanelController(state: BootstrapState) {
       expectsDenseOverview,
       hasLoadedCache,
       visibleProviders,
+      cardEntries.length,
+      overviewColumns,
       actionRowIds,
       statusLine,
       trayScale,
@@ -324,7 +421,7 @@ export function useTrayPanelController(state: BootstrapState) {
     detailMode: selectedProviderId !== null,
     layoutKey,
     zoom: trayScale,
-    baseWidth: panelWidth,
+    baseWidth: panelWidth * overviewColumns,
   });
 
   // Keyboard shortcuts
@@ -418,6 +515,8 @@ export function useTrayPanelController(state: BootstrapState) {
     gridExpanded,
     setGridExpanded,
     visibleProviders,
+    cardEntries,
+    overviewColumns,
     layoutReady,
     requestLayout,
     footerGroups,

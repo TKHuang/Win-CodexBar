@@ -236,6 +236,19 @@ export interface KiroStatus {
   hint: string | null;
 }
 
+export interface AntigravityOAuthStatus {
+  signedIn: boolean;
+  email: string | null;
+  credentialsPath: string;
+  clientSource: string | null;
+  hasClientConfig: boolean;
+}
+
+export interface AntigravityOAuthLoginResult {
+  email: string | null;
+  credentialsPath: string;
+}
+
 // ── Phase 4 — session / environment ──────────────────────────────────
 
 export interface WorkAreaRect {

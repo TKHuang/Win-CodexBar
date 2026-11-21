@@ -207,6 +207,14 @@ impl CursorTokenCostReport {
         if self.api_rate_usd <= 0.0 && self.metered_usd.unwrap_or(0.0) <= 0.0 {
             return base;
         }
+        // A capped billing limit with a remaining balance is authoritative
+        // Enterprise/Team spend; API-rate estimates must not overwrite it.
+        if base
+            .as_ref()
+            .is_some_and(|base| base.limit.is_some() && base.balance.is_some())
+        {
+            return base;
+        }
         let used = self
             .metered_usd
             .filter(|v| *v > 0.0)
@@ -598,6 +606,37 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn estimate_report() -> CursorTokenCostReport {
+        CursorTokenCostReport {
+            api_rate_usd: 90.0,
+            ..CursorTokenCostReport::default()
+        }
+    }
+
+    #[test]
+    fn merge_preserves_capped_spend_with_balance() {
+        let base = CostSnapshot::new(42.5, "USD", "Enterprise pool (billing cycle)")
+            .with_limit(200.0)
+            .with_balance(157.5);
+        let merged = estimate_report()
+            .merge_into_cost(Some(base))
+            .expect("base survives");
+        assert_eq!(merged.used, 42.5);
+        assert_eq!(merged.limit, Some(200.0));
+        assert_eq!(merged.balance, Some(157.5));
+        assert_eq!(merged.period, "Enterprise pool (billing cycle)");
+    }
+
+    #[test]
+    fn merge_still_enriches_spend_without_a_balance() {
+        let base = CostSnapshot::new(5.0, "USD", "On-demand (billing cycle)").with_limit(10.0);
+        let merged = estimate_report()
+            .merge_into_cost(Some(base))
+            .expect("merged cost");
+        assert_eq!(merged.used, 90.0);
+        assert_eq!(merged.period, "Token cost (API-rate, billing window)");
+    }
 
     async fn events_status(status: usize) -> Result<CursorTokenCostReport, TokenCostError> {
         let mut server = mockito::Server::new_async().await;

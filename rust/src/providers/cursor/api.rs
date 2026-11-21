@@ -18,6 +18,20 @@ const WEEKLY_POOL_WINDOW_MINUTES: u32 = 7 * 24 * 60;
 /// Primary label once the shared weekly pool drives the main meter (upstream `"Weekly"`).
 pub(super) const SHARED_WEEKLY_POOL_LABEL: &str = "Weekly";
 
+/// Period label for on-demand spend from usage-summary.
+const ON_DEMAND_PERIOD: &str = "On-demand (billing cycle)";
+
+/// The single billing source that drives the meter and the cost line.
+enum CursorBillingResolution<'a> {
+    /// Verified per-member budget from the team dashboard.
+    MemberBudget(CursorMemberBudget),
+    Plan(&'a PlanUsage),
+    Overall(&'a OnDemandUsage),
+    /// Shared team pool or team on-demand allowance.
+    TeamPool(&'a OnDemandUsage),
+    Empty,
+}
+
 #[derive(Debug)]
 pub struct CursorUsageResult {
     pub(super) primary: RateWindow,
@@ -251,19 +265,22 @@ impl CursorApi {
         );
 
         let (percent_used, secondary, model_specific, cost_snapshot) =
-            if let Some(team_budget) = team_budget {
-                let percent = clamp_percent(team_budget.used_usd / team_budget.limit_usd * 100.0);
-                let cost = Self::summary_on_demand_cost(&summary, billing_end).or_else(|| {
-                    Some(Self::plan_cost(
-                        team_budget.used_usd,
-                        team_budget.limit_usd,
-                        summary.billing_cycle_start.as_deref(),
-                        billing_end,
-                    ))
-                });
-                (percent, None, None, cost)
-            } else if let Some(individual) = &summary.individual_usage {
-                if let Some(plan) = &individual.plan {
+            match Self::resolve_billing(&summary, team_budget) {
+                CursorBillingResolution::MemberBudget(budget) => {
+                    let cost =
+                        Self::summary_on_demand_cost(&summary, billing_end).unwrap_or_else(|| {
+                            Self::plan_cost(
+                                budget.used_usd,
+                                budget.limit_usd,
+                                Some(budget.remaining_usd()),
+                                summary.billing_cycle_start.as_deref(),
+                                billing_end,
+                            )
+                        });
+                    let percent = clamp_percent(budget.used_usd / budget.limit_usd * 100.0);
+                    (percent, None, None, Some(cost))
+                }
+                CursorBillingResolution::Plan(plan) => {
                     let used_cents = plan.used.unwrap_or(0) as f64;
                     let limit_cents = plan
                         .limit
@@ -279,44 +296,40 @@ impl CursorApi {
                     } else {
                         0.0
                     };
-
                     let secondary = plan.auto_percent_used.map(|v| {
                         RateWindow::with_details(clamp_percent(v), cycle_minutes, billing_end, None)
                     });
-
                     let model_specific = plan.api_percent_used.map(|v| {
                         RateWindow::with_details(clamp_percent(v), cycle_minutes, billing_end, None)
                     });
-
                     let cost =
                         Self::summary_on_demand_cost(&summary, billing_end).unwrap_or_else(|| {
                             // Plan-included spend (cents → USD) when on-demand is off.
                             Self::plan_cost(
                                 used_cents / 100.0,
                                 limit_cents / 100.0,
+                                plan.remaining
+                                    .filter(|cents| *cents >= 0)
+                                    .map(|cents| cents as f64 / 100.0),
                                 summary.billing_cycle_start.as_deref(),
                                 billing_end,
                             )
                         });
-
                     (percent, secondary, model_specific, Some(cost))
-                } else if let Some(overall) = &individual.overall {
-                    let percent = Self::usage_percent(overall).unwrap_or(0.0);
-                    let cost = Self::on_demand_cost(Some(overall), billing_end);
-                    (percent, None, None, cost)
-                } else {
-                    (0.0, None, None, None)
                 }
-            } else if let Some(team) = &summary.team_usage {
-                if let Some(pooled) = &team.pooled {
-                    let percent = Self::usage_percent(pooled).unwrap_or(0.0);
-                    let cost = Self::on_demand_cost(Some(pooled), billing_end);
-                    (percent, None, None, cost)
-                } else {
-                    (0.0, None, None, None)
-                }
-            } else {
-                (0.0, None, None, None)
+                CursorBillingResolution::Overall(overall) => (
+                    Self::usage_percent(overall).unwrap_or(0.0),
+                    None,
+                    None,
+                    Self::on_demand_cost(Some(overall), billing_end, ON_DEMAND_PERIOD),
+                ),
+                CursorBillingResolution::TeamPool(pool) => (
+                    Self::usage_percent(pool).unwrap_or(0.0),
+                    None,
+                    None,
+                    Self::on_demand_cost(Some(pool), billing_end, summary.team_pool_period()),
+                ),
+                CursorBillingResolution::Empty => (0.0, None, None, None),
             };
 
         let primary = RateWindow::with_details(percent_used, cycle_minutes, billing_end, None);
@@ -346,15 +359,58 @@ impl CursorApi {
         }
     }
 
+    /// Picks the one billing source that drives the meter and the cost line.
+    ///
+    /// A verified team-member budget wins. Otherwise the first usable source
+    /// in order: individual plan, individual overall, team pool, team
+    /// on-demand. An empty or disabled plan must not shadow the team sources
+    /// (non-admin Enterprise members only expose `teamUsage`).
+    fn resolve_billing(
+        summary: &UsageSummary,
+        team_budget: Option<CursorMemberBudget>,
+    ) -> CursorBillingResolution<'_> {
+        if let Some(budget) = team_budget {
+            return CursorBillingResolution::MemberBudget(budget);
+        }
+        let individual = summary.individual_usage.as_ref();
+        if let Some(plan) = individual
+            .and_then(|individual| individual.plan.as_ref())
+            .filter(|plan| plan.has_usable_usage())
+        {
+            return CursorBillingResolution::Plan(plan);
+        }
+        if let Some(overall) = individual
+            .and_then(|individual| individual.overall.as_ref())
+            .filter(|overall| overall.is_usable())
+        {
+            return CursorBillingResolution::Overall(overall);
+        }
+        let team = summary.team_usage.as_ref();
+        [
+            team.and_then(|team| team.pooled.as_ref()),
+            team.and_then(|team| team.on_demand.as_ref()),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|pool| pool.is_usable())
+        .map_or(
+            CursorBillingResolution::Empty,
+            CursorBillingResolution::TeamPool,
+        )
+    }
+
     fn plan_cost(
         used_usd: f64,
         limit_usd: f64,
+        explicit_remaining_usd: Option<f64>,
         billing_cycle_start: Option<&str>,
         billing_end: Option<DateTime<Utc>>,
     ) -> CostSnapshot {
         let mut cost = CostSnapshot::new(used_usd, "USD", plan_period_label(billing_cycle_start));
         if limit_usd > 0.0 {
-            cost = cost.with_limit(limit_usd);
+            let remaining_usd =
+                explicit_remaining_usd.unwrap_or_else(|| (limit_usd - used_usd).max(0.0));
+            cost = cost.with_limit(limit_usd).with_balance(remaining_usd);
         }
         if let Some(reset) = billing_end {
             cost = cost.with_resets_at(reset);
@@ -362,7 +418,7 @@ impl CursorApi {
         cost
     }
 
-    /// Individual on-demand spend, else the team's.
+    /// Individual on-demand spend, else the team's on-demand, else the team pool.
     fn summary_on_demand_cost(
         summary: &UsageSummary,
         billing_end: Option<DateTime<Utc>>,
@@ -371,17 +427,28 @@ impl CursorApi {
             .individual_usage
             .as_ref()
             .and_then(|individual| individual.on_demand.as_ref());
-        Self::on_demand_cost(individual, billing_end).or_else(|| {
-            summary
-                .team_usage
-                .as_ref()
-                .and_then(|team| Self::on_demand_cost(team.on_demand.as_ref(), billing_end))
-        })
+        let team = summary.team_usage.as_ref();
+        Self::on_demand_cost(individual, billing_end, ON_DEMAND_PERIOD)
+            .or_else(|| {
+                Self::on_demand_cost(
+                    team.and_then(|team| team.on_demand.as_ref()),
+                    billing_end,
+                    ON_DEMAND_PERIOD,
+                )
+            })
+            .or_else(|| {
+                Self::on_demand_cost(
+                    team.and_then(|team| team.pooled.as_ref()),
+                    billing_end,
+                    summary.team_pool_period(),
+                )
+            })
     }
 
     fn on_demand_cost(
         on_demand: Option<&OnDemandUsage>,
         billing_end: Option<DateTime<Utc>>,
+        period: &str,
     ) -> Option<CostSnapshot> {
         let usage = on_demand?;
         if usage.enabled == Some(false) {
@@ -396,9 +463,12 @@ impl CursorApi {
 
         // usage-summary exposes on-demand spend in cents for the billing cycle.
         // Label it explicitly so the tray/detail cost line is not a vague "Monthly".
-        let mut cost = CostSnapshot::new(used_cents / 100.0, "USD", "On-demand (billing cycle)");
+        let mut cost = CostSnapshot::new(used_cents / 100.0, "USD", period);
         if limit_cents > 0.0 {
             cost = cost.with_limit(limit_cents / 100.0);
+        }
+        if let Some(remaining_cents) = usage.remaining_cents() {
+            cost = cost.with_balance(remaining_cents / 100.0);
         }
         if let Some(reset) = billing_end {
             cost = cost.with_resets_at(reset);
@@ -461,6 +531,19 @@ impl UsageSummary {
                 .is_some_and(|limit_type| limit_type.eq_ignore_ascii_case("user"))
     }
 
+    /// Cost-period label for the shared team pool.
+    fn team_pool_period(&self) -> &'static str {
+        let is_enterprise = self
+            .membership_type
+            .as_deref()
+            .is_some_and(|membership| membership.eq_ignore_ascii_case("enterprise"));
+        if is_enterprise {
+            "Enterprise pool (billing cycle)"
+        } else {
+            "Team pool (billing cycle)"
+        }
+    }
+
     pub(super) fn is_team_plan(&self) -> bool {
         matches!(
             self.membership_type
@@ -513,7 +596,46 @@ struct OnDemandUsage {
     remaining: Option<i64>,
 }
 
+impl PlanUsage {
+    /// A plan that is not disabled and reports any limit, spend, remaining
+    /// allowance, or percent. An empty or disabled plan must fall through to
+    /// the team sources.
+    fn has_usable_usage(&self) -> bool {
+        if self.enabled == Some(false) {
+            return false;
+        }
+        self.limit.unwrap_or(0) > 0
+            || self.used.unwrap_or(0) > 0
+            || self.remaining.unwrap_or(0) > 0
+            || self
+                .breakdown
+                .as_ref()
+                .and_then(|breakdown| breakdown.total)
+                .unwrap_or(0)
+                > 0
+            || self.total_percent_used.is_some()
+    }
+}
+
 impl OnDemandUsage {
+    /// Enabled and reporting any spend, limit, or remaining allowance.
+    fn is_usable(&self) -> bool {
+        self.enabled != Some(false)
+            && (self.used.unwrap_or(0) > 0
+                || self.limit.unwrap_or(0) > 0
+                || self.remaining.unwrap_or(0) > 0)
+    }
+
+    /// Remaining allowance in cents: the reported value when non-negative,
+    /// else limit minus used when a limit exists.
+    fn remaining_cents(&self) -> Option<f64> {
+        if let Some(remaining) = self.remaining.filter(|remaining| *remaining >= 0) {
+            return Some(remaining as f64);
+        }
+        let (used, limit) = self.used_and_limit_cents();
+        (limit > 0.0).then(|| (limit - used).max(0.0))
+    }
+
     /// (used, limit) in cents; a missing limit falls back to remaining + used.
     fn used_and_limit_cents(&self) -> (f64, f64) {
         let used = self.used.unwrap_or(0);

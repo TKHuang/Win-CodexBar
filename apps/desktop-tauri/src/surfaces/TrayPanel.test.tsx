@@ -1572,6 +1572,67 @@ describe("TrayPanel provider grid", () => {
       "menu-surface--hover-highlight-off",
     );
   });
+
+  it("uses 1 column for 2 providers, 2 columns for 3–4, 3 columns for 5–6, and returns to 1 in detail mode", async () => {
+    const setSize = vi.fn().mockResolvedValue(undefined);
+    windowMocks.getCurrentWindow.mockReturnValue({
+      setSize,
+      close: vi.fn().mockResolvedValue(undefined),
+      innerSize: vi.fn().mockResolvedValue({ width: 310, height: 200 }),
+    });
+
+    const two = renderTrayPanel([
+      provider("claude", "Claude", 35),
+      provider("codex", "Codex", 20),
+    ]);
+    await waitFor(() => {
+      expect(two.container.querySelector(".menu-stack")?.getAttribute("data-columns")).toBe("1");
+    });
+    expect(two.container.querySelectorAll(".menu-stack__sep")).toHaveLength(1);
+    two.unmount();
+    setSize.mockClear();
+
+    const four = renderTrayPanel([
+      provider("claude", "Claude", 35),
+      provider("codex", "Codex", 20),
+      provider("cursor", "Cursor", 40),
+      provider("gemini", "Gemini", 15),
+    ]);
+    await waitFor(() => {
+      expect(four.container.querySelector(".menu-stack")?.getAttribute("data-columns")).toBe("2");
+    });
+    expect(four.container.querySelector(".menu-stack")).toHaveClass("menu-stack--cols-2");
+    expect(four.container.querySelectorAll(".menu-stack__sep")).toHaveLength(0);
+    await waitFor(() => {
+      expect(setSize).toHaveBeenCalledWith(expect.objectContaining({ width: 620 }));
+    });
+
+    setSize.mockClear();
+    fireEvent.click(screen.getByRole("button", { name: /^Cursor$/ }));
+    await waitFor(() => {
+      expect(four.container.querySelector(".menu-stack")?.getAttribute("data-columns")).toBe("1");
+    });
+    await waitFor(() => {
+      expect(setSize).toHaveBeenCalledWith(expect.objectContaining({ width: 310 }));
+    });
+    four.unmount();
+    setSize.mockClear();
+
+    const five = renderTrayPanel([
+      provider("claude", "Claude", 35),
+      provider("codex", "Codex", 20),
+      provider("cursor", "Cursor", 40),
+      provider("gemini", "Gemini", 15),
+      provider("copilot", "Copilot", 10),
+    ]);
+    await waitFor(() => {
+      expect(five.container.querySelector(".menu-stack")?.getAttribute("data-columns")).toBe("3");
+    });
+    expect(five.container.querySelector(".menu-stack")).toHaveClass("menu-stack--cols-3");
+    await waitFor(() => {
+      expect(setSize).toHaveBeenCalledWith(expect.objectContaining({ width: 930 }));
+    });
+  });
 });
 
 function codexAccountRecord(id: string, emailHint: string) {

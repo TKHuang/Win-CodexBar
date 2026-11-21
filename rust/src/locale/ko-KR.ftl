@@ -1913,3 +1913,23 @@ AcknowledgementsAuthor = 작성자
 AcknowledgementsAuthors = 작성자
 AcknowledgementsLicense = 라이선스
 AcknowledgementsStandardText = 표준 라이선스 텍스트입니다. 이 패키지에는 라이선스 파일이 없습니다.
+
+# Direct account sign-in (Cursor, Antigravity)
+CursorSignInTitle = Cursor 계정
+CursorSignInButton = Cursor로 로그인
+CursorSwitchAccountButton = Cursor 계정 전환
+CursorSignOutButton = 로그아웃
+CursorSignInCancelButton = 취소
+CursorSignInWaiting = 열린 Cursor 창에서 로그인을 완료하세요(엔터프라이즈 SSO 지원).
+CursorSignInHelp = CodexBar 안에서 직접 로그인하여 브라우저 쿠키를 읽지 않고 개인 또는 엔터프라이즈 사용량을 가져옵니다.
+CursorSignInSuccess = Cursor에 로그인했습니다. 사용량을 새로 고치는 중…
+AntigravitySignInTitle = Antigravity Google 로그인
+AntigravitySignInButton = Google로 로그인
+AntigravitySignOutButton = 로그아웃
+AntigravitySignInCancelButton = 취소
+AntigravitySignInWaiting = 브라우저에서 Google 로그인을 완료하세요…
+AntigravitySignInHelp = Google OAuth로 로그인하여 Antigravity 앱이나 agy CLI를 설치하지 않고 Antigravity 할당량을 직접 가져옵니다.
+AntigravitySignInClientMissingHelp = 로컬 Antigravity OAuth 클라이언트를 찾을 수 없습니다. Antigravity를 설치하지 않고 로그인하려면 Google OAuth 데스크톱 Client ID와 Client Secret을 입력하세요.
+AntigravityClientIdLabel = OAuth Client ID
+AntigravityClientSecretLabel = OAuth Client Secret
+AntigravitySignInSuccess = Antigravity에 로그인했습니다. 사용량을 새로 고치는 중…

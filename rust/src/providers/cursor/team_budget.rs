@@ -24,6 +24,12 @@ pub(super) struct CursorMemberBudget {
     pub(super) limit_usd: f64,
 }
 
+impl CursorMemberBudget {
+    pub(super) fn remaining_usd(&self) -> f64 {
+        (self.limit_usd - self.used_usd).max(0.0)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CursorTeamSpend {
@@ -38,6 +44,8 @@ struct CursorTeamMember {
     overall_spend_cents: Option<f64>,
     effective_per_user_limit_dollars: Option<f64>,
     monthly_limit_dollars: Option<f64>,
+    /// Admin-set per-member cap; only used when no other limit is reported.
+    hard_limit_override_dollars: Option<f64>,
 }
 
 impl CursorTeamMember {
@@ -45,7 +53,8 @@ impl CursorTeamMember {
         let used_usd = self.overall_spend_cents? / 100.0;
         let limit_usd = self
             .effective_per_user_limit_dollars
-            .or(self.monthly_limit_dollars)?;
+            .or(self.monthly_limit_dollars)
+            .or(self.hard_limit_override_dollars)?;
         (used_usd.is_finite() && used_usd >= 0.0 && limit_usd.is_finite() && limit_usd > 0.0)
             .then_some(CursorMemberBudget {
                 used_usd,
@@ -244,14 +253,15 @@ impl CursorApi {
         if remaining.is_zero() {
             return Err(ProviderError::Timeout);
         }
+        let base_url = self.base_url();
         let response = self
             .client()
-            .post(format!("{BASE_URL}/api/dashboard/{endpoint}"))
+            .post(format!("{base_url}/api/dashboard/{endpoint}"))
             .header("Cookie", cookie_header)
             .header("Accept", "application/json")
             .header("Content-Type", "application/json")
-            .header("Origin", BASE_URL)
-            .header("Referer", format!("{BASE_URL}/dashboard"))
+            .header("Origin", base_url)
+            .header("Referer", format!("{base_url}/dashboard"))
             .json(&body)
             .timeout(remaining.min(TEAM_REQUEST_TIMEOUT))
             .send()
@@ -271,8 +281,6 @@ impl CursorApi {
             .map_err(|error| ProviderError::Parse(error.to_string()))
     }
 }
-
-const BASE_URL: &str = "https://cursor.com";
 
 #[cfg(test)]
 mod tests {
@@ -316,6 +324,47 @@ mod tests {
     }
 
     #[test]
+    fn hard_limit_override_is_only_the_last_resort_limit() {
+        let override_only: CursorTeamMember =
+            serde_json::from_str(r#"{"overallSpendCents":2500,"hardLimitOverrideDollars":100}"#)
+                .unwrap();
+        assert_eq!(
+            override_only.budget(),
+            Some(CursorMemberBudget {
+                used_usd: 25.0,
+                limit_usd: 100.0
+            })
+        );
+
+        let with_monthly: CursorTeamMember = serde_json::from_str(
+            r#"{"overallSpendCents":2500,"monthlyLimitDollars":150,"hardLimitOverrideDollars":100}"#,
+        )
+        .unwrap();
+        assert_eq!(with_monthly.budget().map(|b| b.limit_usd), Some(150.0));
+
+        // A reported zero effective limit still fails closed.
+        let zero_effective: CursorTeamMember = serde_json::from_str(
+            r#"{"overallSpendCents":2500,"effectivePerUserLimitDollars":0,"hardLimitOverrideDollars":100}"#,
+        )
+        .unwrap();
+        assert!(zero_effective.budget().is_none());
+    }
+
+    #[test]
+    fn remaining_usd_never_goes_negative() {
+        let under = CursorMemberBudget {
+            used_usd: 42.5,
+            limit_usd: 200.0,
+        };
+        assert!((under.remaining_usd() - 157.5).abs() < 1e-9);
+        let over = CursorMemberBudget {
+            used_usd: 250.0,
+            limit_usd: 200.0,
+        };
+        assert_eq!(over.remaining_usd(), 0.0);
+    }
+
+    #[test]
     fn member_selection_requires_exactly_one_valid_match() {
         let missing = MemberBudgetSelector::new("missing@example.com");
         assert_eq!(missing.selection, MemberSelection::NotFound);
@@ -326,6 +375,7 @@ mod tests {
             overall_spend_cents: Some(1312.0),
             effective_per_user_limit_dollars: Some(150.0),
             monthly_limit_dollars: None,
+            hard_limit_override_dollars: None,
         }]);
         assert_eq!(
             single.selection,
@@ -340,6 +390,7 @@ mod tests {
             overall_spend_cents: Some(1312.0),
             effective_per_user_limit_dollars: Some(150.0),
             monthly_limit_dollars: None,
+            hard_limit_override_dollars: None,
         };
         let mut page_duplicate = MemberBudgetSelector::new("member@example.com");
         page_duplicate.feed(&[duplicate.clone(), duplicate.clone()]);
@@ -356,6 +407,7 @@ mod tests {
             overall_spend_cents: Some(-1.0),
             effective_per_user_limit_dollars: Some(150.0),
             monthly_limit_dollars: None,
+            hard_limit_override_dollars: None,
         }]);
         assert_eq!(invalid_budget.selection, MemberSelection::Ambiguous);
     }
@@ -395,6 +447,7 @@ mod tests {
                         overall_spend_cents: None,
                         effective_per_user_limit_dollars: None,
                         monthly_limit_dollars: None,
+                        hard_limit_override_dollars: None,
                     };
                     members
                 ],

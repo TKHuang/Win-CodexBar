@@ -27,6 +27,7 @@ export function CostSection({ cost, t }: Props) {
   const rows: { label: string; value: string | null }[] = [
     { label: t("DetailCostUsed"), value: formatCost(cost.used, cost.formattedUsed) },
     { label: t("DetailCostLimit"), value: cost.limit == null ? null : formatCost(cost.limit, cost.formattedLimit) },
+    { label: t("DetailCostBalance"), value: cost.balance == null ? null : formatCost(cost.balance, cost.formattedBalance) },
     {
       label: t("DetailCostResets"),
       value: cost.resetsAt ?? null,
