@@ -1916,3 +1916,23 @@ AcknowledgementsAuthor = Author
 AcknowledgementsAuthors = Authors
 AcknowledgementsLicense = License
 AcknowledgementsStandardText = Standard license text. This package ships no license file.
+
+# Direct account sign-in (Cursor, Antigravity)
+CursorSignInTitle = Cursor account
+CursorSignInButton = Sign in with Cursor
+CursorSwitchAccountButton = Switch Cursor account
+CursorSignOutButton = Sign out
+CursorSignInCancelButton = Cancel
+CursorSignInWaiting = Complete sign-in in the Cursor window. Enterprise SSO is supported.
+CursorSignInHelp = Sign in directly inside CodexBar to fetch personal or Enterprise usage without reading browser cookies.
+CursorSignInSuccess = Signed in to Cursor. Refreshing usage…
+AntigravitySignInTitle = Antigravity Google sign-in
+AntigravitySignInButton = Sign in with Google
+AntigravitySignOutButton = Sign out
+AntigravitySignInCancelButton = Cancel
+AntigravitySignInWaiting = Complete Google sign-in in your browser…
+AntigravitySignInHelp = Sign in with Google OAuth to fetch Antigravity quota directly without installing the Antigravity app or agy CLI.
+AntigravitySignInClientMissingHelp = No local Antigravity OAuth client was found. Enter a Google OAuth desktop Client ID and Client Secret to sign in without installing Antigravity.
+AntigravityClientIdLabel = OAuth Client ID
+AntigravityClientSecretLabel = OAuth Client Secret
+AntigravitySignInSuccess = Signed in to Antigravity. Refreshing usage…

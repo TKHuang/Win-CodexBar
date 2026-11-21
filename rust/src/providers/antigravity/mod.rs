@@ -14,6 +14,7 @@ pub mod local_sessions;
 mod local_sessions_reader;
 mod local_sqlite;
 mod local_step_resolver;
+pub mod oauth_login;
 mod offline_reason;
 mod quota_summary;
 mod remote;

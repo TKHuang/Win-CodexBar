@@ -27,8 +27,8 @@ use super::quota_summary;
 use crate::core::{ProviderError, RateWindow, UsageSnapshot};
 
 pub(super) const CREDENTIALS_ENV: &str = "ANTIGRAVITY_OAUTH_CREDENTIALS_JSON";
-const CLIENT_ID_ENV: &str = "ANTIGRAVITY_OAUTH_CLIENT_ID";
-const CLIENT_SECRET_ENV: &str = "ANTIGRAVITY_OAUTH_CLIENT_SECRET";
+pub(super) const CLIENT_ID_ENV: &str = "ANTIGRAVITY_OAUTH_CLIENT_ID";
+pub(super) const CLIENT_SECRET_ENV: &str = "ANTIGRAVITY_OAUTH_CLIENT_SECRET";
 
 pub(super) const NOT_LOGGED_IN_MESSAGE: &str = "Antigravity Google OAuth credentials not found. Save them to ~/.codexbar/antigravity/oauth_creds.json or set ANTIGRAVITY_OAUTH_CREDENTIALS_JSON.";
 pub(super) const SESSION_EXPIRED_MESSAGE: &str =
@@ -119,17 +119,17 @@ pub(super) fn credentials_path(home: &Path) -> PathBuf {
         .join("oauth_creds.json")
 }
 
-fn non_empty(value: Option<&str>) -> Option<&str> {
+pub(super) fn non_empty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
-struct TokenClaims {
-    email: Option<String>,
+pub(super) struct TokenClaims {
+    pub(super) email: Option<String>,
     hosted_domain: Option<String>,
 }
 
 impl TokenClaims {
-    fn from_credentials(credentials: &OAuthCredentials) -> Self {
+    pub(super) fn from_credentials(credentials: &OAuthCredentials) -> Self {
         let claims = credentials.id_token.as_deref().and_then(jwt_payload);
         let claim = |name: &str| {
             claims
@@ -478,24 +478,30 @@ impl RemoteFetcher<HttpRemoteTransport> {
 /// Windows install layout of the Antigravity desktop app. These paths are
 /// inferred from the per-user installer location; upstream only scans macOS
 /// app bundles.
-fn default_client_artifacts() -> Vec<PathBuf> {
-    let Some(local_app_data) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) else {
-        return Vec::new();
-    };
-    let resources = local_app_data
-        .join("Programs")
-        .join("Antigravity")
-        .join("resources");
-    vec![
-        resources.join("app").join("out").join("main.js"),
-        resources
-            .join("app")
-            .join("extensions")
-            .join("antigravity")
-            .join("bin")
-            .join("language_server_windows_x64.exe"),
-        resources.join("bin").join("language_server.exe"),
-    ]
+pub(super) fn default_client_artifacts() -> Vec<PathBuf> {
+    // Per-user installs live under `%LOCALAPPDATA%\Programs`, machine-wide
+    // installs under `%PROGRAMFILES%`.
+    let install_roots = [
+        std::env::var_os("LOCALAPPDATA").map(|root| PathBuf::from(root).join("Programs")),
+        std::env::var_os("PROGRAMFILES").map(PathBuf::from),
+    ];
+    install_roots
+        .into_iter()
+        .flatten()
+        .flat_map(|root| {
+            let resources = root.join("Antigravity").join("resources");
+            [
+                resources.join("app").join("out").join("main.js"),
+                resources
+                    .join("app")
+                    .join("extensions")
+                    .join("antigravity")
+                    .join("bin")
+                    .join("language_server_windows_x64.exe"),
+                resources.join("bin").join("language_server.exe"),
+            ]
+        })
+        .collect()
 }
 
 impl<T: RemoteTransport> RemoteFetcher<T> {
@@ -870,7 +876,7 @@ impl<T: RemoteTransport> RemoteFetcher<T> {
     }
 }
 
-fn save_credentials(path: &Path, credentials: &OAuthCredentials) -> std::io::Result<()> {
+pub(super) fn save_credentials(path: &Path, credentials: &OAuthCredentials) -> std::io::Result<()> {
     let contents = serde_json::to_string_pretty(credentials).map_err(std::io::Error::other)?;
     crate::secure_file::write_string(path, &contents)
 }
@@ -1060,7 +1066,7 @@ static CLIENT_ID_RE: LazyLock<Regex> = LazyLock::new(|| {
 static CLIENT_SECRET_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^GOCSPX-[A-Za-z0-9_-]{28}$").expect("valid regex"));
 
-fn discover_client(paths: &[PathBuf]) -> Option<OAuthClient> {
+pub(super) fn discover_client(paths: &[PathBuf]) -> Option<OAuthClient> {
     paths.iter().find_map(|path| {
         let metadata = std::fs::metadata(path).ok()?;
         if !metadata.is_file() || metadata.len() > MAX_CLIENT_ARTIFACT_BYTES {

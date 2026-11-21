@@ -2244,6 +2244,26 @@ locale_keys! {
     UsageItemHiddenByCostSummary,
     PlanRenewsOn,
     PlanExpiresOn,
+
+    // Direct account sign-in (Cursor, Antigravity)
+    CursorSignInTitle,
+    CursorSignInButton,
+    CursorSwitchAccountButton,
+    CursorSignOutButton,
+    CursorSignInCancelButton,
+    CursorSignInWaiting,
+    CursorSignInHelp,
+    CursorSignInSuccess,
+    AntigravitySignInTitle,
+    AntigravitySignInButton,
+    AntigravitySignOutButton,
+    AntigravitySignInCancelButton,
+    AntigravitySignInWaiting,
+    AntigravitySignInHelp,
+    AntigravitySignInClientMissingHelp,
+    AntigravityClientIdLabel,
+    AntigravityClientSecretLabel,
+    AntigravitySignInSuccess,
 }
 
 #[cfg(test)]

@@ -1914,3 +1914,23 @@ AcknowledgementsAuthor = Автор
 AcknowledgementsAuthors = Авторы
 AcknowledgementsLicense = Лицензия
 AcknowledgementsStandardText = Стандартный текст лицензии. Пакет не содержит файла лицензии.
+
+# Direct account sign-in (Cursor, Antigravity)
+CursorSignInTitle = Аккаунт Cursor
+CursorSignInButton = Войти в Cursor
+CursorSwitchAccountButton = Сменить аккаунт Cursor
+CursorSignOutButton = Выйти
+CursorSignInCancelButton = Отмена
+CursorSignInWaiting = Завершите вход в открывшемся окне Cursor. Корпоративный SSO поддерживается.
+CursorSignInHelp = Войдите прямо в CodexBar, чтобы получать личное или корпоративное использование без чтения файлов cookie браузера.
+CursorSignInSuccess = Вход в Cursor выполнен. Обновление использования…
+AntigravitySignInTitle = Вход в Antigravity через Google
+AntigravitySignInButton = Войти через Google
+AntigravitySignOutButton = Выйти
+AntigravitySignInCancelButton = Отмена
+AntigravitySignInWaiting = Завершите вход через Google в браузере…
+AntigravitySignInHelp = Войдите через Google OAuth, чтобы получать квоту Antigravity напрямую без установки приложения Antigravity или agy CLI.
+AntigravitySignInClientMissingHelp = Локальный клиент OAuth Antigravity не найден. Введите Client ID и Client Secret настольного клиента Google OAuth, чтобы войти без установки Antigravity.
+AntigravityClientIdLabel = OAuth Client ID
+AntigravityClientSecretLabel = OAuth Client Secret
+AntigravitySignInSuccess = Вход в Antigravity выполнен. Обновление использования…

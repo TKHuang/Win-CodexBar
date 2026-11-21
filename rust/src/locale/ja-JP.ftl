@@ -1914,3 +1914,23 @@ AcknowledgementsAuthor = 作者
 AcknowledgementsAuthors = 作者
 AcknowledgementsLicense = ライセンス
 AcknowledgementsStandardText = 標準のライセンス文です。このパッケージにはライセンスファイルが含まれていません。
+
+# Direct account sign-in (Cursor, Antigravity)
+CursorSignInTitle = Cursor アカウント
+CursorSignInButton = Cursor にサインイン
+CursorSwitchAccountButton = Cursor アカウントを切り替え
+CursorSignOutButton = サインアウト
+CursorSignInCancelButton = キャンセル
+CursorSignInWaiting = 開いた Cursor ウィンドウでサインインを完了してください（エンタープライズ SSO に対応）。
+CursorSignInHelp = CodexBar 内で直接サインインし、ブラウザの Cookie を読み取らずに個人またはエンタープライズの使用量を取得します。
+CursorSignInSuccess = Cursor にサインインしました。使用量を更新しています…
+AntigravitySignInTitle = Antigravity Google サインイン
+AntigravitySignInButton = Google でサインイン
+AntigravitySignOutButton = サインアウト
+AntigravitySignInCancelButton = キャンセル
+AntigravitySignInWaiting = ブラウザで Google サインインを完了してください…
+AntigravitySignInHelp = Google OAuth でサインインし、Antigravity アプリや agy CLI をインストールせずに Antigravity のクォータを直接取得します。
+AntigravitySignInClientMissingHelp = ローカルに Antigravity OAuth クライアントが見つかりません。Antigravity をインストールせずにサインインするには、Google OAuth デスクトップの Client ID と Client Secret を入力してください。
+AntigravityClientIdLabel = OAuth Client ID
+AntigravityClientSecretLabel = OAuth Client Secret
+AntigravitySignInSuccess = Antigravity にサインインしました。使用量を更新しています…
