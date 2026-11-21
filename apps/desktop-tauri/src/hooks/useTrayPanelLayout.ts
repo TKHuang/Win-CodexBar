@@ -203,7 +203,8 @@ export function useTrayPanelLayout({
       programmaticInFlightRef.current += 1;
       try {
         const committed = sizingStateRef.current.committed;
-        if (!layoutReadyRef.current || committed?.width !== width) {
+        const widthChanged = committed !== null && committed.width !== width;
+        if (!layoutReadyRef.current || widthChanged) {
           const height =
             layoutReadyRef.current && committed ? committed.height : minHeight;
           sizingStateRef.current = recordAutoFitCommit(
@@ -263,6 +264,8 @@ export function useTrayPanelLayout({
 
         if (decision.commit) {
           await applySize(new LogicalSize(width, decision.height));
+          await Promise.resolve(reanchorTrayPanel()).catch(() => {});
+        } else if (widthChanged) {
           await Promise.resolve(reanchorTrayPanel()).catch(() => {});
         }
 

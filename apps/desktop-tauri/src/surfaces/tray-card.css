@@ -739,3 +739,39 @@
 .menu-surface--tray.menu-surface--compact .overview-spend {
   padding: 6px 12px;
 }
+
+/* ── Multi-column Overview grid (3+ cards in Overview) ──────────────
+   Keeps the tray popover compact vertically when multiple providers are
+   enabled: 3–4 cards arrange 2 per row; 5+ cards arrange 3 per row. */
+.menu-surface--tray .menu-stack--columns {
+  display: grid;
+  grid-template-columns: repeat(var(--overview-columns, 2), minmax(0, 1fr));
+  gap: 0;
+  align-items: stretch;
+}
+
+.menu-surface--tray .menu-stack--columns .menu-stack__item {
+  padding: 0;
+  height: 100%;
+  min-width: 0;
+}
+
+.menu-surface--tray .menu-stack--columns .menu-card {
+  height: 100%;
+}
+
+.menu-surface--tray .menu-stack--cols-2 .menu-stack__item:nth-child(2n) {
+  border-left: 1px solid var(--mac-separator);
+}
+
+.menu-surface--tray .menu-stack--cols-2 .menu-stack__item:nth-child(n + 3) {
+  border-top: 1px solid var(--mac-separator);
+}
+
+.menu-surface--tray .menu-stack--cols-3 .menu-stack__item:not(:nth-child(3n + 1)) {
+  border-left: 1px solid var(--mac-separator);
+}
+
+.menu-surface--tray .menu-stack--cols-3 .menu-stack__item:nth-child(n + 4) {
+  border-top: 1px solid var(--mac-separator);
+}
