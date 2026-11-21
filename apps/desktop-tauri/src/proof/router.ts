@@ -46,6 +46,9 @@ const INERT_PLUGIN_PREFIXES = ["plugin:window|", "plugin:webview|", "plugin:dial
  */
 export const INERT_ACTIONS = [
   "add_token_account",
+  "antigravity_oauth_cancel_login",
+  "antigravity_oauth_login",
+  "antigravity_oauth_sign_out",
   "apply_update",
   "claude_account_add",
   "claude_account_cancel_login",
@@ -59,6 +62,8 @@ export const INERT_ACTIONS = [
   "codex_account_remove",
   "codex_account_restart_desktop",
   "codex_account_switch",
+  "cursor_cancel_login",
+  "cursor_login_with_browser",
   "download_update",
   "export_preferences",
   "get_openai_live_usage",
@@ -431,6 +436,13 @@ export function createProofRouter(
     list_agent_sessions: () => scenario.agentSessions ?? { status: "disabled" },
     focus_agent_session: (): SessionFocusResult => ({ status: "focused" }),
     get_gemini_cli_signed_in: () => ({ signedIn: true, credentialsPath: null }),
+    antigravity_oauth_status: () => ({
+      signedIn: false,
+      email: null,
+      credentialsPath: "~/.codexbar/antigravity/oauth_creds.json",
+      clientSource: null,
+      hasClientConfig: false,
+    }),
     get_vertexai_status: () => ({ hasCredentials: false, credentialsPath: null }),
     list_jetbrains_detected_ides: () => [],
     get_kiro_status: () => ({ available: false, hint: null }),

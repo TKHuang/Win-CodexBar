@@ -273,4 +273,24 @@ export const SHELL_LOCALE_KEYS = [
   "UsageSpendIndependentChats",
   "UsageSpendIndependentChat",
 
+  // Direct account sign-in (Cursor, Antigravity)
+  "CursorSignInTitle",
+  "CursorSignInButton",
+  "CursorSwitchAccountButton",
+  "CursorSignOutButton",
+  "CursorSignInCancelButton",
+  "CursorSignInWaiting",
+  "CursorSignInHelp",
+  "CursorSignInSuccess",
+  "AntigravitySignInTitle",
+  "AntigravitySignInButton",
+  "AntigravitySignOutButton",
+  "AntigravitySignInCancelButton",
+  "AntigravitySignInWaiting",
+  "AntigravitySignInHelp",
+  "AntigravitySignInClientMissingHelp",
+  "AntigravityClientIdLabel",
+  "AntigravityClientSecretLabel",
+  "AntigravitySignInSuccess",
+
 ] as const;

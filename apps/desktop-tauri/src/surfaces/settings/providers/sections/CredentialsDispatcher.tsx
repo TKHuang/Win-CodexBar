@@ -1,4 +1,6 @@
 import type { LocaleKey } from "../../../../i18n/keys";
+import { AntigravityOAuthCreds } from "./credentials/AntigravityOAuthCreds";
+import { CursorSignInCreds } from "./credentials/CursorSignInCreds";
 import { GeminiCliCreds } from "./credentials/GeminiCliCreds";
 import { VertexAiCreds } from "./credentials/VertexAiCreds";
 import { JetBrainsCreds } from "./credentials/JetBrainsCreds";
@@ -21,6 +23,10 @@ interface Props {
  */
 export function CredentialsDispatcher({ providerId, t, onCredentialsChanged }: Props) {
   switch (providerId) {
+    case "cursor":
+      return <CursorSignInCreds t={t} onChanged={onCredentialsChanged} />;
+    case "antigravity":
+      return <AntigravityOAuthCreds t={t} onChanged={onCredentialsChanged} />;
     case "gemini":
       return <GeminiCliCreds providerId={providerId} t={t} />;
     case "vertexai":

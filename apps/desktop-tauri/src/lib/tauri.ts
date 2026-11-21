@@ -654,6 +654,38 @@ export function getKiroStatus(): Promise<
   return invoke("get_kiro_status");
 }
 
+export function cursorLoginWithBrowser(): Promise<void> {
+  return invoke<void>("cursor_login_with_browser");
+}
+
+export function cursorCancelLogin(): Promise<void> {
+  return invoke<void>("cursor_cancel_login");
+}
+
+export function getAntigravityOAuthStatus(): Promise<
+  import("../types/bridge").AntigravityOAuthStatus
+> {
+  return invoke("antigravity_oauth_status");
+}
+
+export function antigravityOAuthLogin(
+  clientId?: string,
+  clientSecret?: string,
+): Promise<import("../types/bridge").AntigravityOAuthLoginResult> {
+  return invoke("antigravity_oauth_login", {
+    clientId: clientId?.trim() || null,
+    clientSecret: clientSecret?.trim() || null,
+  });
+}
+
+export function antigravityOAuthCancelLogin(): Promise<void> {
+  return invoke<void>("antigravity_oauth_cancel_login");
+}
+
+export function antigravityOAuthSignOut(): Promise<void> {
+  return invoke<void>("antigravity_oauth_sign_out");
+}
+
 // ── Phase 7 — global shortcut capture + notification preview ──────────
 
 export function registerGlobalShortcut(accelerator: string): Promise<void> {
