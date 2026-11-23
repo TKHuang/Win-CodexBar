@@ -257,6 +257,50 @@
       ]
     },
     {
+      "name": "flyout-dark-modern",
+      "query": "window=flyout&fixture=default&theme=dark",
+      "size": [310, 1032],
+      "steps": [
+        { "expectTheme": "dark" },
+        { "expectSelector": ".menu-surface--modern" },
+        { "expectStyle": { "selector": ".menu-surface--tray", "property": "color-scheme", "value": "dark" } },
+        { "expectStyle": { "selector": ".menu-surface--tray", "property": "color", "value": "rgba(236, 236, 255, 0.92)" } },
+        { "screenshot": "flyout-dark-modern", "clip": "panel" }
+      ]
+    },
+    {
+      "name": "flyout-dark-classic",
+      "query": "window=flyout&fixture=classic-look&theme=dark",
+      "size": [310, 1032],
+      "steps": [
+        { "expectTheme": "dark" },
+        { "expectSelector": ".menu-surface--classic" },
+        { "expectStyle": { "selector": ".menu-surface--tray", "property": "background-color", "value": "rgb(43, 43, 46)" } },
+        { "expectStyle": { "selector": ".menu-surface--tray", "property": "color", "value": "rgba(255, 255, 255, 0.88)" } },
+        { "screenshot": "flyout-dark-classic", "clip": "panel" }
+      ]
+    },
+    {
+      "name": "flyout-light",
+      "query": "window=flyout&fixture=default&theme=light",
+      "size": [310, 1032],
+      "steps": [
+        { "expectTheme": "light" },
+        { "expectStyle": { "selector": ".menu-surface--tray", "property": "color-scheme", "value": "light" } },
+        { "screenshot": "flyout-light", "clip": "panel" }
+      ]
+    },
+    {
+      "name": "flyout-auto-follows-windows-light",
+      "query": "window=flyout&fixture=default&theme=auto&system=light",
+      "size": [310, 1032],
+      "steps": [
+        { "expectCall": { "cmd": "get_system_theme" } },
+        { "expectTheme": "light" },
+        { "expectStyle": { "selector": ".menu-surface--tray", "property": "color-scheme", "value": "light" } }
+      ]
+    },
+    {
       "name": "settings-general-dark",
       "query": "window=settings&tab=general&theme=dark",
       "size": [880, 620],

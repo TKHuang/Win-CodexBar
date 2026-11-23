@@ -5,7 +5,7 @@ import type { ThemePreference } from "../types/bridge";
 export type ResolvedTheme = "light" | "dark";
 
 const MEDIA_QUERY = "(prefers-color-scheme: light)";
-/** How often a visible Settings window re-reads the Windows theme. */
+/** How often a visible window re-reads the Windows theme. */
 const SYSTEM_THEME_POLL_MS = 30_000;
 
 function prefersLight(): boolean {
@@ -74,9 +74,9 @@ function followWindowsTheme(): () => void {
 
 export interface UseThemeOptions {
   /**
-   * Follow the Windows app theme when the preference is `auto`. Only the
-   * Settings surface sets this; other windows keep the media query, which
-   * reads dark on every pinned window.
+   * Follow the Windows app theme when the preference is `auto`. Settings and
+   * the tray panel set this; the float bar keeps the media query, which reads
+   * dark on every pinned window.
    */
   followSystem?: boolean;
 }

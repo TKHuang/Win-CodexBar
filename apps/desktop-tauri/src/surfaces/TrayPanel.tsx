@@ -149,7 +149,7 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
 
   if (sorted.length === 0) {
     return (
-      <div className={containerClassName} data-theme="light">
+      <div className={containerClassName}>
         {moveHandle}
         <MenuSurface banner={banner} footerGroups={footerGroups}
           statusLine={statusLine} style={surfaceStyle} hoverHighlight={hoverHighlight}
@@ -167,7 +167,7 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
   }
 
   return (
-    <div className={containerClassName} data-theme="light">
+    <div className={containerClassName}>
       {moveHandle}
       <MenuSurface banner={banner} footerGroups={footerGroups}
         statusLine={statusLine} style={surfaceStyle} hoverHighlight={hoverHighlight}

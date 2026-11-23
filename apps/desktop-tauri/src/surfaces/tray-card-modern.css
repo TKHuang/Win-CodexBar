@@ -26,6 +26,9 @@
   --mac-divider: rgba(70, 70, 130, 0.24);
   --mac-separator: rgba(70, 70, 130, 0.2);
   --mac-selection-bg: #2f6bf2;
+  --mac-tab-hover: rgba(40, 40, 110, 0.1);
+  --mac-tab-track: rgba(70, 70, 130, 0.26);
+  --mac-panel-shine: inset 0 1px 0 rgba(255, 255, 255, 0.55);
   --mac-panel-fill:
     radial-gradient(120% 55% at 0% 0%, rgba(255, 255, 255, 0.6), rgba(255, 255, 255, 0) 62%),
     linear-gradient(168deg, #ece7fb 0%, #dfdbfa 42%, #cfd2f8 100%);
@@ -49,7 +52,23 @@
   border: 0;
   border-radius: 0;
   background: var(--mac-panel-fill);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.55);
+  box-shadow: var(--mac-panel-shine);
+}
+
+/* Dark: the same tinted surface in deep indigo. */
+[data-theme="dark"] .menu-surface--tray.menu-surface--modern {
+  --mac-text: rgba(236, 236, 255, 0.92);
+  --mac-text-2: rgba(206, 206, 245, 0.62);
+  --mac-text-3: rgba(206, 206, 245, 0.32);
+  --mac-track: rgba(160, 160, 235, 0.18);
+  --mac-divider: rgba(150, 150, 225, 0.22);
+  --mac-separator: rgba(150, 150, 225, 0.16);
+  --mac-tab-hover: rgba(170, 170, 255, 0.12);
+  --mac-tab-track: rgba(150, 150, 225, 0.26);
+  --mac-panel-shine: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  --mac-panel-fill:
+    radial-gradient(120% 55% at 0% 0%, rgba(140, 130, 255, 0.14), rgba(140, 130, 255, 0) 62%),
+    linear-gradient(168deg, #262338 0%, #211f33 42%, #1b1c2e 100%);
 }
 
 .menu-surface--tray.menu-surface--modern .menu-card__content {
@@ -169,7 +188,7 @@
 }
 
 .menu-surface--tray.menu-surface--modern .provider-grid__item:not(.provider-grid__item--active):hover {
-  background: rgba(40, 40, 110, 0.1);
+  background: var(--mac-tab-hover);
 }
 
 /* Labelled tabs: one row (All narrower, the rest equal) or wrapped rows. */
@@ -255,7 +274,7 @@
   height: 3px;
   margin: 0;
   border-radius: 2px;
-  background: rgba(70, 70, 130, 0.26);
+  background: var(--mac-tab-track);
 }
 
 .menu-surface--tray.menu-surface--modern .provider-grid--tabs .provider-grid__weekly-track::after {

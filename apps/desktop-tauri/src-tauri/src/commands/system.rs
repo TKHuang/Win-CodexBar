@@ -205,7 +205,7 @@ fn abgr_to_hex(value: u32) -> String {
 }
 
 /// The Windows app-theme setting (`"light"` or `"dark"`) for the Settings
-/// window under the `auto` theme.
+/// window and the tray panel under the `auto` theme.
 ///
 /// Every native window is pinned to Dark (see `shell/settings_window.rs`), so
 /// `prefers-color-scheme` inside the webview always reports dark. This reads

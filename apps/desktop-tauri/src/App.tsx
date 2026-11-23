@@ -9,6 +9,7 @@ import {
 } from "./lib/tauri";
 import { useSurfaceSnapshot } from "./hooks/useSurfaceSnapshot";
 import { useTheme } from "./hooks/useTheme";
+import { useTauriEvent } from "./hooks/useTauriEvent";
 import { useLocale } from "./hooks/useLocale";
 import TrayPanel from "./surfaces/TrayPanel";
 import { FLOATBAR_WINDOW_LABEL } from "./floatbar/api";
@@ -63,11 +64,20 @@ function AppInner() {
   const [error, setError] = useState<string | null>(null);
   const [themePreference, setThemePreference] = useState<ThemePreference>("dark");
 
-  // Settings follows the Windows app theme under `auto`; the other surfaces
-  // keep the pinned-Dark media query.
-  useTheme(themePreference, {
-    followSystem: isSettingsWindow() || surface.mode === "settings",
-  });
+  // Settings and the tray panel follow the Windows app theme under `auto`.
+  // The float bar keeps its own dark look.
+  useTheme(themePreference, { followSystem: !isFloatBarWindow() });
+  // `codexbar:settings-updated` only fires in the window that saved, so the
+  // shell's broadcast carries an Appearance change to the other windows.
+  useTauriEvent(
+    "settings-changed",
+    () => {
+      getSettingsSnapshot()
+        .then((fresh) => setThemePreference(fresh.theme))
+        .catch(() => {});
+    },
+    [],
+  );
   useDeepSeekPricingStatus();
 
   const reloadBootstrapState = useCallback(

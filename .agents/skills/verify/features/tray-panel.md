@@ -49,6 +49,7 @@ Preconditions:
   shows Usage unavailable). Cards ignore errorState, so the panel alone will not reveal the mistake.
 - launch.ps1 returns when main renders; with -ProofMode popOut the flyout page appears a moment later, so
   start with a wait on flyout.
-- The flyout is always drawn in the light palette (TrayPanel sets data-theme="light") while its DWM frame
-  reports dark; do not report that as a theme bug from this map alone.
+- The flyout follows Settings > General > Appearance: Dark and Light pick that palette, and Auto reads the
+  Windows app theme through get_system_theme. Its DWM frame always reports dark, because every window is
+  pinned Dark (the theme flip); a light panel in a dark frame under Light or Auto-light is expected.
 - The tray icon itself, its pixels and the context menu are not reachable from CDP or this harness.

@@ -88,12 +88,12 @@ describe("tray card stylesheet", () => {
     );
   });
 
-  it("restyles the switcher: accent selection, instant black .095 hover, 2px quota line", () => {
+  it("restyles the switcher: accent selection, instant .095 tint hover, 2px quota line", () => {
     const item = ruleBlock(tray, ".menu-surface--tray .provider-grid__item");
     expect(item).toContain("border-radius: 6px");
     expect(item).toContain("transition: none");
     expect(ruleBlock(tray, ".menu-surface--tray .provider-grid__item:hover")).toContain(
-      "rgba(0, 0, 0, 0.095)",
+      "rgba(var(--surface-tint-rgb), 0.095)",
     );
     const active = ruleBlock(tray, ".menu-surface--tray .provider-grid__item--active");
     expect(active).toContain("background: var(--mac-selection-bg)");
@@ -117,6 +117,16 @@ describe("per-surface tint token", () => {
     expect(base).toMatch(/:root\s*\{[^}]*--surface-tint-rgb: 255, 255, 255;/);
     expect(base).toMatch(/\[data-theme="light"\]\s*\{[^}]*--surface-tint-rgb: 0, 0, 0;/);
     expect(base).toMatch(/\.menu-surface--tray\s*\{[^}]*--surface-tint-rgb: 0, 0, 0;/);
+    expect(base).toMatch(
+      /\[data-theme="dark"\] \.menu-surface--tray\s*\{[^}]*--surface-tint-rgb: 255, 255, 255;/,
+    );
+  });
+
+  it("gives the tray panel a dark palette under the dark theme", () => {
+    const dark = ruleBlock(base, '[data-theme="dark"] .menu-surface--tray');
+    expect(dark).toContain("--mac-text: rgba(255, 255, 255, 0.88)");
+    expect(dark).toContain("color-scheme: dark");
+    expect(base).toMatch(/\[data-theme="dark"\]\s*\{\s*--mac-panel-bg: #2b2b2e;/);
   });
 
   it("replaces the tray-only dark-tint overrides", () => {
@@ -192,7 +202,9 @@ describe("modern tray stylesheet", () => {
     expect(selectors.length).toBeGreaterThan(20);
     for (const group of selectors) {
       for (const selector of group.split(",")) {
-        expect(selector.trim(), group).toMatch(/^\.menu-surface--tray\.menu-surface--modern\b/);
+        expect(selector.trim(), group).toMatch(
+          /^(\[data-theme="dark"\] )?\.menu-surface--tray\.menu-surface--modern\b/,
+        );
       }
     }
   });
@@ -211,8 +223,17 @@ describe("modern tray stylesheet", () => {
     expect(item).toContain("transition: none");
     expect(
       ruleBlock(modern, `${MODERN} .provider-grid__item:not(.provider-grid__item--active):hover`),
-    ).toContain("rgba(40, 40, 110, 0.1)");
+    ).toContain("var(--mac-tab-hover)");
+    expect(ruleBlock(modern, MODERN)).toContain("--mac-tab-hover: rgba(40, 40, 110, 0.1)");
     expect(modern).not.toContain(`${MODERN} .provider-grid__item:hover`);
+  });
+
+  it("has a dark indigo surface under the dark theme", () => {
+    const dark = ruleBlock(modern, `[data-theme="dark"] ${MODERN}`);
+    expect(dark).toContain("--mac-panel-fill:");
+    expect(dark).toContain("#262338");
+    expect(dark).toContain("--mac-text: rgba(236, 236, 255, 0.92)");
+    expect(dark).toContain("--mac-tab-hover:");
   });
 
   it("draws labelled tabs with a 3px quota underline", () => {

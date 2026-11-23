@@ -255,8 +255,7 @@
 
 /* Near-black brands (TypeSafe, V0, Replicate...) vanish on dark surfaces, so
    the dark theme uses ProviderIcon's lifted --provider-brand-dark when it sets
-   one. Light scopes, including the tray panel's nested data-theme="light",
-   keep the exact brand color; the light rule comes second so it wins there. */
+   one. The light theme keeps the exact brand color. */
 [data-theme="dark"] .provider-icon {
   color: var(--provider-brand-dark, var(--provider-brand, var(--accent)));
 }

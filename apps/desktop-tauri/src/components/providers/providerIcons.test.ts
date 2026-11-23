@@ -198,11 +198,7 @@ describe("provider icon registry", () => {
   it("keeps the brand color in light scopes and the lifted tint in dark ones", () => {
     const css = loadStyles();
     const dark = css.indexOf('[data-theme="dark"] .provider-icon {');
-    const light = css.indexOf('[data-theme="light"] .provider-icon {');
     expect(dark).toBeGreaterThan(-1);
-    // The tray panel nests data-theme="light" inside a dark document, so the
-    // light rule must come later to win at equal specificity.
-    expect(light).toBeGreaterThan(dark);
     expect(ruleBlock(css, '[data-theme="dark"] .provider-icon')).toContain(
       "var(--provider-brand-dark, var(--provider-brand",
     );

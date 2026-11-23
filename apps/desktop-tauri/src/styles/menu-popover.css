@@ -278,16 +278,6 @@ html:has(.menu-surface--tray) {
   --panel-border: var(--mac-divider);
 
   --usage-bar-track: var(--mac-track);
-  --pace-slow-bg: rgba(0, 122, 255, 0.12);
-  --pace-slow-fg: #007aff;
-  --pace-steady-bg: rgba(21, 128, 61, 0.12);
-  --pace-steady-fg: #15803d;
-  --pace-racing-bg: rgba(180, 83, 9, 0.14);
-  --pace-racing-fg: #b45309;
-  --pace-burning-bg: rgba(185, 28, 28, 0.12);
-  --pace-burning-fg: #b91c1c;
-  --pace-track-expected-fg: rgba(0, 122, 255, 0.45);
-  --chart-cost-fg: #007aff;
   --chart-credits-fg: var(--chart-credits);
   --surface-tint-rgb: 0, 0, 0;
 
@@ -306,6 +296,39 @@ html:has(.menu-surface--tray) {
   background: var(--mac-panel-bg);
   box-shadow: var(--mac-panel-highlight);
   color: var(--mac-text);
+}
+[data-theme="light"] .menu-surface--tray {
+  --pace-slow-bg: rgba(0, 122, 255, 0.12);
+  --pace-slow-fg: #007aff;
+  --pace-steady-bg: rgba(21, 128, 61, 0.12);
+  --pace-steady-fg: #15803d;
+  --pace-racing-bg: rgba(180, 83, 9, 0.14);
+  --pace-racing-fg: #b45309;
+  --pace-burning-bg: rgba(185, 28, 28, 0.12);
+  --pace-burning-fg: #b91c1c;
+  --pace-track-expected-fg: rgba(0, 122, 255, 0.45);
+  --chart-cost-fg: #007aff;
+}
+/* Dark panel: the macOS dark menu palette. Pace and chart colors come from
+   the app's dark tokens. */
+[data-theme="dark"] .menu-surface--tray {
+  --mac-panel-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  --mac-panel-border: rgba(255, 255, 255, 0.14);
+  --mac-text: rgba(255, 255, 255, 0.88);
+  --mac-text-2: rgba(255, 255, 255, 0.55);
+  --mac-text-3: rgba(255, 255, 255, 0.28);
+  --mac-track: rgba(255, 255, 255, 0.12);
+  --mac-divider: rgba(255, 255, 255, 0.14);
+  --mac-separator: rgba(255, 255, 255, 0.1);
+  --mac-error: #ff453a;
+  --mac-pace-ok: #30d158;
+  --mac-pace-bad: #ff453a;
+  --mac-marker: rgba(255, 255, 255, 0.6);
+  --mac-accent: #0a84ff;
+  --mac-metric-card-bg: rgba(255, 255, 255, 0.05);
+  --surface-tint-rgb: 255, 255, 255;
+
+  color-scheme: dark;
 }
 .menu-surface--tray .menu-surface__body {
   flex: 0 1 auto;
@@ -347,7 +370,7 @@ html:has(.menu-surface--tray) {
   border-radius: 6px;
   padding: 4px 4px;
 }
-.menu-surface--tray .provider-grid__item .provider-icon {
+[data-theme="light"] .menu-surface--tray .provider-grid__item .provider-icon {
   filter: brightness(0);
 }
 .menu-surface--tray .update-banner--available,

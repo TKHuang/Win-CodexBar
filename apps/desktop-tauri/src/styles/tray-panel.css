@@ -7,6 +7,12 @@
 :root {
   --mac-panel-bg: #dedee2;
 }
+[data-theme="dark"] {
+  --mac-panel-bg: #2b2b2e;
+}
+[data-theme="light"] {
+  --mac-panel-bg: #dedee2;
+}
 html:has(.tray-panel-reveal),
 body:has(.tray-panel-reveal),
 .tray-panel-reveal {
@@ -47,11 +53,11 @@ body:has(.tray-panel-reveal),
   width: 32px;
   height: 3px;
   border-radius: 2px;
-  background: rgba(0, 0, 0, 0.18);
+  background: rgba(var(--surface-tint-rgb), 0.18);
   transition: background 120ms ease-out;
 }
 .tray-move-handle:hover .tray-move-handle__grip {
-  background: rgba(0, 0, 0, 0.38);
+  background: rgba(var(--surface-tint-rgb), 0.38);
 }
 .tray-panel-reveal--movable .menu-surface--tray {
   padding-top: 12px;
@@ -79,7 +85,7 @@ body:has(.tray-panel-reveal),
 .panel-resize-handle--active {
   background: rgba(47, 107, 242, 0.32);
 }
-/* Opaque so the keyboard focus on a 6px strip stays visible on the light panel. */
+/* Opaque so the keyboard focus on a 6px strip stays visible on the panel. */
 .panel-resize-handle:focus-visible {
   background: #2f6bf2;
   outline: none;

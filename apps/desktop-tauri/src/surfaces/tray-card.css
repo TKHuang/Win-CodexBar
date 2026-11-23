@@ -598,7 +598,7 @@
 }
 
 .menu-surface--tray .provider-grid__item:hover {
-  background: rgba(0, 0, 0, 0.095);
+  background: rgba(var(--surface-tint-rgb), 0.095);
 }
 
 .menu-surface--tray .provider-grid__item--active {
